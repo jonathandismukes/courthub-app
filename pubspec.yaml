@@ -1,0 +1,54 @@
+name: hoopsight
+description: "Find your game with ease! This app maps out local basketball courts and provides real-time updates on player occupancy, so you always know where the action is."
+publish_to: "none"
+version: 1.0.0
+
+environment:
+  sdk: ^3.6.0
+
+dependencies:
+  cloud_functions: ^6.0.0
+  latlong2: 0.9.1
+  flutter_map: ^8.0.0
+  qr_flutter: ^4.0.0
+  flutter_zxing: ^2.0.0
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  google_fonts: ^6.1.0
+  shared_preferences: ^2.3.3
+  google_maps_flutter: ^2.0.0
+  google_maps_flutter_web: ^0.5.10
+  geolocator: 13.0.4
+  geocoding: ^4.0.0
+  http: ^1.0.0
+  firebase_core: ^4.1.1
+  firebase_auth: '>=5.3.3'
+  cloud_firestore: '>=5.5.0'
+  firebase_storage: ^13.0.0
+  image_picker: '>=1.1.2'
+  file_picker: '>=8.1.2'
+  url_launcher: ^6.0.0
+  intl: 0.20.2
+  cached_network_image: ^3.0.0
+  firebase_messaging: ^16.0.0
+  flutter_local_notifications: ^19.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: 0.14.4
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  web:
+    generate: true
+  image_path: assets/images/c.jpeg
+  remove_alpha_ios: true

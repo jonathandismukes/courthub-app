@@ -1,0 +1,42 @@
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "functions": {
+    "source": "functions",
+    "predeploy": [
+      "npm --prefix \"$RESOURCE_DIR\" run lint"
+    ],
+    "runtime": "nodejs18"
+  },
+  "hosting": {
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  },
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "courthub-app",
+          "appId": "1:929601953173:android:eb4450bb28b6827e06aa9c",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "courthub-app",
+          "configurations": {
+            "android": "1:929601953173:android:eb4450bb28b6827e06aa9c",
+            "ios": "1:929601953173:ios:8adfe01e8f951cbc06aa9c",
+            "web": "1:929601953173:web:3a3f8c557d4887e006aa9c"
+          }
+        }
+      }
+    }
+  }
+}

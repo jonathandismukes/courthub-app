@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CourtHub Support</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            padding: 40px;
+        }
+        .logo {
+            text-align: center;
+            font-size: 50px;
+            margin-bottom: 20px;
+        }
+        h1 {
+            text-align: center;
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 40px;
+            font-size: 1.1em;
+        }
+        h2 {
+            color: #667eea;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        .contact-info {
+            background: #f8f9ff;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .contact-item {
+            margin: 15px 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .contact-item svg {
+            width: 24px;
+            height: 24px;
+            fill: #667eea;
+        }
+        a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .faq-item {
+            margin: 20px 0;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .faq-item:last-of-type {
+            border-bottom: none;
+        }
+        .faq-question {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 1.1em;
+        }
+        .faq-answer {
+            color: #666;
+            padding-left: 20px;
+        }
+        .feature-list {
+            list-style: none;
+            padding-left: 0;
+        }
+        .feature-list li {
+            padding: 10px 0;
+            padding-left: 30px;
+            position: relative;
+        }
+        .feature-list li:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: #667eea;
+            font-weight: bold;
+            font-size: 1.2em;
+        }
+        /* Alternate sport icons: 🎾 tennis, 🏀 basketball, 🏓 pickleball stand-in */
+        .feature-list li:nth-child(3n+1):before { content: "🎾"; }
+        .feature-list li:nth-child(3n+2):before { content: "🏀"; }
+        .feature-list li:nth-child(3n+3):before { content: "🏓"; }
+        footer {
+            text-align: center;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 2px solid #f0f0f0;
+            color: #888;
+            font-size: 0.9em;
+        }
+        footer p {
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">🏀🎾🏓</div>
+        <h1>CourtHub Support Center</h1>
+        <p class="subtitle">Find courts for basketball, pickleball, and tennis</p>
+
+        <h2>Contact Us</h2>
+        <div class="contact-info">
+            <div class="contact-item">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
+                <span><strong>Email:</strong> <a href="mailto:silverstreak622000@yahoo.com">silverstreak622000@yahoo.com</a></span>
+            </div>
+            <p style="margin-top: 15px; color: #666;">We aim to respond to all inquiries within 24-48 hours.</p>
+        </div>
+
+        <h2>About CourtHub</h2>
+        <p>CourtHub helps you find basketball, pickleball, and tennis courts near you with real-time player counts. Whether you're looking for an empty court or want to join an active game, CourtHub makes it easy to discover and check in to courts in your area.</p>
+
+        <h2>Features</h2>
+        <ul class="feature-list">
+            <li>Interactive map showing nearby courts for basketball, pickleball, and tennis</li>
+            <li>Real-time player counts for each court</li>
+            <li>Browse as guest with limited features; create a free account for full access</li>
+            <li>Check in to courts and let others know you're playing</li>
+            <li>View court details, ratings, and reviews</li>
+            <li>Save your favorite courts</li>
+            <li>Connect with friends and create pickup games</li>
+            <li>Get notifications when friends are playing nearby</li>
+        </ul>
+
+        <h2>Frequently Asked Questions</h2>
+        
+        <div class="faq-item">
+            <div class="faq-question">Q: Do I need an account to use CourtHub?</div>
+            <div class="faq-answer">A: You can browse as a guest with limited features (nearby and search). To check in, save favorites, connect with friends, and get notifications, create a free account for full access.</div>
+        </div>
+
+        <div class="faq-item">
+            <div class="faq-question">Q: How do I find nearby courts?</div>
+            <div class="faq-answer">A: Open the app and navigate to the "Map" tab. You'll see all available parks with basketball, pickleball, and tennis courts in your vicinity.</div>
+        </div>
+
+        <div class="faq-item">
+            <div class="faq-question">Q: How do I check in to a court?</div>
+            <div class="faq-answer">A: Select a park from the map or home page, then choose a specific court. Tap the "Check In" button and enter the number of players.</div>
+        </div>
+
+        <div class="faq-item">
+            <div class="faq-question">Q: How does real-time player count work?</div>
+            <div class="faq-answer">A: Users check in to courts when they arrive, and the player count updates automatically. When they leave, they can check out to update the count for others.</div>
+        </div>
+
+        <div class="faq-item">
+            <div class="faq-question">Q: What if a court's player count is incorrect?</div>
+            <div class="faq-answer">A: You can update the player count for any court you are checked into. Simply go to the park detail page, select the court, and adjust the number.</div>
+        </div>
+
+        <div class="faq-item">
+            <div class="faq-question">Q: Why does CourtHub need my location?</div>
+            <div class="faq-answer">A: We use your location to show you nearby courts on the map and help you find the closest places to play. Your location is only used while you're using the app and is never shared with other users without your permission.</div>
+        </div>
+
+        <div class="faq-item">
+            <div class="faq-question">Q: Is CourtHub free?</div>
+            <div class="faq-answer">A: Yes, the core features are free to use. We may offer optional paid upgrades in the future to enhance your experience.</div>
+        </div>
+
+        <div class="faq-item">
+            <div class="faq-question">Q: How do I report a bug or suggest a feature?</div>
+            <div class="faq-answer">A: Please email us at <a href="mailto:silverstreak622000@yahoo.com">silverstreak622000@yahoo.com</a> with a detailed description of the issue or your feature request.</div>
+        </div>
+
+        <div class="faq-item">
+            <div class="faq-question">Q: Can I add a new court that's not on the map?</div>
+            <div class="faq-answer">A: Currently, courts are sourced from public databases. If you'd like to request a new court be added, please email us with the court name and location.</div>
+        </div>
+
+        <h2>Privacy</h2>
+        <p>CourtHub respects your privacy. We only collect information necessary to provide our services:</p>
+        <ul class="feature-list">
+            <li>Location data is used only to show nearby courts</li>
+            <li>Your email is used for account management and notifications</li>
+            <li>Profile information is only visible to users you connect with</li>
+            <li>We never sell your data to third parties</li>
+        </ul>
+
+        <h2>Technical Support</h2>
+        <p>If you're experiencing technical issues:</p>
+        <ul class="feature-list">
+            <li>Make sure you have the latest version of the app</li>
+            <li>Check your internet connection</li>
+            <li>Try logging out and logging back in</li>
+            <li>If the issue persists, email us with details about the problem</li>
+        </ul>
+
+        <footer>
+            <p>&copy; 2025 CourtHub. All rights reserved.</p>
+            <p>Version 1.0</p>
+            <p style="margin-top: 10px;">Last updated: <span id="last-updated"></span></p>
+        </footer>
+    </div>
+    <script>
+        // Display last modified date
+        const lastModified = new Date(document.lastModified);
+        document.getElementById('last-updated').textContent = lastModified.toLocaleDateString('en-US', { 
+            year: 'numeric', 
+            month: 'long', 
+            day: 'numeric' 
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+CourtHub - Firebase Hosting Deployment Guide
+=============================================
+
+Your support page is now ready at /support.html
+
+DEPLOYMENT STEPS:
+-----------------
+
+1. Deploy using Dreamflow's Publish button (top-right corner)
+   OR
+   Run this command in your terminal:
+   
+   cd /path/to/your/project
+   firebase deploy --only hosting
+
+2. After deployment, you'll get a Firebase Hosting URL like:
+   https://your-project-id.web.app/
+   OR
+   https://your-project-id.firebaseapp.com/
+
+3. Your support page will be accessible at:
+   https://your-project-id.web.app/support.html
+
+4. Update App Store Connect:
+   - Go to App Store Connect
+   - Navigate to your app → App Information
+   - Update the Support URL field with:
+     https://your-project-id.web.app/support.html
+   - Save changes
+   - Resubmit your app for review
+
+WHAT'S DEPLOYED:
+----------------
+- Main app: https://your-project-id.web.app/
+- Support page: https://your-project-id.web.app/support.html
+
+The support page includes:
+✓ Contact form
+✓ Support email (silverstreak622000@yahoo.com)
+✓ FAQ section
+✓ Professional design matching CourtHub branding
+
+Need help? Email: silverstreak622000@yahoo.com

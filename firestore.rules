@@ -1,0 +1,103 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+    
+    // Users collection - signed-in users can read all profiles, but only update their own
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isOwner(userId);
+      allow update, delete: if isOwner(userId);
+    }
+    
+    // Parks collection - public read, signed-in users can write
+    match /parks/{parkId} {
+      allow read: if true;
+      allow create, update: if isSignedIn();
+      allow delete: if isSignedIn();
+    }
+    
+    // Games collection - public read, signed-in users can create
+    match /games/{gameId} {
+      allow read: if true;
+      allow create: if isSignedIn();
+      allow update, delete: if isSignedIn() && 
+        (request.auth.uid == resource.data.creatorId || 
+         request.auth.uid in resource.data.playerIds);
+    }
+    
+    // Reviews collection - public read, signed-in users can create their own
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.userId;
+      allow update, delete: if isSignedIn() && request.auth.uid == resource.data.userId;
+    }
+    
+    // Check-ins collection - public read, signed-in users can manage their own
+    match /checkins/{checkinId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.userId;
+      allow update, delete: if isSignedIn() && request.auth.uid == resource.data.userId;
+    }
+    
+    // Friend requests collection - users can read their own requests and manage accordingly
+    match /friend_requests/{requestId} {
+      allow read: if isSignedIn() && 
+        (request.auth.uid == resource.data.senderId || 
+         request.auth.uid == resource.data.receiverId);
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.senderId;
+      allow update: if isSignedIn() && 
+        (request.auth.uid == resource.data.senderId || 
+         request.auth.uid == resource.data.receiverId);
+      allow delete: if isSignedIn() && 
+        (request.auth.uid == resource.data.senderId || 
+         request.auth.uid == resource.data.receiverId);
+    }
+    
+    // Groups collection - signed-in users can read and create
+    match /groups/{groupId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.creatorId;
+      allow update, delete: if isSignedIn() && 
+        (request.auth.uid == resource.data.creatorId || 
+         request.auth.uid in resource.data.memberIds);
+    }
+    
+    // Invites collection - users can read their own invites
+    match /invites/{inviteId} {
+      allow read: if isSignedIn() && 
+        (request.auth.uid == resource.data.senderId || 
+         request.auth.uid == resource.data.receiverId);
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.senderId;
+      allow update, delete: if isSignedIn() && 
+        (request.auth.uid == resource.data.senderId || 
+         request.auth.uid == resource.data.receiverId);
+    }
+    
+    // Notifications collection - users can read their own notifications
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && request.auth.uid == resource.data.userId;
+      allow create: if isSignedIn();
+      allow update, delete: if isSignedIn() && request.auth.uid == resource.data.userId;
+    }
+    
+    // FCM tokens subcollection under users
+    match /users/{userId}/tokens/{tokenId} {
+      allow read, write: if isOwner(userId);
+    }
+    
+    // Support messages - allow anyone to submit support requests from the website
+    match /support_messages/{messageId} {
+      allow create: if true;
+      allow read, update, delete: if false;
+    }
+  }
+}
