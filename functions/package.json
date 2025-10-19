@@ -1,6 +1,6 @@
 {
-  "name": "hoopsight-functions",
-  "description": "Firebase Cloud Functions for HoopSight",
+  "name": "courthub-functions",
+  "description": "Firebase Cloud Functions for CourtHub",
   "version": "1.0.0",
   "engines": {
     "node": "18"
@@ -16,3 +16,4 @@
     "firebase-functions": "^4.5.0"
   }
 }
+
