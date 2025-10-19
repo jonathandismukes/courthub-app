@@ -1,4 +1,4 @@
-name: Firebase Functions Deploy
+name: Deploy Firebase Functions
 
 on:
   workflow_dispatch:
@@ -6,46 +6,49 @@ on:
     paths:
       - 'functions/**'
       - 'firebase.json'
-      - '.firebaserc'
-      - '.github/workflows/firebase-functions-deploy.yml'
+      - 'firestore.rules'
+      - 'firestore.indexes.json'
+      - 'storage.rules'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: firebase-functions-deploy
+  cancel-in-progress: true
 
 jobs:
-  deploy-functions:
+  deploy:
+    name: Deploy Cloud Functions
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node 18
+      - name: Setup Node.js 18
         uses: actions/setup-node@v4
         with:
           node-version: '18'
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
+          export_default_credentials: true
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
 
       - name: Install Functions dependencies
         working-directory: functions
         run: npm ci
 
-      - name: Diagnostics — verify firebase.json at repo root
-        run: |
-          echo "Working directory:" && pwd
-          echo "List root:" && ls -la
-          test -f firebase.json && echo "Found firebase.json" || (echo "Missing firebase.json" && exit 1)
-          test -f .firebaserc && echo "Found .firebaserc" || echo "No .firebaserc (ok if project is set in firebase.json)"
-
-      - name: Set Functions config (Geo keys)
-        uses: w9jds/firebase-action@v13
-        with:
-          args: functions:config:set maps.geoapify_key="${{ secrets.GEOAPIFY_KEY }}"
+      - name: Set Functions config (Geoapify key)
         env:
-          GCP_SA_KEY: ${{ secrets.FIREBASE_DEPLOY_KEY }}
+          GEOAPIFY_KEY: ${{ secrets.GEOAPIFY_KEY }}
+        run: |
+          firebase --project courthub-app functions:config:set maps.geoapify_key="$GEOAPIFY_KEY"
 
       - name: Deploy Cloud Functions
-        uses: w9jds/firebase-action@v13
-        with:
-          args: deploy --only functions --config firebase.json --non-interactive
-        env:
-          GCP_SA_KEY: ${{ secrets.FIREBASE_DEPLOY_KEY }}
+        run: firebase deploy --only functions --project courthub-app
