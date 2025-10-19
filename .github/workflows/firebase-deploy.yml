@@ -1,4 +1,4 @@
-name: Cloud Functions Deploy (Resilient New New)
+name: Cloud Functions Deploy (Auto-Detect New New)
 
 on:
   push:
@@ -27,29 +27,66 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          # Reuse the same service account JSON secret used by hosting deploy
+          # Uses the same service account JSON secret as hosting deploy
           credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
 
-      - name: Show repo root for context
+      - name: Show workspace context
         run: |
-          echo "Repo root: $(pwd)"
+          echo "PWD: $(pwd)"
+          echo "Repo contents (top level):"
           ls -la
+          echo "Known config files:"
+          ls -la firebase.json || true
+          ls -la .firebaserc || true
 
-      - name: Verify functions directory
+      - name: Locate Functions directory
+        id: locate
+        shell: bash
         run: |
-          if [ ! -f "functions/package.json" ]; then
-            echo "::error::functions/package.json not found at repo root."
-            echo "Checked: $(pwd)/functions/package.json"
-            echo "If your functions folder is elsewhere, move/copy it to ./functions or adjust your workflow paths."
+          set -euo pipefail
+          FOUND_DIR=""
+          if [ -f "functions/package.json" ]; then
+            FOUND_DIR="functions"
+          else
+            # Try to find a package.json that depends on firebase-functions (depth 4)
+            CANDIDATE=$(grep -Rsl --include=package.json -m 1 '"firebase-functions"' . || true)
+            if [ -n "$CANDIDATE" ]; then
+              FOUND_DIR=$(dirname "$CANDIDATE")
+            fi
+          fi
+
+          if [ -z "$FOUND_DIR" ]; then
+            echo "::error::Could not find a Functions package.json."
+            echo "Searched for a package.json containing \"firebase-functions\" up to depth 4."
+            echo "Listing package.json files found at top 3 levels for debugging:"
+            find . -maxdepth 3 -type f -name package.json -print || true
             exit 1
           fi
+
+          echo "Functions directory detected: $FOUND_DIR"
+          echo "FUNCTIONS_DIR=$FOUND_DIR" >> "$GITHUB_ENV"
 
       - name: Install Firebase CLI
         run: npm install --global firebase-tools
 
-      - name: Install Functions dependencies
-        working-directory: functions
-        run: npm install --no-audit --no-fund
+      - name: Show Functions directory contents
+        run: |
+          echo "Using FUNCTIONS_DIR=$FUNCTIONS_DIR"
+          ls -la "$FUNCTIONS_DIR"
+
+      - name: Install Functions dependencies (prefer npm ci when lockfile exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "$FUNCTIONS_DIR/package-lock.json" ]; then
+            echo "Lockfile found → npm ci"
+            npm ci --prefix "$FUNCTIONS_DIR"
+          else
+            echo "No lockfile → npm install"
+            npm install --no-audit --no-fund --prefix "$FUNCTIONS_DIR"
+          fi
 
       - name: Deploy Functions (us-central1)
-        run: firebase deploy --only functions --project courthub-app --non-interactive
+        run: |
+          # Run from repo root so firebase.json (at root) is picked up.
+          firebase deploy --only functions --project courthub-app --non-interactive
