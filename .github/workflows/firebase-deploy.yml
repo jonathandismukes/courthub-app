@@ -1,4 +1,4 @@
-name: Cloud Functions Deploy
+name: Cloud Functions Deploy (Resilient New New)
 
 on:
   push:
@@ -30,12 +30,26 @@ jobs:
           # Reuse the same service account JSON secret used by hosting deploy
           credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
 
+      - name: Show repo root for context
+        run: |
+          echo "Repo root: $(pwd)"
+          ls -la
+
+      - name: Verify functions directory
+        run: |
+          if [ ! -f "functions/package.json" ]; then
+            echo "::error::functions/package.json not found at repo root."
+            echo "Checked: $(pwd)/functions/package.json"
+            echo "If your functions folder is elsewhere, move/copy it to ./functions or adjust your workflow paths."
+            exit 1
+          fi
+
       - name: Install Firebase CLI
         run: npm install --global firebase-tools
 
-      # Using npm install to avoid lockfile requirement in CI
       - name: Install Functions dependencies
-        run: npm install --no-audit --no-fund --prefix functions
+        working-directory: functions
+        run: npm install --no-audit --no-fund
 
       - name: Deploy Functions (us-central1)
         run: firebase deploy --only functions --project courthub-app --non-interactive
