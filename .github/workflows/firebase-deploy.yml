@@ -1,46 +1,30 @@
-name: Cloud Functions Deploy (Auto-Detect New New)
+name: Firebase Functions Deploy (Node 18, auto-skip)
 
 on:
+  workflow_dispatch: {}
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: [ main ]
+    paths:
+      - 'functions/**'
+      - '.github/workflows/firebase-functions-deploy.yml'
 
-permissions:
-  contents: read
-  id-token: write
+concurrency:
+  group: functions-deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build_and_deploy:
-    name: Deploy Functions
+  deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (match Functions engines)
-        uses: actions/setup-node@v4
-        with:
-          # Must match functions/package.json → engines.node
-          node-version: '18'
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          # Uses the same service account JSON secret as hosting deploy
-          credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
-
-      - name: Show workspace context
-        run: |
-          echo "PWD: $(pwd)"
-          echo "Repo contents (top level):"
-          ls -la
-          echo "Known config files:"
-          ls -la firebase.json || true
-          ls -la .firebaserc || true
-
-      - name: Locate Functions directory
-        id: locate
+      - name: Detect Functions directory
+        id: detect
         shell: bash
         run: |
           set -euo pipefail
@@ -48,7 +32,6 @@ jobs:
           if [ -f "functions/package.json" ]; then
             FOUND_DIR="functions"
           else
-            # Try to find a package.json that depends on firebase-functions (depth 4)
             CANDIDATE=$(grep -Rsl --include=package.json -m 1 '"firebase-functions"' . || true)
             if [ -n "$CANDIDATE" ]; then
               FOUND_DIR=$(dirname "$CANDIDATE")
@@ -56,37 +39,45 @@ jobs:
           fi
 
           if [ -z "$FOUND_DIR" ]; then
-            echo "::error::Could not find a Functions package.json."
-            echo "Searched for a package.json containing \"firebase-functions\" up to depth 4."
-            echo "Listing package.json files found at top 3 levels for debugging:"
-            find . -maxdepth 3 -type f -name package.json -print || true
-            exit 1
-          fi
-
-          echo "Functions directory detected: $FOUND_DIR"
-          echo "FUNCTIONS_DIR=$FOUND_DIR" >> "$GITHUB_ENV"
-
-      - name: Install Firebase CLI
-        run: npm install --global firebase-tools
-
-      - name: Show Functions directory contents
-        run: |
-          echo "Using FUNCTIONS_DIR=$FUNCTIONS_DIR"
-          ls -la "$FUNCTIONS_DIR"
-
-      - name: Install Functions dependencies (prefer npm ci when lockfile exists)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f "$FUNCTIONS_DIR/package-lock.json" ]; then
-            echo "Lockfile found → npm ci"
-            npm ci --prefix "$FUNCTIONS_DIR"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No Cloud Functions package found; skipping deploy."
           else
-            echo "No lockfile → npm install"
-            npm install --no-audit --no-fund --prefix "$FUNCTIONS_DIR"
+            echo "found=true"  >> "$GITHUB_OUTPUT"
+            echo "dir=$FOUND_DIR" >> "$GITHUB_OUTPUT"
+            echo "Detected functions directory: $FOUND_DIR"
           fi
 
-      - name: Deploy Functions (us-central1)
+      - name: Setup Node 18
+        if: steps.detect.outputs.found == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: ${{ steps.detect.outputs.dir }}/package-lock.json
+
+      - name: Install dependencies
+        if: steps.detect.outputs.found == 'true'
         run: |
-          # Run from repo root so firebase.json (at root) is picked up.
-          firebase deploy --only functions --project courthub-app --non-interactive
+          npm install --no-audit --no-fund --prefix "${{ steps.detect.outputs.dir }}"
+
+      - name: Authenticate to Google Cloud (Service Account)
+        if: steps.detect.outputs.found == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
+          export_default_credentials: true
+
+      - name: Deploy Cloud Functions (project: courthub-app)
+        if: steps.detect.outputs.found == 'true'
+        env:
+          CI: true
+        run: |
+          npx --yes firebase-tools@13.15.4 deploy \
+            --only functions \
+            --project courthub-app \
+            --non-interactive \
+            --force
+
+      - name: Skipped (no Functions detected)
+        if: steps.detect.outputs.found != 'true'
+        run: echo "No Cloud Functions found in the repository. Deploy skipped."
