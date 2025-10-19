@@ -1,12 +1,13 @@
-name: Deploy Firebase Functions
+name: Firebase Functions Deploy (No Lockfile)
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'functions/**'
-      - '.github/workflows/firebase-functions.yml'
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "functions/**"
+      - ".github/workflows/firebase-functions-deploy.yml"
 
 permissions:
   contents: read
@@ -14,36 +15,40 @@ permissions:
 
 jobs:
   deploy:
+    name: Deploy Cloud Functions
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      - name: Install Functions dependencies (npm ci if lockfile exists)
-        working-directory: functions
+      - name: Verify Functions directory
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
+          if [ ! -f "functions/package.json" ]; then
+            echo "::error::Missing functions/package.json. Ensure Cloud Functions live in functions/."
+            exit 1
           fi
 
-      - name: Authenticate to Google Cloud (service account)
-        id: auth
-        uses: google-github-actions/auth@v2
+      - name: Setup Node 18 (no caching)
+        uses: actions/setup-node@v4
         with:
-          credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
-          export_default_credentials: true
+          node-version: 18.x
 
-      - name: Install Firebase CLI
-        run: npm install -g firebase-tools
+      - name: Install Functions dependencies (no lockfile required)
+        working-directory: functions
+        run: npm install --no-audit --no-fund
 
-      - name: Deploy Cloud Functions to courthub-app
+      - name: Deploy Firebase Functions (uses service account or token)
+        uses: w9jds/firebase-action@v3.2.0
+        with:
+          args: deploy --only functions --project courthub-app
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
-        run: firebase deploy --only functions --project courthub-app
+          PROJECT_ID: courthub-app
+          WORKING_DIR: functions
+          # Preferred: service account JSON stored in GitHub secret FIREBASE_DEPLOY_KEY
+          GCP_SA_KEY: ${{ secrets.FIREBASE_DEPLOY_KEY }}
+          # Fallback: classic Firebase CI token stored in FIREBASE_TOKEN
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+
+      - name: Outcome
+        if: ${{ success() }}
+        run: echo "Functions deploy completed."
