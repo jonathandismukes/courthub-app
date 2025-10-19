@@ -67,7 +67,7 @@ jobs:
           credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
           export_default_credentials: true
 
-      - name: Deploy Cloud Functions (project: courthub-app)
+      - name: Deploy Cloud Functions (project:courthub-app)
         if: steps.detect.outputs.found == 'true'
         env:
           CI: true
