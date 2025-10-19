@@ -1,4 +1,4 @@
-name: Firebase Functions Deploy (Node 18, Auto-Skip)
+name: Firebase Functions Deploy (No Lockfile)
 
 on:
   workflow_dispatch:
@@ -21,59 +21,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - id: detect
-        name: Detect Functions directory
-        shell: bash
+      - name: Verify Functions directory
         run: |
-          set -euo pipefail
-          FOUND_DIR=""
-          if [ -f "functions/package.json" ]; then
-            FOUND_DIR="functions"
-          else
-            CANDIDATE=$(grep -Rsl --include=package.json -m 1 '"firebase-functions"' . || true)
-            if [ -n "$CANDIDATE" ]; then
-              FOUND_DIR=$(dirname "$CANDIDATE")
-            fi
-          fi
-          if [ -n "$FOUND_DIR" ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "dir=$FOUND_DIR" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "dir=" >> "$GITHUB_OUTPUT"
+          if [ ! -f "functions/package.json" ]; then
+            echo "::error::Missing functions/package.json. Ensure Cloud Functions live in functions/."
+            exit 1
           fi
 
-      - name: Setup Node 18
-        if: steps.detect.outputs.found == 'true'
+      - name: Setup Node 18 (no caching)
         uses: actions/setup-node@v4
         with:
-          node-version: 18
-          cache: npm
-          cache-dependency-path: ${{ steps.detect.outputs.dir }}/package-lock.json
+          node-version: 18.x
 
-      - name: Install dependencies
-        if: steps.detect.outputs.found == 'true'
-        run: |
-          npm ci --no-audit --no-fund --prefix "${{ steps.detect.outputs.dir }}"
+      - name: Install Functions dependencies (no lockfile required)
+        working-directory: functions
+        run: npm install --no-audit --no-fund
 
-      - name: Authenticate to Google Cloud (Service Account)
-        if: steps.detect.outputs.found == 'true'
-        uses: google-github-actions/auth@v2
+      - name: Deploy Firebase Functions (uses service account or token)
+        uses: w9jds/firebase-action@v3.2.0
         with:
-          credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
-          export_default_credentials: true
-
-      - name: Deploy Cloud Functions (courthub-app)
-        if: steps.detect.outputs.found == 'true'
+          args: deploy --only functions --project courthub-app
         env:
-          CI: true
-        run: |
-          npx --yes firebase-tools@13.15.4 deploy \
-            --only functions \
-            --project courthub-app \
-            --non-interactive \
-            --force
+          PROJECT_ID: courthub-app
+          WORKING_DIR: functions
+          # Preferred: service account JSON stored in GitHub secret FIREBASE_DEPLOY_KEY
+          GCP_SA_KEY: ${{ secrets.FIREBASE_DEPLOY_KEY }}
+          # Fallback: classic Firebase CI token stored in FIREBASE_TOKEN
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
 
-      - name: Skipped (no Functions detected)
-        if: steps.detect.outputs.found != 'true'
-        run: echo "No Firebase Functions found; skipping deploy."
+      - name: Outcome
+        if: ${{ success() }}
+        run: echo "Functions deploy completed."
