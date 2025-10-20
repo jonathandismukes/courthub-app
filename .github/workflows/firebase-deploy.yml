@@ -89,8 +89,38 @@ jobs:
       - name: Install Firebase CLI
         run: npm install -g firebase-tools@13
 
+      - name: Repo tree (top-level)
+        run: |
+          echo "--- ls -la (repo root) ---"
+          ls -la
+          echo "--- ls -la functions/ (if exists) ---"
+          [ -d functions ] && ls -la functions || echo "(no functions directory)"
+
+      - name: Locate firebase.json and set paths
+        id: locate_cfg
+        shell: bash
+        run: |
+          set -e
+          if [ -f firebase.json ]; then
+            FIREBASE_DIR='.'
+          elif [ -f functions/firebase.json ]; then
+            FIREBASE_DIR='functions'
+          else
+            echo "::error::firebase.json not found at repo root or functions/."
+            echo "Repository tree:"; ls -la; echo "functions/ tree:"; [ -d functions ] && ls -la functions || true
+            exit 1
+          fi
+          echo "Using FIREBASE_DIR=$FIREBASE_DIR"
+          echo "FIREBASE_DIR=$FIREBASE_DIR" >> $GITHUB_ENV
+          # Derive functions source directory from firebase.json
+          FUNCTIONS_SOURCE=$(node -e "const fs=require('fs');const p=process.env.FIREBASE_DIR+'/firebase.json';const cfg=JSON.parse(fs.readFileSync(p,'utf8'));const src=(cfg.functions&&cfg.functions.source)||'functions';process.stdout.write(src)")
+          echo "FUNCTIONS_SOURCE=$FUNCTIONS_SOURCE" >> $GITHUB_ENV
+          FUNCTIONS_ABS_DIR="$FIREBASE_DIR/$FUNCTIONS_SOURCE"
+          echo "FUNCTIONS_ABS_DIR=$FUNCTIONS_ABS_DIR" >> $GITHUB_ENV
+          echo "Resolved functions directory: $FUNCTIONS_ABS_DIR"
+
       - name: Install functions dependencies (with fallback)
-        working-directory: functions
+        working-directory: ${{ env.FUNCTIONS_ABS_DIR }}
         run: |
           if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
             echo "Using npm ci";
@@ -104,10 +134,13 @@ jobs:
       - name: Set Firebase functions config (geoapify)
         if: ${{ env.GEOAPIFY_KEY != '' }}
         continue-on-error: true
+        working-directory: ${{ env.FIREBASE_DIR }}
         run: |
           echo "Setting functions config for maps.geoapify_key"
           firebase --project ${{ env.TARGET_PROJECT }} functions:config:set maps.geoapify_key="$GEOAPIFY_KEY"
 
       - name: Deploy Cloud Functions
+        working-directory: ${{ env.FIREBASE_DIR }}
         run: |
+          echo "Deploying from $(pwd) using $(ls -1 firebase.json)"
           firebase deploy --only functions --project ${{ env.TARGET_PROJECT }}
