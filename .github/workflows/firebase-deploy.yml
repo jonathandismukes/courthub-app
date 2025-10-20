@@ -26,10 +26,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: WORKFLOW SIGNATURE
+        run: echo "COURTHUB Functions Deploy v2 | file=docs/firebase-functions-deploy.yml.copy"
+
       - name: Setup Node.js 18
         uses: actions/setup-node@v4
         with:
           node-version: '18'
+
+      - name: Print Node and npm versions
+        run: |
+          node -v
+          npm -v
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -44,9 +52,11 @@ jobs:
       - name: Install Functions dependencies
         working-directory: functions
         run: |
+          echo "Current directory: $(pwd)"
+          ls -la
           if [ -f package-lock.json ]; then
             echo "Lockfile found -> npm ci"
-            npm ci
+            npm ci || (echo "npm ci failed, falling back to npm install" && npm install)
           else
             echo "No lockfile -> npm install"
             npm install
