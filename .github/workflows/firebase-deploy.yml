@@ -110,6 +110,8 @@ jobs:
             echo "Repository tree:"; ls -la; echo "functions/ tree:"; [ -d functions ] && ls -la functions || true
             exit 1
           fi
+          # Make FIREBASE_DIR visible to this step's sub-processes and to later steps
+          export FIREBASE_DIR="$FIREBASE_DIR"
           echo "Using FIREBASE_DIR=$FIREBASE_DIR"
           echo "FIREBASE_DIR=$FIREBASE_DIR" >> $GITHUB_ENV
           # Derive functions source directory from firebase.json
