@@ -1027,6 +1027,45 @@ async function sendNotificationsToUsers(db, userIds, title, body, data) {
  */
 
 const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+// Overpass mirror endpoints for resiliency
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.openstreetmap.ru/api/interpreter',
+  'https://overpass.nchc.org.tw/api/interpreter'
+];
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// POST helper with mirror rotation, retries, and backoff
+async function postOverpass({ query, userAgent = 'Courthub/1.0 (+courthub.app)', attemptsPerMirror = 2 }) {
+  // Shuffle start index for basic load distribution
+  const start = Math.floor(Math.random() * OVERPASS_MIRRORS.length);
+  const order = OVERPASS_MIRRORS.map((_, i) => OVERPASS_MIRRORS[(start + i) % OVERPASS_MIRRORS.length]);
+
+  for (const mirror of order) {
+    for (let attempt = 0; attempt < Math.max(1, attemptsPerMirror); attempt++) {
+      const res = await httpRequest('POST', mirror, {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'User-Agent': userAgent,
+        },
+        body: `data=${encodeURIComponent(query)}`,
+      });
+      if (res && res.ok) return res;
+      // Backoff for throttle/server errors, otherwise try next mirror
+      const status = res && typeof res.status === 'number' ? res.status : 0;
+      const retryable = status === 0 || status === 429 || (status >= 500 && status < 600);
+      if (retryable) {
+        await sleep(500 + attempt * 750);
+        continue;
+      } else {
+        break;
+      }
+    }
+  }
+  throw new functions.https.HttpsError('unavailable', 'All Overpass mirrors failed');
+}
 
 const WEST_TO_EAST_STATE_ORDER = [
   'CA', 'OR', 'WA', // West Coast
@@ -1287,13 +1326,7 @@ async function runOsmImportBatch({ db, adminUid, state, maxCreates, nodesOnly })
   if (!query) {
     throw new functions.https.HttpsError('invalid-argument', 'Could not build query');
   }
-  const res = await httpRequest('POST', OVERPASS_URL, {
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'User-Agent': 'Courthub-Importer/1.0 (+courthub.app)'
-    },
-    body: `data=${encodeURIComponent(query)}`,
-  });
+  const res = await postOverpass({ query, userAgent: 'Courthub-Importer/1.0 (+courthub.app)' });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     console.warn('Overpass error', res.status, text.slice(0, 200));
@@ -1350,11 +1383,43 @@ exports.importOsmCourtsByState = functions
  * Progress is written to imports/osm with fields: { state, created, skippedExists,
  * lastRunAt, nextIndex, nodesOnly, maxCreates, more, phase, cycleCount }
  */
-exports.scheduledOsmImportBatch = functions.pubsub
-  .schedule('every 15 minutes')
+exports.scheduledOsmImportBatch = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub.schedule('every 7 minutes')
   .timeZone('Etc/UTC')
   .onRun(async (context) => {
     const db = admin.firestore();
+    // Overlapping-run protection: Firestore lease
+    async function acquireLease(db, name, ttlSeconds, owner) {
+      const ref = db.collection('imports').doc('osm').collection('locks').doc(name);
+      return db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        const now = Date.now();
+        const data = snap.exists ? snap.data() : {};
+        const untilMs = data && data.leaseUntil ? new Date(data.leaseUntil).getTime() : 0;
+        if (untilMs > now && data.owner && data.owner !== owner) {
+          return false;
+        }
+        const leaseUntil = new Date(now + Math.max(60, ttlSeconds) * 1000).toISOString();
+        tx.set(ref, { owner, leaseUntil, updatedAt: new Date().toISOString() }, { merge: true });
+        return true;
+      });
+    }
+    async function releaseLease(db, name, owner) {
+      try {
+        const ref = db.collection('imports').doc('osm').collection('locks').doc(name);
+        await db.runTransaction(async (tx) => {
+          const snap = await tx.get(ref);
+          if (!snap.exists) return;
+          const data = snap.data() || {};
+          if (data.owner && data.owner !== owner) return; // don't steal someone else's lease
+          tx.set(ref, { leaseUntil: new Date(0).toISOString(), updatedAt: new Date().toISOString(), owner: data.owner || owner }, { merge: true });
+        });
+      } catch (_) {}
+    }
+
+    const leaseOwner = context.eventId || `scheduler_${Date.now()}`;
+    let leaseAcquired = false;
     try {
       const statusRef = db.collection('imports').doc('osm');
       const logsColl = statusRef.collection('logs');
@@ -1381,6 +1446,18 @@ exports.scheduledOsmImportBatch = functions.pubsub
         }).catch(() => {});
         return null;
       }
+
+      // Acquire lease for up to 8 minutes (buffer > schedule interval)
+      const gotLease = await acquireLease(db, 'main', 8 * 60, leaseOwner);
+      if (!gotLease) {
+        const nowIso = new Date().toISOString();
+        console.log('Auto OSM import skipped: lease active');
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: lease active' }, { merge: true }).catch(() => {});
+        const runId = `${nowIso.replace(/[:.]/g, '-')}_skipped_lease`;
+        await logsColl.doc(runId).set({ runId, ts: nowIso, ok: true, note: 'lease active, skipped' }).catch(() => {});
+        return null;
+      }
+      leaseAcquired = true;
 
       const cfgNodesOnlyDefault = cfg.autoOsmImportNodesOnly !== false; // default true
       const maxCreates = Math.max(1, Math.min(4000, Number(cfg.autoOsmImportMaxCreates) || 1500));
@@ -1495,6 +1572,10 @@ exports.scheduledOsmImportBatch = functions.pubsub
         console.warn('Failed to write failure log', logErr);
       }
       return null;
+    } finally {
+      if (leaseAcquired) {
+        await releaseLease(db, 'main', leaseOwner).catch(() => {});
+      }
     }
   });
 
@@ -1525,10 +1606,7 @@ exports.scheduledOsmAuditAndBacklog = functions.pubsub
 
         // Overpass lightweight count
         const countQuery = makeOverpassCountQueryForState(state, 'basketball|tennis|pickleball', { nodesOnly: false });
-        const res = await httpRequest('POST', OVERPASS_URL, {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'User-Agent': 'Courthub-Audit/1.0 (+courthub.app)' },
-          body: `data=${encodeURIComponent(countQuery)}`,
-        });
+        const res = await postOverpass({ query: countQuery, userAgent: 'Courthub-Audit/1.0 (+courthub.app)' });
         let osmCount = 0;
         if (res.ok) {
           const json = await res.json();
@@ -1543,10 +1621,7 @@ exports.scheduledOsmAuditAndBacklog = functions.pubsub
         // If coverage looks low, queue city backfill for this state
         if (osmCount > 0 && coverage < 0.7) {
           const cityQuery = makeOverpassCitiesInStateQuery(state);
-          const cRes = await httpRequest('POST', OVERPASS_URL, {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'User-Agent': 'Courthub-Audit/1.0 (+courthub.app)' },
-            body: `data=${encodeURIComponent(cityQuery)}`,
-          });
+          const cRes = await postOverpass({ query: cityQuery, userAgent: 'Courthub-Audit/1.0 (+courthub.app)' });
           if (cRes.ok) {
             const cJson = await cRes.json();
             const cities = (Array.isArray(cJson.elements) ? cJson.elements : [])
@@ -1632,10 +1707,7 @@ exports.scheduledOsmBackfillCityBatch = functions.pubsub
 
       const radiusM = Math.round((task.radiusKm || 10) * 1000);
       const query = makeOverpassQueryAroundPoint(task.lat, task.lon, radiusM, 'basketball|tennis|pickleball', { nodesOnly: false });
-      const res = await httpRequest('POST', OVERPASS_URL, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'User-Agent': 'Courthub-CityBackfill/1.0 (+courthub.app)' },
-        body: `data=${encodeURIComponent(query)}`,
-      });
+      const res = await postOverpass({ query, userAgent: 'Courthub-CityBackfill/1.0 (+courthub.app)' });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         console.warn('City backfill Overpass error', res.status, text.slice(0, 160));
