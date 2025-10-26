@@ -150,12 +150,13 @@ exports.claimImporterOwner = functions.https.onCall(async (data, context) => {
 const crypto = require('crypto');
 const https = require('https');
 const { URL } = require('url');
+const zlib = require('zlib');
 
 /**
  * Minimal HTTPS helper to avoid relying on global fetch in Node runtimes.
  * Returns { ok, status, json(), text() }
  */
-function httpRequest(method, urlString, { headers = {}, body = null } = {}) {
+function httpRequest(method, urlString, { headers = {}, body = null, timeoutMs = 0 } = {}) {
   return new Promise((resolve) => {
     try {
       const url = new URL(urlString);
@@ -172,19 +173,35 @@ function httpRequest(method, urlString, { headers = {}, body = null } = {}) {
         res.on('data', (d) => chunks.push(d));
         res.on('end', () => {
           const buffer = Buffer.concat(chunks);
-          const text = buffer.toString('utf8');
-          const makeResp = (ok) => ({
-            ok,
-            status: res.statusCode || 0,
-            async json() {
-              try { return JSON.parse(text); } catch (_) { return {}; }
-            },
-            async text() { return text; },
-          });
-          resolve(makeResp(res.statusCode && res.statusCode >= 200 && res.statusCode < 300));
+          const enc = (res.headers && (res.headers['content-encoding'] || res.headers['Content-Encoding'])) || '';
+          const finish = (buf) => {
+            const text = buf.toString('utf8');
+            const makeResp = (ok) => ({
+              ok,
+              status: res.statusCode || 0,
+              async json() {
+                try { return JSON.parse(text); } catch (_) { return {}; }
+              },
+              async text() { return text; },
+            });
+            resolve(makeResp(res.statusCode && res.statusCode >= 200 && res.statusCode < 300));
+          };
+          if (enc.includes('gzip')) {
+            zlib.gunzip(buffer, (err, out) => finish(err ? buffer : out));
+          } else if (enc.includes('deflate')) {
+            zlib.inflate(buffer, (err, out) => finish(err ? buffer : out));
+          } else {
+            finish(buffer);
+          }
         });
       });
       req.on('error', () => resolve({ ok: false, status: 0, json: async () => ({}), text: async () => '' }));
+      if (timeoutMs && timeoutMs > 0) {
+        req.setTimeout(timeoutMs, () => {
+          try { req.destroy(new Error('Request timeout')); } catch (_) {}
+          resolve({ ok: false, status: 0, json: async () => ({}), text: async () => 'Request timeout' });
+        });
+      }
       if (body) {
         if (typeof body === 'string' || Buffer.isBuffer(body)) {
           req.write(body);
@@ -498,12 +515,12 @@ exports.geoTextSearch = functions.https.onCall(async (data, context) => {
       if (remaining <= 0) {
         console.log('Google fallback skipped: budget cap reached');
       } else {
-        try {
-          places = await fetchGoogleTextSearch(text, bias);
-          await consumeGoogleCalls(db, 1);
-        } catch (e) {
-          console.warn('Google text search error', e);
-        }
+      try {
+        places = await fetchGoogleTextSearch(text, bias);
+        await consumeGoogleCalls(db, 1);
+      } catch (e) {
+        console.warn('Google text search error', e);
+      }
       }
     }
 
@@ -558,14 +575,14 @@ exports.geoTextSearchV2 = functions.https.onCall(async (data, context) => {
         console.log('Google paged search skipped: budget cap reached');
       } else {
         const allowedPages = Math.max(1, Math.min(maxPages, remaining));
-        try {
-          const out = await fetchGoogleTextSearchPaged({ text, bias, pageAll, maxPages: allowedPages, pageSize });
-          places = out.places || [];
-          const pagesUsed = Math.min(allowedPages, Math.ceil((places.length || 1) / pageSize));
-          await consumeGoogleCalls(db, pagesUsed);
-        } catch (e) {
-          console.warn('Google text search v2 error', e);
-        }
+      try {
+        const out = await fetchGoogleTextSearchPaged({ text, bias, pageAll, maxPages: allowedPages, pageSize });
+        places = out.places || [];
+        const pagesUsed = Math.min(allowedPages, Math.ceil((places.length || 1) / pageSize));
+        await consumeGoogleCalls(db, pagesUsed);
+      } catch (e) {
+        console.warn('Google text search v2 error', e);
+      }
       }
     }
 
@@ -837,6 +854,406 @@ exports.geoPlaceDetails = functions.https.onCall(async (data, context) => {
 });
 
 /**
+ * ========================
+ * PARKS BACKFILL (server-side)
+ * ========================
+ * Callable + optional scheduled batch that runs the same logic as the in-app
+ * ParkBackfillService but on Cloud Functions, so it can run unattended.
+ *
+ * Control doc (Firestore): backfill/control
+ *  - enabled: boolean (default false)
+ *  - mode: 'ultraConservative' | 'balanced' | 'full' (default 'balanced')
+ *  - capPerRun: number (default 50000)
+ *  - clusterDecimals: number (default 3)
+ *  - parseCityStateNoApi: boolean (default true)
+ *  - refineNamesCap: number (default 0)
+ *  - cursor: last processed documentId (managed by the runner)
+ *
+ * Status doc: backfill/status
+ *  - scanned, updated, noCoords, apiMisses, rgCalls, clustersTouched, pages, lastRunAt, lastSuccessAt, lastError, done, cursor
+ */
+
+function isMissingAddress(s) {
+  if (!s) return true;
+  const t = String(s).trim();
+  if (!t) return true;
+  return t.toLowerCase() === 'address not specified';
+}
+
+function isMissingOrGenericName(s) {
+  const t = (s || '').trim();
+  if (!t) return true;
+  const low = t.toLowerCase();
+  if (low === 'unknown park') return true;
+  if (/^(basketball|tennis|pickleball) court(s)?$/i.test(low)) return true;
+  if (/^(court|courts)\s*\d*$/i.test(low)) return true;
+  return false;
+}
+
+function isTwoLetterState(s) { return /^[A-Za-z]{2}$/.test(s || ''); }
+
+const NAME_TO_CODE = {
+  'alabama': 'AL','alaska': 'AK','arizona': 'AZ','arkansas': 'AR','california': 'CA','colorado': 'CO','connecticut': 'CT','delaware': 'DE','florida': 'FL','georgia': 'GA','hawaii': 'HI','idaho': 'ID','illinois': 'IL','indiana': 'IN','iowa': 'IA','kansas': 'KS','kentucky': 'KY','louisiana': 'LA','maine': 'ME','maryland': 'MD','massachusetts': 'MA','michigan': 'MI','minnesota': 'MN','mississippi': 'MS','missouri': 'MO','montana': 'MT','nebraska': 'NE','nevada': 'NV','new hampshire': 'NH','new jersey': 'NJ','new mexico': 'NM','new york': 'NY','north carolina': 'NC','north dakota': 'ND','ohio': 'OH','oklahoma': 'OK','oregon': 'OR','pennsylvania': 'PA','rhode island': 'RI','south carolina': 'SC','south dakota': 'SD','tennessee': 'TN','texas': 'TX','utah': 'UT','vermont': 'VT','virginia': 'VA','washington': 'WA','west virginia': 'WV','wisconsin': 'WI','wyoming': 'WY','district of columbia': 'DC','dc': 'DC'
+};
+
+function canonState(state) {
+  const s = String(state || '').trim();
+  if (!s) return s;
+  if (isTwoLetterState(s)) return s.toUpperCase();
+  return NAME_TO_CODE[s.toLowerCase()] || s.toUpperCase();
+}
+
+function streetFromAddress(address) {
+  const a = String(address || '');
+  if (!a.trim()) return '';
+  const firstComma = a.indexOf(',');
+  if (firstComma === -1) return a.trim();
+  return a.substring(0, firstComma).trim();
+}
+
+function looksNumericStreet(street) {
+  const s = String(street || '');
+  if (!s) return false;
+  return /^\d{3,6}\s/i.test(s);
+}
+
+function sportPluralLabel(sport) {
+  switch (sport) {
+    case 'basketball': return 'Basketball Courts';
+    case 'tennisSingles':
+    case 'tennisDoubles': return 'Tennis Courts';
+    case 'pickleballSingles':
+    case 'pickleballDoubles': return 'Pickleball Courts';
+    default: return 'Basketball Courts';
+  }
+}
+
+function fallbackNameFromContext({ original, address, city, sport }) {
+  const label = sportPluralLabel(sport || 'basketball');
+  const street = streetFromAddress(address);
+  if (street && !looksNumericStreet(street)) return `${street} — ${label}`;
+  if ((city || '').trim()) return `${String(city).trim()} — ${label}`;
+  return label;
+}
+
+function parseCityStateFromAddress(address) {
+  const parts = String(address || '').split(',').map((s) => s.trim());
+  let city = '';
+  let state = '';
+  for (let i = 0; i < parts.length; i++) {
+    const m = parts[i].match(/\b([A-Za-z]{2})\b/);
+    if (m) {
+      const code = m[1];
+      if (isTwoLetterState(code)) {
+        state = code.toUpperCase();
+        if (i > 0 && !city) city = parts[i - 1];
+        break;
+      }
+    }
+  }
+  if (!state) {
+    for (let i = 0; i < parts.length; i++) {
+      const code = NAME_TO_CODE[parts[i].toLowerCase()];
+      if (code) {
+        state = code;
+        if (i > 0 && !city) city = parts[i - 1];
+        break;
+      }
+    }
+  }
+  return { city: (city || '').trim(), state: canonState(state) };
+}
+
+function titleCase(input) {
+  const s = String(input || '');
+  if (!s.trim()) return s;
+  const words = s.toLowerCase().split(/\s+/);
+  const capped = words.map((w) => (w ? w[0].toUpperCase() + (w.length > 1 ? w.substring(1) : '') : w));
+  const small = new Set(['Of','And','The','At','In','On','For','To']);
+  for (let i = 1; i < capped.length - 1; i++) { if (small.has(capped[i])) capped[i] = capped[i].toLowerCase(); }
+  return capped.join(' ');
+}
+
+function clusterKey(lat, lng, decimals = 3) {
+  const r = (v) => Number(v).toFixed(decimals);
+  return `${r(lat)},${r(lng)}`;
+}
+
+async function runParksBackfillBatch({ db, settings, ownerUid, startAfterId = null }) {
+  const pageSize = Math.max(200, Math.min(900, Number(settings.pageSize) || 600));
+  const mode = settings.mode || 'balanced';
+  const capPerRun = Math.max(0, Number(settings.capPerRun) || 50000);
+  const clusterDecimals = Math.max(2, Math.min(5, Number(settings.clusterDecimals) || 3));
+  const parseCityStateNoApi = settings.parseCityStateNoApi !== false; // default true
+  const refineNamesCap = Math.max(0, Number(settings.refineNamesCap) || 0);
+
+  let scanned = 0, updated = 0, noCoords = 0, apiMisses = 0, rgCalls = 0, clustersTouched = 0, pages = 0;
+  let refineUsed = 0;
+  const t0 = Date.now();
+  const placesCacheAddr = new Map(); // key -> { addr, city, state }
+  const clusterGoodName = new Map(); // key|sport -> name
+  const clusterGeocoded = new Set();
+
+  let base = db.collection('parks').orderBy(admin.firestore.FieldPath.documentId());
+  if (startAfterId) {
+    try {
+      const curSnap = await db.collection('parks').doc(startAfterId).get();
+      if (curSnap.exists) base = base.startAfter(curSnap);
+    } catch (_) {}
+  }
+
+  let cursor = null;
+  let writesInBatch = 0;
+  let batch = db.batch();
+
+  const commitBatch = async () => { if (writesInBatch > 0) { await batch.commit(); batch = db.batch(); writesInBatch = 0; } };
+
+  const pageSnap = await base.limit(pageSize).get();
+  if (pageSnap.empty) {
+    return { scanned: 0, updated: 0, noCoords: 0, apiMisses: 0, rgCalls: 0, clustersTouched: 0, pages: 0, cursor: null, done: true };
+  }
+
+  const docs = pageSnap.docs;
+  for (const doc of docs) {
+    scanned += 1;
+    const data = doc.data() || {};
+    const id = doc.id;
+    cursor = id;
+    const name = String(data.name || '').trim();
+    let address = String(data.address || '').trim();
+    let city = String(data.city || '').trim();
+    let state = String(data.state || '').trim();
+    const latitude = Number(data.latitude || 0);
+    const longitude = Number(data.longitude || 0);
+    const courts = Array.isArray(data.courts) ? data.courts : [];
+    const sportType = (courts && courts[0] && courts[0].sportType) || 'basketball';
+
+    const missingName = isMissingOrGenericName(name);
+    const missingAddr = isMissingAddress(address) || !city || !state;
+    if (!missingName && !missingAddr) continue;
+    if (!isFinite(latitude) || !isFinite(longitude) || latitude === 0 || longitude === 0) { noCoords += 1; continue; }
+
+    let newAddress = address;
+    let newCity = city;
+    let newState = state;
+    let newName = name;
+
+    const key = clusterKey(latitude, longitude, clusterDecimals);
+    let rg = null;
+
+    if (mode === 'ultraConservative') {
+      if (parseCityStateNoApi && (!newCity || !newState) && newAddress.trim()) {
+        const parsed = parseCityStateFromAddress(newAddress);
+        if (!newCity && parsed.city) newCity = parsed.city;
+        if (!newState && parsed.state) newState = parsed.state;
+      }
+      if (missingName) {
+        newName = fallbackNameFromContext({ original: name, address: newAddress, city: newCity, sport: sportType });
+      }
+    } else if (mode === 'balanced') {
+      const known = placesCacheAddr.get(key);
+      if (missingAddr && known) {
+        if (known.addr) newAddress = newAddress || known.addr;
+        if (known.city) newCity = newCity || known.city;
+        if (known.state) newState = newState || known.state;
+      }
+      const spKey = `${key}|${sportType.includes('tennis') ? 'tennis' : sportType.includes('pickle') ? 'pickleball' : 'basketball'}`;
+      const knownName = clusterGoodName.get(spKey);
+      if (missingName && knownName) newName = knownName;
+      if (!newAddress || isMissingAddress(newAddress) || !newCity || !newState) {
+        if (!clusterGeocoded.has(key) && rgCalls < capPerRun) {
+          try {
+            rg = await fetchGeoapifyReverse(latitude, longitude);
+            if (rg) {
+              rgCalls += 1;
+              clusterGeocoded.add(key);
+              clustersTouched += 1;
+              const gotAddr = String(rg.address || '').trim();
+              const gotCity = String(rg.city || '').trim();
+              const gotState = canonState(String(rg.state || '').trim());
+              if (gotAddr || gotCity || gotState) {
+                placesCacheAddr.set(key, { addr: gotAddr, city: gotCity, state: gotState });
+              }
+              if (missingAddr) {
+                if (!newAddress || isMissingAddress(newAddress)) newAddress = gotAddr || newAddress;
+                if (!newCity) newCity = gotCity;
+                if (!newState) newState = gotState;
+              }
+            } else {
+              apiMisses += 1;
+            }
+          } catch (_) { apiMisses += 1; }
+        }
+      }
+      if (!isMissingAddress(address) && city && state) {
+        placesCacheAddr.set(key, { addr: address, city, state: canonState(state) });
+      }
+      if (!isMissingOrGenericName(name)) {
+        clusterGoodName.set(spKey, name);
+      }
+      if (missingName) {
+        newName = fallbackNameFromContext({ original: name, address: newAddress, city: newCity, sport: sportType });
+      }
+    } else { // full
+      try { rg = await fetchGeoapifyReverse(latitude, longitude); } catch (_) { rg = null; }
+      if (!rg) { apiMisses += 1; continue; }
+      rgCalls += 1;
+      const gotAddr = String(rg.address || '').trim();
+      const gotCity = String(rg.city || '').trim();
+      const gotState = canonState(String(rg.state || '').trim());
+      if (missingAddr) {
+        if (!newAddress || isMissingAddress(newAddress)) newAddress = gotAddr || newAddress;
+        if (!newCity) newCity = gotCity;
+        if (!newState) newState = gotState;
+      }
+      if (missingName) {
+        newName = fallbackNameFromContext({ original: name, address: newAddress, city: newCity, sport: sportType });
+      }
+    }
+
+    if (parseCityStateNoApi && (!newCity || !newState) && newAddress.trim()) {
+      const parsed = parseCityStateFromAddress(newAddress);
+      if (!newCity && parsed.city) newCity = parsed.city;
+      if (!newState && parsed.state) newState = parsed.state;
+    }
+
+    if (refineNamesCap > 0 && refineUsed < refineNamesCap && isMissingOrGenericName(newName)) {
+      // Lightweight server-side name refinement: reuse reverse geocode city to build a better label
+      const label = sportPluralLabel(sportType);
+      const street = streetFromAddress(newAddress);
+      const isNum = looksNumericStreet(street);
+      if (street && !isNum) {
+        newName = `${street} — ${label}`;
+      } else if (newCity) {
+        newName = `${newCity} — ${label}`;
+      } else {
+        newName = label;
+      }
+      refineUsed += 1;
+    }
+
+    const origName = String(data.name || '');
+    const origAddr = String(data.address || '');
+    const origCity = String(data.city || '');
+    const origState = String(data.state || '');
+    const maybeTitle = (orig, val) => (val === orig ? val : titleCase(val));
+    newName = maybeTitle(origName, newName);
+    newAddress = maybeTitle(origAddr, newAddress);
+    newCity = maybeTitle(origCity, newCity);
+    const changed = (newName !== origName) || (newAddress !== origAddr) || (newCity !== origCity) || (canonState(newState) !== canonState(origState));
+    if (!changed) continue;
+
+    const update = {
+      name: newName,
+      address: newAddress,
+      city: newCity,
+      state: canonState(newState),
+      updatedAt: new Date().toISOString(),
+    };
+    batch.update(db.collection('parks').doc(id), update);
+    writesInBatch += 1;
+    updated += 1;
+    if (writesInBatch >= 400) await commitBatch();
+
+    // Safety time guard: stop early if close to timeout
+    const elapsed = Date.now() - t0;
+    if (elapsed > 480000) break; // ~8 minutes
+  }
+
+  await commitBatch();
+  pages += 1;
+
+  return { scanned, updated, noCoords, apiMisses, rgCalls, clustersTouched, pages, cursor, done: docs.length < pageSize };
+}
+
+exports.runParksBackfillOnce = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const callerUid = context.auth.uid;
+    const adminUid = await getAdminUid(db);
+    if (!adminUid || callerUid !== adminUid) {
+      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run backfill');
+    }
+
+    const settings = {
+      mode: (data && data.mode) || 'balanced',
+      capPerRun: Number(data && data.capPerRun) || 50000,
+      clusterDecimals: Number(data && data.clusterDecimals) || 3,
+      parseCityStateNoApi: (data && data.parseCityStateNoApi) !== false,
+      refineNamesCap: Number(data && data.refineNamesCap) || 0,
+      pageSize: Number(data && data.pageSize) || 600,
+    };
+    const controlRef = db.collection('backfill').doc('control');
+    const statusRef = db.collection('backfill').doc('status');
+    try {
+      const ctrlSnap = await controlRef.get().catch(() => null);
+      let cursor = (ctrlSnap && ctrlSnap.exists && ctrlSnap.data().cursor) || null;
+      const res = await runParksBackfillBatch({ db, settings, ownerUid: adminUid, startAfterId: cursor });
+      const nowIso = new Date().toISOString();
+      await statusRef.set({
+        ...res,
+        lastRunAt: nowIso,
+        lastSuccessAt: nowIso,
+        settings,
+      }, { merge: true });
+      await controlRef.set({ cursor: res.done ? null : res.cursor, updatedAt: nowIso, lastMode: settings.mode }, { merge: true });
+      // Per-run log
+      const runId = nowIso.replace(/[:.]/g, '-') + '_manual';
+      await db.collection('backfill').doc('logs').collection('runs').doc(runId).set({ runId, ts: nowIso, ok: true, ...res, settings });
+      return { ok: true, ...res };
+    } catch (e) {
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastErrorAt: nowIso, lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true }).catch(() => {});
+      throw new functions.https.HttpsError('internal', e?.message || 'Unknown error');
+    }
+  });
+
+// Optional: unattended scheduler that consumes batches using backfill/control
+exports.scheduledParksBackfillBatch = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub.schedule('every 10 minutes').timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const controlRef = db.collection('backfill').doc('control');
+    const statusRef = db.collection('backfill').doc('status');
+    try {
+      const ctrl = await controlRef.get();
+      const data = ctrl.exists ? ctrl.data() : {};
+      const enabled = data && data.enabled === true; // default disabled for safety
+      if (!enabled) {
+        await statusRef.set({ lastRunAt: new Date().toISOString(), note: 'skipped: disabled' }, { merge: true });
+        return null;
+      }
+      const settings = {
+        mode: data && data.mode ? String(data.mode) : 'balanced',
+        capPerRun: Math.max(0, Number(data && data.capPerRun) || 50000),
+        clusterDecimals: Math.max(2, Math.min(5, Number(data && data.clusterDecimals) || 3)),
+        parseCityStateNoApi: (data && data.parseCityStateNoApi) !== false,
+        refineNamesCap: Math.max(0, Number(data && data.refineNamesCap) || 0),
+        pageSize: Math.max(200, Math.min(900, Number(data && data.pageSize) || 600)),
+      };
+      const adminUid = await getAdminUid(db);
+      const cursor = (data && data.cursor) || null;
+      const res = await runParksBackfillBatch({ db, settings, ownerUid: adminUid || 'system', startAfterId: cursor });
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ ...res, lastRunAt: nowIso, lastSuccessAt: nowIso, settings }, { merge: true });
+      await controlRef.set({ cursor: res.done ? null : res.cursor, updatedAt: nowIso, lastMode: settings.mode }, { merge: true });
+      const runId = nowIso.replace(/[:.]/g, '-') + '_scheduled';
+      await db.collection('backfill').doc('logs').collection('runs').doc(runId).set({ runId, ts: nowIso, ok: true, ...res, settings });
+      return null;
+    } catch (e) {
+      try {
+        await statusRef.set({ lastRunAt: new Date().toISOString(), lastErrorAt: new Date().toISOString(), lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true });
+      } catch (_) {}
+      return null;
+    }
+  });
+
+/**
  * Cloud Function: Notify park submitter on approval or denial
  *
  * Triggers: onUpdate for parks collection
@@ -1026,45 +1443,99 @@ async function sendNotificationsToUsers(db, userIds, title, body, data) {
  * - Idempotent by sourceId: uses doc id osm:<type>:<osmId>
  */
 
+// Primary Overpass endpoint and resilient mirror list
 const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
-// Overpass mirror endpoints for resiliency
 const OVERPASS_MIRRORS = [
-  'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.openstreetmap.ru/api/interpreter',
-  'https://overpass.nchc.org.tw/api/interpreter'
+  'https://overpass-api.de/api/interpreter',
+  'https://z.overpass-api.de/api/interpreter',
+  'https://lz4.overpass-api.de/api/interpreter',
+  'https://overpass.osm.ch/api/interpreter',
 ];
 
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
 
-// POST helper with mirror rotation, retries, and backoff
-async function postOverpass({ query, userAgent = 'Courthub/1.0 (+courthub.app)', attemptsPerMirror = 2 }) {
-  // Shuffle start index for basic load distribution
-  const start = Math.floor(Math.random() * OVERPASS_MIRRORS.length);
-  const order = OVERPASS_MIRRORS.map((_, i) => OVERPASS_MIRRORS[(start + i) % OVERPASS_MIRRORS.length]);
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  for (const mirror of order) {
-    for (let attempt = 0; attempt < Math.max(1, attemptsPerMirror); attempt++) {
-      const res = await httpRequest('POST', mirror, {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'User-Agent': userAgent,
-        },
-        body: `data=${encodeURIComponent(query)}`,
-      });
-      if (res && res.ok) return res;
-      // Backoff for throttle/server errors, otherwise try next mirror
-      const status = res && typeof res.status === 'number' ? res.status : 0;
-      const retryable = status === 0 || status === 429 || (status >= 500 && status < 600);
-      if (retryable) {
-        await sleep(500 + attempt * 750);
-        continue;
-      } else {
-        break;
+/**
+ * Post an Overpass query, rotating through mirrors until one succeeds.
+ * Returns an object compatible with httpRequest() plus { endpoint }.
+ */
+async function overpassPostWithMirrors(query, userAgent = 'Courthub/1.0 (+courthub.app)') {
+  const headers = {
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'Accept': 'application/json',
+    'User-Agent': userAgent,
+  };
+  const body = `data=${encodeURIComponent(query)}`;
+  const mirrors = shuffle([...OVERPASS_MIRRORS]);
+  const MAX_ATTEMPTS_PER_MIRROR = 2;
+  for (const url of mirrors) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_MIRROR; attempt++) {
+      const res = await httpRequest('POST', url, { headers, body, timeoutMs: 25000 });
+      if (res.ok) {
+        return { ...res, endpoint: url };
       }
+      let text = '';
+      try { text = await res.text(); } catch (_) { text = ''; }
+      const status = res.status || 0;
+      const brief = (text || '').slice(0, 200);
+      console.warn(`Overpass failure (mirror=${url}, attempt=${attempt}) status=${status} body=${brief}`);
+      if (status === 429 || status === 502 || status === 503 || status === 504) {
+        // backoff with jitter to be polite and allow mirror to recover
+        await sleep(800 * attempt + Math.floor(Math.random() * 500));
+        continue;
+      }
+      // For other statuses, try next mirror immediately
+      break;
     }
   }
-  throw new functions.https.HttpsError('unavailable', 'All Overpass mirrors failed');
+  return { ok: false, status: 0, json: async () => ({}), text: async () => 'All Overpass mirrors failed', endpoint: '' };
+}
+
+/**
+ * Acquire a short-lived lease on a Firestore doc to prevent overlapping runs.
+ * If a non-expired lease exists, returns { acquired: false, until, owner }.
+ * When acquired, returns { acquired: true, until } and writes owner/expiry.
+ */
+async function tryAcquireLease(db, ref, { leaseField = 'runLease', owner = '', ttlMs = 6 * 60 * 1000 } = {}) {
+  const now = Date.now();
+  const leaseKeyOwner = `${leaseField}Owner`;
+  const leaseKeyUntil = `${leaseField}ExpiresAt`;
+  const untilIso = new Date(now + ttlMs).toISOString();
+  try {
+    const out = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const data = snap.exists ? snap.data() : {};
+      const existingUntil = data && data[leaseKeyUntil] ? new Date(data[leaseKeyUntil]).getTime() : 0;
+      if (existingUntil && existingUntil > now) {
+        return { acquired: false, until: data[leaseKeyUntil], owner: data[leaseKeyOwner] || '' };
+      }
+      tx.set(ref, { [leaseKeyOwner]: owner, [leaseKeyUntil]: untilIso, lastLeaseAt: new Date(now).toISOString() }, { merge: true });
+      return { acquired: true, until: untilIso };
+    });
+    return out;
+  } catch (e) {
+    console.warn('tryAcquireLease error', e);
+    // Fail closed: do not run if we could not determine lease
+    return { acquired: false, until: null, owner: '' };
+  }
+}
+
+async function releaseLease(db, ref, { leaseField = 'runLease' } = {}) {
+  const leaseKeyOwner = `${leaseField}Owner`;
+  const leaseKeyUntil = `${leaseField}ExpiresAt`;
+  try {
+    await ref.set({ [leaseKeyOwner]: null, [leaseKeyUntil]: new Date(Date.now() - 1000).toISOString() }, { merge: true });
+  } catch (e) {
+    console.warn('releaseLease error', e);
+  }
 }
 
 const WEST_TO_EAST_STATE_ORDER = [
@@ -1102,6 +1573,12 @@ function makeOverpassQueryForState(stateCode, sportsRegex = 'basketball|tennis|p
   // Common tagging schemas on facilities
   parts.push(`node["leisure"="pitch"]["sport"~"${sportsRegex}"](area.searchArea);`);
   parts.push(`node["leisure"="sports_centre"]["sport"~"${sportsRegex}"](area.searchArea);`);
+  // Alt schemas widely used: explicit keys and playgrounds
+  parts.push(`node["basketball"="yes"](area.searchArea);`);
+  parts.push(`node["playground:basketball"="yes"](area.searchArea);`);
+  parts.push(`node["leisure"="recreation_ground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+  parts.push(`node["leisure"="playground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+  parts.push(`node["leisure"="playground"]["name"~"${sportsRegex}",i](area.searchArea);`);
   if (!nodesOnly) {
     // When enabled, also include ways/relations with a sport tag directly
     parts.push(`way["sport"~"${sportsRegex}"](area.searchArea);`);
@@ -1111,6 +1588,17 @@ function makeOverpassQueryForState(stateCode, sportsRegex = 'basketball|tennis|p
     parts.push(`relation["leisure"="pitch"]["sport"~"${sportsRegex}"](area.searchArea);`);
     parts.push(`way["leisure"="sports_centre"]["sport"~"${sportsRegex}"](area.searchArea);`);
     parts.push(`relation["leisure"="sports_centre"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    // Alt schemas for ways/relations
+    parts.push(`way["basketball"="yes"](area.searchArea);`);
+    parts.push(`relation["basketball"="yes"](area.searchArea);`);
+    parts.push(`way["playground:basketball"="yes"](area.searchArea);`);
+    parts.push(`relation["playground:basketball"="yes"](area.searchArea);`);
+    parts.push(`way["leisure"="recreation_ground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`relation["leisure"="recreation_ground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`way["leisure"="playground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`relation["leisure"="playground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`way["leisure"="playground"]["name"~"${sportsRegex}",i](area.searchArea);`);
+    parts.push(`relation["leisure"="playground"]["name"~"${sportsRegex}",i](area.searchArea);`);
   }
   return `
     [out:json][timeout:120];
@@ -1130,6 +1618,11 @@ function makeOverpassCountQueryForState(stateCode, sportsRegex = 'basketball|ten
   parts.push(`node["sport"~"${sportsRegex}"](area.searchArea);`);
   parts.push(`node["leisure"="pitch"]["sport"~"${sportsRegex}"](area.searchArea);`);
   parts.push(`node["leisure"="sports_centre"]["sport"~"${sportsRegex}"](area.searchArea);`);
+  parts.push(`node["basketball"="yes"](area.searchArea);`);
+  parts.push(`node["playground:basketball"="yes"](area.searchArea);`);
+  parts.push(`node["leisure"="recreation_ground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+  parts.push(`node["leisure"="playground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+  parts.push(`node["leisure"="playground"]["name"~"${sportsRegex}",i](area.searchArea);`);
   if (!nodesOnly) {
     parts.push(`way["sport"~"${sportsRegex}"](area.searchArea);`);
     parts.push(`relation["sport"~"${sportsRegex}"](area.searchArea);`);
@@ -1137,6 +1630,16 @@ function makeOverpassCountQueryForState(stateCode, sportsRegex = 'basketball|ten
     parts.push(`relation["leisure"="pitch"]["sport"~"${sportsRegex}"](area.searchArea);`);
     parts.push(`way["leisure"="sports_centre"]["sport"~"${sportsRegex}"](area.searchArea);`);
     parts.push(`relation["leisure"="sports_centre"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`way["basketball"="yes"](area.searchArea);`);
+    parts.push(`relation["basketball"="yes"](area.searchArea);`);
+    parts.push(`way["playground:basketball"="yes"](area.searchArea);`);
+    parts.push(`relation["playground:basketball"="yes"](area.searchArea);`);
+    parts.push(`way["leisure"="recreation_ground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`relation["leisure"="recreation_ground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`way["leisure"="playground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`relation["leisure"="playground"]["sport"~"${sportsRegex}"](area.searchArea);`);
+    parts.push(`way["leisure"="playground"]["name"~"${sportsRegex}",i](area.searchArea);`);
+    parts.push(`relation["leisure"="playground"]["name"~"${sportsRegex}",i](area.searchArea);`);
   }
   return `
     [out:json][timeout:90];
@@ -1326,15 +1829,22 @@ async function runOsmImportBatch({ db, adminUid, state, maxCreates, nodesOnly })
   if (!query) {
     throw new functions.https.HttpsError('invalid-argument', 'Could not build query');
   }
-  const res = await postOverpass({ query, userAgent: 'Courthub-Importer/1.0 (+courthub.app)' });
+  const res = await overpassPostWithMirrors(query, 'Courthub-Importer/1.0 (+courthub.app)');
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    console.warn('Overpass error', res.status, text.slice(0, 200));
-    throw new functions.https.HttpsError('unavailable', 'Overpass request failed');
+    const endpoint = res.endpoint || OVERPASS_URL;
+    const brief = (text || '').slice(0, 200);
+    console.warn('Overpass error', res.status, endpoint, brief);
+    // Surface richer context to Firestore logs and Cloud Logging
+    throw new functions.https.HttpsError(
+      'unavailable',
+      `Overpass request failed (status=${res.status || 0}) via ${endpoint}: ${brief}`
+    );
   }
   const json = await res.json();
   const elements = Array.isArray(json.elements) ? json.elements : [];
-  return await importOverpassElements({ db, adminUid, state, elements, maxCreates });
+  const out = await importOverpassElements({ db, adminUid, state, elements, maxCreates });
+  return { ...out, overpassEndpoint: res.endpoint };
 }
 
 // Increase resources: CA-sized imports can exceed default 60s timeout
@@ -1385,45 +1895,27 @@ exports.importOsmCourtsByState = functions
  */
 exports.scheduledOsmImportBatch = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
-  .pubsub.schedule('every 7 minutes')
+  .pubsub
+  .schedule('every 7 minutes')
   .timeZone('Etc/UTC')
   .onRun(async (context) => {
     const db = admin.firestore();
-    // Overlapping-run protection: Firestore lease
-    async function acquireLease(db, name, ttlSeconds, owner) {
-      const ref = db.collection('imports').doc('osm').collection('locks').doc(name);
-      return db.runTransaction(async (tx) => {
-        const snap = await tx.get(ref);
-        const now = Date.now();
-        const data = snap.exists ? snap.data() : {};
-        const untilMs = data && data.leaseUntil ? new Date(data.leaseUntil).getTime() : 0;
-        if (untilMs > now && data.owner && data.owner !== owner) {
-          return false;
-        }
-        const leaseUntil = new Date(now + Math.max(60, ttlSeconds) * 1000).toISOString();
-        tx.set(ref, { owner, leaseUntil, updatedAt: new Date().toISOString() }, { merge: true });
-        return true;
-      });
-    }
-    async function releaseLease(db, name, owner) {
-      try {
-        const ref = db.collection('imports').doc('osm').collection('locks').doc(name);
-        await db.runTransaction(async (tx) => {
-          const snap = await tx.get(ref);
-          if (!snap.exists) return;
-          const data = snap.data() || {};
-          if (data.owner && data.owner !== owner) return; // don't steal someone else's lease
-          tx.set(ref, { leaseUntil: new Date(0).toISOString(), updatedAt: new Date().toISOString(), owner: data.owner || owner }, { merge: true });
-        });
-      } catch (_) {}
-    }
-
-    const leaseOwner = context.eventId || `scheduler_${Date.now()}`;
-    let leaseAcquired = false;
     try {
       const statusRef = db.collection('imports').doc('osm');
       const logsColl = statusRef.collection('logs');
       const adminUid = await getAdminUid(db);
+
+      // Run lease to avoid overlapping runs at 7-min cadence
+      const leaseOwner = `main:${context.eventId || Math.random().toString(36).slice(2)}`;
+      const lease = await tryAcquireLease(db, statusRef, { leaseField: 'runLease', owner: leaseOwner, ttlMs: 6 * 60 * 1000 });
+      if (!lease.acquired) {
+        const nowIso = new Date().toISOString();
+        console.log('[scheduledOsmImportBatch] skipped: lease held until', lease.until, 'by', lease.owner || 'unknown');
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: overlapping run', leaseHeldUntil: lease.until || null }, { merge: true }).catch(() => {});
+        const runId = `${nowIso.replace(/[:.]/g, '-')}_skipped_overlap`;
+        await logsColl.doc(runId).set({ runId, ts: nowIso, ok: true, note: 'skipped overlapping run', leaseUntil: lease.until || null }, { merge: true }).catch(() => {});
+        return null;
+      }
 
       // Config gate
       const cfgDoc = await db.collection('config').doc('app').get();
@@ -1432,7 +1924,7 @@ exports.scheduledOsmImportBatch = functions
       const autoEnabled = cfg && cfg.autoOsmImportEnabled !== false;
       if (!autoEnabled) {
         const nowIso = new Date().toISOString();
-        console.log('Auto OSM import disabled by config.');
+        console.log('[scheduledOsmImportBatch] disabled by config (config/app.autoOsmImportEnabled=false).');
         await statusRef.set({
           lastRunAt: nowIso,
           lastNote: 'skipped: autoOsmImportEnabled=false',
@@ -1444,20 +1936,9 @@ exports.scheduledOsmImportBatch = functions
           ok: true,
           note: 'auto import disabled',
         }).catch(() => {});
+        await releaseLease(db, statusRef, { leaseField: 'runLease' });
         return null;
       }
-
-      // Acquire lease for up to 8 minutes (buffer > schedule interval)
-      const gotLease = await acquireLease(db, 'main', 8 * 60, leaseOwner);
-      if (!gotLease) {
-        const nowIso = new Date().toISOString();
-        console.log('Auto OSM import skipped: lease active');
-        await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: lease active' }, { merge: true }).catch(() => {});
-        const runId = `${nowIso.replace(/[:.]/g, '-')}_skipped_lease`;
-        await logsColl.doc(runId).set({ runId, ts: nowIso, ok: true, note: 'lease active, skipped' }).catch(() => {});
-        return null;
-      }
-      leaseAcquired = true;
 
       const cfgNodesOnlyDefault = cfg.autoOsmImportNodesOnly !== false; // default true
       const maxCreates = Math.max(1, Math.min(4000, Number(cfg.autoOsmImportMaxCreates) || 1500));
@@ -1477,7 +1958,7 @@ exports.scheduledOsmImportBatch = functions
       // If config explicitly disables nodesOnly (rare), allow ways even in phase 1.
       const effectiveNodesOnly = cfgNodesOnlyDefault ? nodesOnly : false;
 
-      console.log(`Auto OSM import: running batch for ${state} (index ${nextIndex})`);
+      console.log(`[scheduledOsmImportBatch] start state=${state} index=${nextIndex} nodesOnly=${effectiveNodesOnly} maxCreates=${maxCreates}`);
       // Use a safe fallback owner if none configured
       const ownerForWrite = adminUid || 'system';
       const result = await runOsmImportBatch({ db, adminUid: ownerForWrite, state, maxCreates, nodesOnly: effectiveNodesOnly });
@@ -1503,6 +1984,7 @@ exports.scheduledOsmImportBatch = functions
         nextIndex: nextIdx,
         phase: nextPhase,
         cycleCount: nextCycleCount,
+        overpassEndpoint: result.overpassEndpoint || OVERPASS_URL,
       };
       await statusRef.set(updated, { merge: true });
       // Per-run log for auditability
@@ -1522,8 +2004,9 @@ exports.scheduledOsmImportBatch = functions
         scanned: true,
         zeroCreated: result.created === 0,
         ok: true,
+        overpassEndpoint: result.overpassEndpoint || OVERPASS_URL,
       }).catch((e) => console.warn('Failed to write import log', e));
-      console.log(`Auto OSM import complete for ${state}: +${result.created}, skipped ${result.skippedExists}.`);
+      console.log(`[scheduledOsmImportBatch] complete state=${state} created=${result.created} skipped=${result.skippedExists} endpoint=${result.overpassEndpoint || OVERPASS_URL}`);
       try {
         // Notify owner if a state produced no new imports (likely complete for current mode)
         if (result.created === 0) {
@@ -1535,9 +2018,10 @@ exports.scheduledOsmImportBatch = functions
       } catch (e) {
         console.warn('Failed to send completion notification', e);
       }
+      await releaseLease(db, statusRef, { leaseField: 'runLease' });
       return null;
     } catch (e) {
-      console.error('scheduledOsmImportBatch error', e);
+      console.error('[scheduledOsmImportBatch] error', e);
       try {
         // Attempt to write an error log and heartbeat so monitoring surfaces failures
         const db2 = admin.firestore();
@@ -1571,11 +2055,12 @@ exports.scheduledOsmImportBatch = functions
       } catch (logErr) {
         console.warn('Failed to write failure log', logErr);
       }
+      try {
+        const db3 = admin.firestore();
+        const statusRef3 = db3.collection('imports').doc('osm');
+        await releaseLease(db3, statusRef3, { leaseField: 'runLease' });
+      } catch (_) {}
       return null;
-    } finally {
-      if (leaseAcquired) {
-        await releaseLease(db, 'main', leaseOwner).catch(() => {});
-      }
     }
   });
 
@@ -1606,7 +2091,7 @@ exports.scheduledOsmAuditAndBacklog = functions.pubsub
 
         // Overpass lightweight count
         const countQuery = makeOverpassCountQueryForState(state, 'basketball|tennis|pickleball', { nodesOnly: false });
-        const res = await postOverpass({ query: countQuery, userAgent: 'Courthub-Audit/1.0 (+courthub.app)' });
+        const res = await overpassPostWithMirrors(countQuery, 'Courthub-Audit/1.0 (+courthub.app)');
         let osmCount = 0;
         if (res.ok) {
           const json = await res.json();
@@ -1621,7 +2106,7 @@ exports.scheduledOsmAuditAndBacklog = functions.pubsub
         // If coverage looks low, queue city backfill for this state
         if (osmCount > 0 && coverage < 0.7) {
           const cityQuery = makeOverpassCitiesInStateQuery(state);
-          const cRes = await postOverpass({ query: cityQuery, userAgent: 'Courthub-Audit/1.0 (+courthub.app)' });
+          const cRes = await overpassPostWithMirrors(cityQuery, 'Courthub-Audit/1.0 (+courthub.app)');
           if (cRes.ok) {
             const cJson = await cRes.json();
             const cities = (Array.isArray(cJson.elements) ? cJson.elements : [])
@@ -1686,7 +2171,9 @@ exports.scheduledOsmAuditAndBacklog = functions.pubsub
   });
 
 // Consume one city backlog task per run and import within radius
-exports.scheduledOsmBackfillCityBatch = functions.pubsub
+exports.scheduledOsmBackfillCityBatch = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub
   .schedule('every 15 minutes')
   .timeZone('Etc/UTC')
   .onRun(async () => {
@@ -1697,9 +2184,21 @@ exports.scheduledOsmBackfillCityBatch = functions.pubsub
     const nowIso = new Date().toISOString();
 
     try {
+      // Run lease for city backfill to avoid overlapping consumption
+      const leaseOwner = `city:${Math.random().toString(36).slice(2)}`;
+      const lease = await tryAcquireLease(db, statusRef, { leaseField: 'cityLease', owner: leaseOwner, ttlMs: 12 * 60 * 1000 });
+      if (!lease.acquired) {
+        console.log('[scheduledOsmBackfillCityBatch] skipped: city lease held until', lease.until, 'by', lease.owner || 'unknown');
+        await statusRef.set({ lastBackfillAt: nowIso, lastNote: 'skipped city: overlapping run', cityLeaseHeldUntil: lease.until || null }, { merge: true }).catch(() => {});
+        return null;
+      }
+
       // Pick the oldest pending task
       const q = await backlogColl.where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(1).get();
-      if (q.empty) return null;
+      if (q.empty) {
+        console.log('[scheduledOsmBackfillCityBatch] no pending backlog tasks');
+        return null;
+      }
       const taskDoc = q.docs[0];
       const task = taskDoc.data();
       // Mark in-progress
@@ -1707,10 +2206,10 @@ exports.scheduledOsmBackfillCityBatch = functions.pubsub
 
       const radiusM = Math.round((task.radiusKm || 10) * 1000);
       const query = makeOverpassQueryAroundPoint(task.lat, task.lon, radiusM, 'basketball|tennis|pickleball', { nodesOnly: false });
-      const res = await postOverpass({ query, userAgent: 'Courthub-CityBackfill/1.0 (+courthub.app)' });
+      const res = await overpassPostWithMirrors(query, 'Courthub-CityBackfill/1.0 (+courthub.app)');
       if (!res.ok) {
         const text = await res.text().catch(() => '');
-        console.warn('City backfill Overpass error', res.status, text.slice(0, 160));
+        console.warn('[scheduledOsmBackfillCityBatch] Overpass error', res.status, text.slice(0, 160));
         await taskDoc.ref.set({ status: 'pending', lastErrorAt: nowIso, lastError: text.slice(0, 200) }, { merge: true });
         return null;
       }
@@ -1732,10 +2231,13 @@ exports.scheduledOsmBackfillCityBatch = functions.pubsub
           lastAt: nowIso,
         }, { merge: true });
       } catch (_) {}
+      console.log('[scheduledOsmBackfillCityBatch] complete state=', task.state, 'city=', task.cityName, 'created=', result.created, 'skipped=', result.skippedExists);
+      await releaseLease(db, statusRef, { leaseField: 'cityLease' });
       return null;
     } catch (e) {
-      console.error('scheduledOsmBackfillCityBatch error', e);
+      console.error('[scheduledOsmBackfillCityBatch] error', e);
       // Best effort: leave task pending for retry
+      try { await releaseLease(db, statusRef, { leaseField: 'cityLease' }); } catch (_) {}
       return null;
     }
   });
