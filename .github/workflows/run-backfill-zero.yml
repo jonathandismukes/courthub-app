@@ -1,0 +1,66 @@
+name: Run Parks Backfill (Zero-API)
+
+# Manual trigger so you can run a callable function from GitHub UI
+on:
+  workflow_dispatch:
+    inputs:
+      function:
+        description: Callable function to run
+        required: true
+        type: choice
+        default: runParksBackfillOnce
+        options:
+          - runParksBackfillOnce
+          - importOsmCourtsByState
+          - claimImporterOwner
+          - geoTextSearchV2
+      payload_json:
+        description: JSON payload to pass to the callable (e.g. {"state":"CA"})
+        required: false
+        default: "{}"
+      region:
+        description: Cloud Functions region
+        required: true
+        default: us-central1
+      project_id:
+        description: Optional Firebase projectId override (blank uses repo default)
+        required: false
+        default: ""
+
+jobs:
+  run:
+    name: Call Firebase Callable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Firebase CLI
+        run: npm i -g firebase-tools@13
+
+      - name: Call function via Firebase CLI
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FUNC='${{ github.event.inputs.function }}'
+          DATA='${{ github.event.inputs.payload_json }}'
+          REGION='${{ github.event.inputs.region }}'
+          PROJECT='${{ github.event.inputs.project_id }}'
+
+          echo "Function: $FUNC"
+          echo "Region:   $REGION"
+          if [ -n "$PROJECT" ]; then
+            echo "Project:  $PROJECT"
+            firebase functions:call "$FUNC" --data "$DATA" --region "$REGION" --project "$PROJECT"
+          else
+            firebase functions:call "$FUNC" --data "$DATA" --region "$REGION"
+          fi
+
+          echo "✅ Done"
