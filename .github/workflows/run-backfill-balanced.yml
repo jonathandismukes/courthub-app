@@ -22,6 +22,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -30,13 +35,14 @@ jobs:
           credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
 
       - name: Install Firebase CLI
+        # Pin to v12.x because newer CLIs removed/changed functions:call flags
         run: npm install -g firebase-tools@12.9.1
 
       - name: Call runParksBackfillOnce (Balanced, cap=40,000)
         run: |
           set -e
           echo "Invoking runParksBackfillOnce with mode=balanced, capPerRun=40000"
-          firebase --project "${TARGET_PROJECT}" functions:call runParksBackfillOnce --data '{
+          firebase --project "${TARGET_PROJECT}" functions:call runParksBackfillOnce --region us-central1 --data '{
             "mode": "balanced",
             "capPerRun": 40000,
             "clusterDecimals": 3,
