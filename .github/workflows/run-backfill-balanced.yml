@@ -42,7 +42,7 @@ jobs:
         run: |
           set -e
           echo "Invoking runParksBackfillOnce with mode=balanced, capPerRun=40000"
-          firebase --project "${TARGET_PROJECT}" functions:call runParksBackfillOnce --region us-central1 --data '{
+          firebase --project "${TARGET_PROJECT}" functions:call runParksBackfillOnce --data '{
             "mode": "balanced",
             "capPerRun": 40000,
             "clusterDecimals": 3,
