@@ -1,44 +1,31 @@
-name: Run Parks Backfill (Balanced one-time)
+name: Run Balanced Backfill (cap=40,000)
 
 on:
   workflow_dispatch:
 
-concurrency:
-  group: backfill-balanced-run
-  cancel-in-progress: false
-
 jobs:
-  run_balanced_once:
-    name: Run Balanced Backfill (cap=40,000)
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Use Node.js
+      - name: Use Node.js 18
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '18'
 
-      - name: Install Firebase CLI
-        run: npm i -g firebase-tools@12.9.1
+      - name: Install Firebase CLI v12.9.1
+        run: npm install -g firebase-tools@12.9.1
 
       - name: Call runParksBackfillOnce (Balanced, cap=40,000)
         env:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_DEPLOY_KEY }}
-        shell: bash
         run: |
           set -euo pipefail
           echo "Invoking runParksBackfillOnce with mode=balanced, capPerRun=40000"
-          firebase --project courthub-app functions:call runParksBackfillOnce \
-            --data '{
-              "mode": "balanced",
-              "capPerRun": 40000,
-              "pageSize": 500,
-              "pauseMs": 600
-            }'
+          firebase --project courthub-app functions:call runParksBackfillOnce --data '{"mode":"balanced","capPerRun":40000}'
 
       - name: Link to Firebase Console logs
-        if: ${{ always() }}
         run: |
-          echo "::notice::Open Functions logs: https://console.firebase.google.com/project/courthub-app/functions/list"
+          echo "Logs: https://console.firebase.google.com/project/courthub-app/functions/details;tab=logs?region=us-central1&functionId=runParksBackfillOnce"
