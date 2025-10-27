@@ -10,9 +10,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      # Use your existing deploy key secret as the Firebase token
-      FIREBASE_TOKEN: ${{ secrets.FIREBASE_DEPLOY_KEY }}
       PROJECT_ID: courthub-app
+      REGION: us-central1
+      FUNCTION_NAME: runParksBackfillOnce
+      # Web API key is public; used solely to mint an ID token via REST
+      FIREBASE_WEB_API_KEY: "AIzaSyBdVPSqcU2uZfuXvDIFInRvYB1_yEwIO_4"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,28 +24,82 @@ jobs:
         with:
           node-version: 20
 
-      - name: Validate required secrets and variables
+      - name: Validate required secrets
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${FIREBASE_TOKEN:-}" ]]; then
-            echo "FIREBASE_TOKEN is NOT set. Please add FIREBASE_DEPLOY_KEY in repo secrets." >&2
+          if [[ -z "${{ secrets.WORKFLOW_ADMIN_EMAIL }}" || -z "${{ secrets.WORKFLOW_ADMIN_PASSWORD }}" ]]; then
+            echo "Missing WORKFLOW_ADMIN_EMAIL or WORKFLOW_ADMIN_PASSWORD repo secrets." >&2
+            echo "Add an owner account's email/password as repository secrets, then re-run." >&2
             exit 1
           fi
-          echo "FIREBASE_TOKEN is set (value hidden)."
-          echo "PROJECT_ID=$PROJECT_ID"
+          echo "Admin secrets present."
 
-      - name: Verify firebase-tools version (v13)
-        run: npx -y firebase-tools@13 --version
-
-      - name: Call runParksBackfillOnce (balanced)
+      - name: Get Firebase ID token (owner account)
+        id: auth
+        env:
+          ADMIN_EMAIL: ${{ secrets.WORKFLOW_ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.WORKFLOW_ADMIN_PASSWORD }}
+        shell: bash
         run: |
           set -euo pipefail
-          echo '{"mode":"balanced","capPerRun":40000}' \
-            | npx -y firebase-tools@13 \
-                --project "$PROJECT_ID" \
-                functions:call runParksBackfillOnce
+          node <<'NODE'
+          const https = require('https');
+          const fs = require('fs');
+          const email = process.env.ADMIN_EMAIL;
+          const password = process.env.ADMIN_PASSWORD;
+          const apiKey = process.env.FIREBASE_WEB_API_KEY;
+          if (!email || !password || !apiKey) {
+            console.error('Missing email/password/apiKey');
+            process.exit(1);
+          }
+          const payload = JSON.stringify({ email, password, returnSecureToken: true });
+          const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`;
+          const req = https.request(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }}, res => {
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => {
+              if (res.statusCode !== 200) {
+                console.error('Sign-in failed', res.statusCode, body);
+                process.exit(1);
+              }
+              const json = JSON.parse(body);
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `id_token=${json.idToken}\n`);
+              console.log('Obtained ID token');
+            });
+          });
+          req.on('error', (err) => { console.error(err); process.exit(1); });
+          req.write(payload);
+          req.end();
+          NODE
+
+      - name: Call runParksBackfillOnce (balanced)
+        env:
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY='{"data":{"mode":"balanced","capPerRun":40000}}'
+          TMP=$(mktemp)
+          curl -sS -X POST "https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_NAME}" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ID_TOKEN}" \
+            -d "$BODY" \
+            -w "\n%{http_code}" > "$TMP" || true
+          HTTP_CODE=$(tail -n1 "$TMP")
+          RESP_BODY=$(sed '$ d' "$TMP")
+          echo "HTTP $HTTP_CODE"
+          echo "Response: $RESP_BODY"
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "Request failed with HTTP $HTTP_CODE" >&2
+            exit 1
+          fi
+          if echo "$RESP_BODY" | grep -q '"error"'; then
+            echo "Callable returned error" >&2
+            exit 1
+          fi
+          echo "Backfill request accepted."
 
       - name: Link to Firebase Console logs
         run: |
-          echo "Logs: https://console.firebase.google.com/project/${PROJECT_ID}/functions/details;tab=logs?region=us-central1&functionId=runParksBackfillOnce"
+          echo "Logs: https://console.firebase.google.com/project/${PROJECT_ID}/functions/details?region=${REGION}&functionId=${FUNCTION_NAME}"
