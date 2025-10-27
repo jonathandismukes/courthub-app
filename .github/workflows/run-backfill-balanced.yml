@@ -36,16 +36,6 @@ jobs:
       - name: Verify firebase-tools version (v13)
         run: npx -y firebase-tools@13 --version
 
-      - name: Verify Firebase auth and project access
-        shell: bash
-        run: |
-          set -euo pipefail
-          # List functions to verify token + project access works (no secrets printed)
-          npx -y firebase-tools@13 --project "$PROJECT_ID" functions:list || {
-            echo "Failed to access project $PROJECT_ID with provided FIREBASE_TOKEN" >&2
-            exit 1
-          }
-
       - name: Call runParksBackfillOnce (balanced)
         run: |
           set -euo pipefail
