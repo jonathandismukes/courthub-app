@@ -31,7 +31,8 @@ jobs:
           credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
           # Request an ID token usable to call the HTTPS function URL
           token_format: id_token
-          audience: https://${{ env.REGION }}-${{ env.TARGET_PROJECT }}.cloudfunctions.net/runParksBackfillOnce
+          id_token_audience: https://${{ env.REGION }}-${{ env.TARGET_PROJECT }}.cloudfunctions.net/runParksBackfillOnce
+          id_token_include_email: true
 
       - name: Call runParksBackfillOnce (Balanced, cap=40,000)
         env:
@@ -52,4 +53,3 @@ jobs:
         if: ${{ always() }}
         run: |
           echo "::notice::Open Functions logs: https://console.firebase.google.com/project/${{ env.TARGET_PROJECT }}/functions/list"
-
