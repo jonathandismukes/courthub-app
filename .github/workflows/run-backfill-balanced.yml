@@ -15,39 +15,32 @@ jobs:
   run_balanced_once:
     name: Run Balanced Backfill (cap=40,000)
     runs-on: ubuntu-latest
-    # Set your default Firebase project ID here or use GitHub Environments/Repository Variables
     env:
       TARGET_PROJECT: courthub-app
-      REGION: us-central1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud (OIDC id_token for callable)
-        id: auth
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          # Service Account JSON stored in repo secret FIREBASE_DEPLOY_KEY
           credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
-          # Request an ID token usable to call the HTTPS function URL
-          token_format: id_token
-          id_token_audience: https://${{ env.REGION }}-${{ env.TARGET_PROJECT }}.cloudfunctions.net/runParksBackfillOnce
-          id_token_include_email: true
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools@13
 
       - name: Call runParksBackfillOnce (Balanced, cap=40,000)
-        env:
-          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
         run: |
-          set -euo pipefail
-          URL="https://${REGION}-${TARGET_PROJECT}.cloudfunctions.net/runParksBackfillOnce"
-          echo "POST ${URL}"
-          BODY='{"data":{"mode":"balanced","capPerRun":40000,"clusterDecimals":3,"parseCityStateNoApi":true,"refineNamesCap":0,"pageSize":600}}'
-          RESP=$(curl -sS -f -X POST \
-            -H "Authorization: Bearer ${ID_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data "${BODY}" \
-            "${URL}")
-          echo "Response: ${RESP}"
+          set -e
+          echo "Invoking runParksBackfillOnce with mode=balanced, capPerRun=40000"
+          firebase --project "${TARGET_PROJECT}" functions:call runParksBackfillOnce --data '{
+            "mode": "balanced",
+            "capPerRun": 40000,
+            "clusterDecimals": 3,
+            "parseCityStateNoApi": true,
+            "refineNamesCap": 0,
+            "pageSize": 600
+          }'
 
       - name: Link to Firebase Console logs
         if: ${{ always() }}
