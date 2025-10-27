@@ -17,7 +17,7 @@ jobs:
 
       - name: Verify Firebase CLI version (npx pinned)
         run: |
-          npx -y firebase-tools@12.9.1 --version
+          npx -y firebase-tools@13 --version
 
       - name: Call runParksBackfillOnce (Balanced, cap=40,000)
         env:
@@ -25,7 +25,9 @@ jobs:
         run: |
           set -euo pipefail
           echo "Invoking runParksBackfillOnce with mode=balanced, capPerRun=40000"
-          npx -y firebase-tools@12.9.1 --project courthub-app functions:call runParksBackfillOnce --data '{"mode":"balanced","capPerRun":40000}'
+          # firebase-tools v13 removed the --data flag for functions:call.
+          # Pipe the JSON payload to stdin instead to be version-agnostic.
+          echo '{"mode":"balanced","capPerRun":40000}' | npx -y firebase-tools@13 --project courthub-app functions:call runParksBackfillOnce
 
       - name: Link to Firebase Console logs
         run: |
