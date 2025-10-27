@@ -30,7 +30,7 @@ jobs:
           credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
 
       - name: Install Firebase CLI
-        run: npm install -g firebase-tools@13
+        run: npm install -g firebase-tools@12.9.1
 
       - name: Call runParksBackfillOnce (Balanced, cap=40,000)
         run: |
