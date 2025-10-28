@@ -1,134 +1,28 @@
-name: Run Balanced Backfill (cap=40,000)
+name: Run Parks Backfill (Balanced)
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  run:
+  run-backfill-balanced:
     runs-on: ubuntu-latest
-    env:
-      PROJECT_ID: courthub-app
-      REGION: us-central1
-      FUNCTION_NAME: runParksBackfillOnce
-      # Web API key is public; used solely to mint an ID token via REST
-      FIREBASE_WEB_API_KEY: "AIzaSyBdVPSqcU2uZfuXvDIFInRvYB1_yEwIO_4"
     steps:
-      - name: Checkout
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
 
-      - name: Determine auth method
-        id: auth_method
-        shell: bash
+      - name: Verify Firebase CLI version (v12.9.1)
+        run: npx -y firebase-tools@12.9.1 --version
+
+      - name: Call runParksBackfillOnce (balanced)
         env:
-          HAS_EMAIL: ${{ secrets.WORKFLOW_ADMIN_EMAIL }}
-          HAS_PASSWORD: ${{ secrets.WORKFLOW_ADMIN_PASSWORD }}
-          HAS_FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
-          HAS_FIREBASE_DEPLOY_KEY: ${{ secrets.FIREBASE_DEPLOY_KEY }}
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_DEPLOY_KEY }}
         run: |
-          set -euo pipefail
-          METHOD="none"
-          if [[ -n "${HAS_EMAIL:-}" && -n "${HAS_PASSWORD:-}" ]]; then
-            METHOD="owner_id_token"
-          elif [[ -n "${HAS_FIREBASE_TOKEN:-}" || -n "${HAS_FIREBASE_DEPLOY_KEY:-}" ]]; then
-            METHOD="firebase_token"
-          fi
-          echo "method=$METHOD" >> "$GITHUB_OUTPUT"
-          echo "Selected auth method: $METHOD"
-          if [[ "$METHOD" == "none" ]]; then
-            echo "No auth secrets found. Set either (WORKFLOW_ADMIN_EMAIL + WORKFLOW_ADMIN_PASSWORD) or FIREBASE_TOKEN (or FIREBASE_DEPLOY_KEY)." >&2
-            exit 1
-          fi
-
-      - name: Get Firebase ID token (owner account)
-        if: steps.auth_method.outputs.method == 'owner_id_token'
-        id: auth
-        env:
-          ADMIN_EMAIL: ${{ secrets.WORKFLOW_ADMIN_EMAIL }}
-          ADMIN_PASSWORD: ${{ secrets.WORKFLOW_ADMIN_PASSWORD }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          node <<'NODE'
-          const https = require('https');
-          const fs = require('fs');
-          const email = process.env.ADMIN_EMAIL;
-          const password = process.env.ADMIN_PASSWORD;
-          const apiKey = process.env.FIREBASE_WEB_API_KEY;
-          if (!email || !password || !apiKey) {
-            console.error('Missing email/password/apiKey');
-            process.exit(1);
-          }
-          const payload = JSON.stringify({ email, password, returnSecureToken: true });
-          const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`;
-          const req = https.request(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }}, res => {
-            let body = '';
-            res.on('data', c => body += c);
-            res.on('end', () => {
-              if (res.statusCode !== 200) {
-                console.error('Sign-in failed', res.statusCode, body);
-                process.exit(1);
-              }
-              const json = JSON.parse(body);
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `id_token=${json.idToken}\n`);
-              console.log('Obtained ID token');
-            });
-          });
-          req.on('error', (err) => { console.error(err); process.exit(1); });
-          req.write(payload);
-          req.end();
-          NODE
-
-      - name: Call via REST with ID token (balanced)
-        if: steps.auth_method.outputs.method == 'owner_id_token'
-        env:
-          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          BODY='{"data":{"mode":"balanced","capPerRun":40000}}'
-          TMP=$(mktemp)
-          curl -sS -X POST "https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_NAME}" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${ID_TOKEN}" \
-            -d "$BODY" \
-            -w "\n%{http_code}" > "$TMP" || true
-          HTTP_CODE=$(tail -n1 "$TMP")
-          RESP_BODY=$(sed '$ d' "$TMP")
-          echo "HTTP $HTTP_CODE"
-          echo "Response: $RESP_BODY"
-          if [[ "$HTTP_CODE" != "200" ]]; then
-            echo "Request failed with HTTP $HTTP_CODE" >&2
-            exit 1
-          fi
-          if echo "$RESP_BODY" | grep -q '"error"'; then
-            echo "Callable returned error" >&2
-            exit 1
-          fi
-          echo "Backfill request accepted."
-
-      - name: Call via Firebase CLI token (balanced)
-        if: steps.auth_method.outputs.method == 'firebase_token'
-        env:
-          # Prefer FIREBASE_TOKEN, fall back to FIREBASE_DEPLOY_KEY
-          FB_TOKEN: ${{ secrets.FIREBASE_TOKEN != '' && secrets.FIREBASE_TOKEN || secrets.FIREBASE_DEPLOY_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Verifying firebase-tools version..."
-          npx -y firebase-tools@13 --version
-          echo '{"mode":"balanced","capPerRun":40000}' | npx -y firebase-tools@13 \
-            --project "$PROJECT_ID" \
-            --token "$FB_TOKEN" \
-            functions:call "$FUNCTION_NAME"
-
-      - name: Link to Firebase Console logs
-        run: |
-          echo "Logs: https://console.firebase.google.com/project/${PROJECT_ID}/functions/details?region=${REGION}&functionId=${FUNCTION_NAME}"
+          npx -y firebase-tools@12.9.1 \
+            --project courthub-app \
+            functions:call runParksBackfillOnce \
+            --data '{"mode":"balanced","capPerRun":40000}'
