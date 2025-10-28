@@ -18,11 +18,7 @@ jobs:
       - name: Verify Firebase CLI version (v12.9.1)
         run: npx -y firebase-tools@12.9.1 --version
 
-      - name: Call runParksBackfillOnce (balanced)
+      - name: Call runParksBackfillOnce (balanced, single-line v12)
         env:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_DEPLOY_KEY }}
-        run: |
-          npx -y firebase-tools@12.9.1 \
-            --project courthub-app \
-            functions:call runParksBackfillOnce \
-            --data '{"mode":"balanced","capPerRun":40000}'
+        run: npx -y firebase-tools@12.9.1 functions:call runParksBackfillOnce --project courthub-app --data '{"mode":"balanced","capPerRun":40000}'
