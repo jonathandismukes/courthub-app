@@ -24,18 +24,31 @@ jobs:
         with:
           node-version: 20
 
-      - name: Validate required secrets
+      - name: Determine auth method
+        id: auth_method
         shell: bash
+        env:
+          HAS_EMAIL: ${{ secrets.WORKFLOW_ADMIN_EMAIL }}
+          HAS_PASSWORD: ${{ secrets.WORKFLOW_ADMIN_PASSWORD }}
+          HAS_FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          HAS_FIREBASE_DEPLOY_KEY: ${{ secrets.FIREBASE_DEPLOY_KEY }}
         run: |
           set -euo pipefail
-          if [[ -z "${{ secrets.WORKFLOW_ADMIN_EMAIL }}" || -z "${{ secrets.WORKFLOW_ADMIN_PASSWORD }}" ]]; then
-            echo "Missing WORKFLOW_ADMIN_EMAIL or WORKFLOW_ADMIN_PASSWORD repo secrets." >&2
-            echo "Add an owner account's email/password as repository secrets, then re-run." >&2
+          METHOD="none"
+          if [[ -n "${HAS_EMAIL:-}" && -n "${HAS_PASSWORD:-}" ]]; then
+            METHOD="owner_id_token"
+          elif [[ -n "${HAS_FIREBASE_TOKEN:-}" || -n "${HAS_FIREBASE_DEPLOY_KEY:-}" ]]; then
+            METHOD="firebase_token"
+          fi
+          echo "method=$METHOD" >> "$GITHUB_OUTPUT"
+          echo "Selected auth method: $METHOD"
+          if [[ "$METHOD" == "none" ]]; then
+            echo "No auth secrets found. Set either (WORKFLOW_ADMIN_EMAIL + WORKFLOW_ADMIN_PASSWORD) or FIREBASE_TOKEN (or FIREBASE_DEPLOY_KEY)." >&2
             exit 1
           fi
-          echo "Admin secrets present."
 
       - name: Get Firebase ID token (owner account)
+        if: steps.auth_method.outputs.method == 'owner_id_token'
         id: auth
         env:
           ADMIN_EMAIL: ${{ secrets.WORKFLOW_ADMIN_EMAIL }}
@@ -73,7 +86,8 @@ jobs:
           req.end();
           NODE
 
-      - name: Call runParksBackfillOnce (balanced)
+      - name: Call via REST with ID token (balanced)
+        if: steps.auth_method.outputs.method == 'owner_id_token'
         env:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
         shell: bash
@@ -99,6 +113,21 @@ jobs:
             exit 1
           fi
           echo "Backfill request accepted."
+
+      - name: Call via Firebase CLI token (balanced)
+        if: steps.auth_method.outputs.method == 'firebase_token'
+        env:
+          # Prefer FIREBASE_TOKEN, fall back to FIREBASE_DEPLOY_KEY
+          FB_TOKEN: ${{ secrets.FIREBASE_TOKEN != '' && secrets.FIREBASE_TOKEN || secrets.FIREBASE_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Verifying firebase-tools version..."
+          npx -y firebase-tools@13 --version
+          echo '{"mode":"balanced","capPerRun":40000}' | npx -y firebase-tools@13 \
+            --project "$PROJECT_ID" \
+            --token "$FB_TOKEN" \
+            functions:call "$FUNCTION_NAME"
 
       - name: Link to Firebase Console logs
         run: |
