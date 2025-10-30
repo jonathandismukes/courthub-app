@@ -10,15 +10,36 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Authenticate to Google Cloud (service account)
+        uses: google-github-actions/auth@v2
         with:
-          node-version: '20'
+          credentials_json: ${{ secrets.FIREBASE_DEPLOY_KEY }}
 
-      - name: Verify Firebase CLI version (v12.9.1)
-        run: npx -y firebase-tools@12.9.1 --version
-
-      - name: Call runParksBackfillOnce (balanced, single-line v12)
+      - name: Resolve BACKFILL_RUN_SECRET from Functions config
         env:
-          FIREBASE_TOKEN: ${{ secrets.FIREBASE_DEPLOY_KEY }}
-        run: npx -y firebase-tools@12.9.1 functions:call runParksBackfillOnce --project courthub-app --data '{"mode":"balanced","capPerRun":40000}'
+          TARGET_PROJECT: courthub-app
+        run: |
+          set -euo pipefail
+          echo "Fetching Firebase Functions config from project: ${TARGET_PROJECT}"
+          CFG=$(npx -y firebase-tools@13 functions:config:get --project "${TARGET_PROJECT}" || echo "{}")
+          # Extract backfill.run_secret safely via Node
+          RUN_SECRET=$(node -e 'try{const j=JSON.parse(process.argv[1]);const v=((j.backfill||{}).run_secret)||"";process.stdout.write(String(v));}catch(e){process.stdout.write("")}' "${CFG}")
+          if [ -z "${RUN_SECRET}" ]; then
+            echo "backfill.run_secret is not set in Firebase Functions config. Cannot invoke HTTP runner." >&2
+            exit 1
+          fi
+          echo "::add-mask::${RUN_SECRET}"
+          echo "BACKFILL_RUN_SECRET=${RUN_SECRET}" >> "$GITHUB_ENV"
+
+      - name: Invoke HTTP backfill
+        env:
+          TARGET_PROJECT: courthub-app
+          BACKFILL_RUN_SECRET: ${{ env.BACKFILL_RUN_SECRET }}
+        run: |
+          set -euo pipefail
+          URL="https://us-central1-${TARGET_PROJECT}.cloudfunctions.net/runParksBackfillOnceHttp"
+          echo "Calling $URL"
+          curl -sS -X POST "$URL" \
+            -H "X-Run-Secret: ${BACKFILL_RUN_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data '{"mode":"balanced","capPerRun":40000}'
