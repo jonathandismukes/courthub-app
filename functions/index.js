@@ -1212,6 +1212,84 @@ exports.runParksBackfillOnce = functions
     }
   });
 
+/**
+ * HTTP wrapper for CI: invoke the same backfill once logic via HTTPS onRequest.
+ * Auth model: shared secret header to avoid brittle CLI callable flows.
+ *
+ * Security:
+ * - Requires header: X-Run-Secret matching BACKFILL_RUN_SECRET (env) or backfill.run_secret (functions config)
+ * - Only proceeds if config/app.adminUid is set; runs as that owner
+ *
+ * Usage (GitHub Actions):
+ *   curl -sS -X POST "https://us-central1-<project>.cloudfunctions.net/runParksBackfillOnceHttp" \
+ *     -H "X-Run-Secret: $BACKFILL_RUN_SECRET" -H "Content-Type: application/json" \
+ *     -d '{"mode":"balanced","capPerRun":40000}'
+ */
+exports.runParksBackfillOnceHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') {
+        res.status(405).json({ ok: false, error: 'Method Not Allowed' });
+        return;
+      }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      if (!secretConfigured) {
+        console.error('BACKFILL_RUN_SECRET not configured');
+        res.status(500).json({ ok: false, error: 'Server not configured' });
+        return;
+      }
+      const provided = String(req.headers['x-run-secret'] || '').trim();
+      if (!provided || provided !== secretConfigured) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const db = admin.firestore();
+      const adminUid = await getAdminUid(db);
+      if (!adminUid) {
+        res.status(403).json({ ok: false, error: 'Owner not configured' });
+        return;
+      }
+
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const settings = {
+        mode: (body && body.mode) || 'balanced',
+        capPerRun: Number(body && body.capPerRun) || 50000,
+        clusterDecimals: Number(body && body.clusterDecimals) || 3,
+        parseCityStateNoApi: (body && body.parseCityStateNoApi) !== false,
+        refineNamesCap: Number(body && body.refineNamesCap) || 0,
+        pageSize: Number(body && body.pageSize) || 600,
+      };
+
+      const controlRef = db.collection('backfill').doc('control');
+      const statusRef = db.collection('backfill').doc('status');
+      try {
+        const ctrlSnap = await controlRef.get().catch(() => null);
+        let cursor = (ctrlSnap && ctrlSnap.exists && ctrlSnap.data().cursor) || null;
+        const resBatch = await runParksBackfillBatch({ db, settings, ownerUid: adminUid, startAfterId: cursor });
+        const nowIso = new Date().toISOString();
+        await statusRef.set({
+          ...resBatch,
+          lastRunAt: nowIso,
+          lastSuccessAt: nowIso,
+          settings,
+        }, { merge: true });
+        await controlRef.set({ cursor: resBatch.done ? null : resBatch.cursor, updatedAt: nowIso, lastMode: settings.mode }, { merge: true });
+        // Per-run log
+        const runId = nowIso.replace(/[:.]/g, '-') + '_manual_http';
+        await db.collection('backfill').doc('logs').collection('runs').doc(runId).set({ runId, ts: nowIso, ok: true, ...resBatch, settings });
+        res.status(200).json({ ok: true, ...resBatch });
+      } catch (e) {
+        const nowIso = new Date().toISOString();
+        await statusRef.set({ lastRunAt: nowIso, lastErrorAt: nowIso, lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true }).catch(() => {});
+        res.status(500).json({ ok: false, error: e?.message || 'Unknown error' });
+      }
+    } catch (e) {
+      res.status(500).json({ ok: false, error: 'Unhandled error' });
+    }
+  });
+
 // Optional: unattended scheduler that consumes batches using backfill/control
 exports.scheduledParksBackfillBatch = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
