@@ -35,10 +35,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 18 (no cache)
+      - name: Setup Node.js 20 (no cache)
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
 
       - name: Show service account key metadata (safe)
         if: ${{ always() }}
