@@ -77,6 +77,292 @@ exports.enforceSingleAdminOnUserWrite = functions.firestore
   });
 
 /**
+ * ========================
+ * PARKS GEO-CODE QUEUE DRAINER
+ * ========================
+ * Scheduled worker that processes parks_geocode_queue at a safe rate,
+ * updates the park's address/city/state, and enforces a daily cap.
+ *
+ * Collection: parks_geocode_queue
+ *   - Fields: { parkId, lat, lng, priority, reason, createdAt(ISO), status: 'queued' | 'running' | 'done' | 'failed', attempts }
+ *
+ * Rate/Caps (override via env or functions config):
+ *   GEOCODE_RATE_PER_MIN or geocode.rate_per_min (default 25)
+ *   GEOCODE_DAILY_CAP or geocode.daily_cap (default 40000)
+ *
+ * Usage accounting: billing/geoapify/days/YYYY-MM-DD { calls }
+ */
+function dayKey() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+async function getGeoapifyRemainingToday(db, dailyCap) {
+  try {
+    const key = dayKey();
+    const ref = db.collection('billing').doc('geoapify').collection('days').doc(key);
+    const snap = await ref.get();
+    const used = snap.exists ? Number(snap.data().calls || 0) : 0;
+    return Math.max(0, dailyCap - used);
+  } catch (_) {
+    // Fail-safe: return 0 to avoid overruns when accounting is unavailable
+    return 0;
+  }
+}
+
+async function consumeGeoapifyCalls(db, calls) {
+  try {
+    const key = dayKey();
+    const ref = db.collection('billing').doc('geoapify').collection('days').doc(key);
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const prev = snap.exists ? Number(snap.data().calls || 0) : 0;
+      tx.set(ref, { day: key, calls: prev + calls, updatedAt: new Date().toISOString() }, { merge: true });
+    });
+  } catch (e) {
+    console.warn('consumeGeoapifyCalls failed', e);
+  }
+}
+
+async function runGeocodeDrainBudget(db, { budgetThisRun, cap }) {
+  // Prefer priority then createdAt; if composite index missing, Firestore suggests one in logs
+  let q = db.collection('parks_geocode_queue')
+    .where('status', '==', 'queued')
+    .orderBy('priority', 'asc')
+    .orderBy('createdAt', 'asc')
+    .limit(budgetThisRun);
+  let snap;
+  try {
+    snap = await q.get();
+  } catch (e) {
+    // Fallback to createdAt only if composite index not available
+    console.warn('[geocodeDrain] fallback query (missing composite index?)', e.message || e);
+    snap = await db.collection('parks_geocode_queue')
+      .where('status', '==', 'queued')
+      .orderBy('createdAt', 'asc')
+      .limit(budgetThisRun)
+      .get();
+  }
+  if (snap.empty) {
+    console.log('[geocodeDrain] no queued jobs');
+    return { processed: 0 };
+  }
+
+  let processed = 0;
+  for (const doc of snap.docs) {
+    if (processed >= budgetThisRun) break;
+    const ref = doc.ref;
+    const job = doc.data() || {};
+    const parkId = job.parkId;
+    const lat = Number(job.lat);
+    const lng = Number(job.lng);
+    if (!parkId || !isFinite(lat) || !isFinite(lng)) {
+      await ref.set({ status: 'failed', error: 'invalid job payload', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+      continue;
+    }
+
+    // Acquire a per-job lease to avoid double process across retries
+    let leased = false;
+    try {
+      await db.runTransaction(async (tx) => {
+        const s = await tx.get(ref);
+        const d = s.exists ? s.data() : {};
+        const until = d && d.leaseExpiresAt ? new Date(d.leaseExpiresAt).getTime() : 0;
+        if (until && until > Date.now()) return; // already leased
+        const end = new Date(Date.now() + 60 * 1000).toISOString();
+        tx.set(ref, { status: 'running', leaseOwner: 'drain', leaseExpiresAt: end, startedAt: new Date().toISOString(), attempts: (Number(d.attempts)||0) + 1 }, { merge: true });
+        leased = true;
+      });
+    } catch (e) {
+      leased = false;
+    }
+    if (!leased) continue;
+
+    // Perform reverse geocode
+    let rg = null;
+    try { rg = await fetchGeoapifyReverse(lat, lng); } catch (e) { rg = null; }
+    if (!rg) {
+      await ref.set({ status: 'failed', error: 'reverse geocode failed', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+      continue;
+    }
+    processed += 1;
+    await consumeGeoapifyCalls(db, 1);
+
+    const addr = String(rg.address || '').trim();
+    const city = String(rg.city || '').trim();
+    const state = canonState(String(rg.state || '').trim());
+    const nowIso = new Date().toISOString();
+
+    // Update park doc minimally
+    try {
+      await db.collection('parks').doc(parkId).set({
+        address: addr || admin.firestore.FieldValue.delete(),
+        city: city || admin.firestore.FieldValue.delete(),
+        state: state || admin.firestore.FieldValue.delete(),
+        needsGeocode: false,
+        lastGeocodedAt: nowIso,
+        updatedAt: nowIso,
+      }, { merge: true });
+    } catch (e) {
+      console.warn('[geocodeDrain] failed to update park', parkId, e.message || e);
+    }
+
+    // Mark job done
+    try {
+      await ref.set({ status: 'done', finishedAt: nowIso }, { merge: true });
+    } catch (_) {}
+  }
+
+  return { processed };
+}
+
+exports.scheduledGeocodeQueueDrain = functions
+  .runWith({ timeoutSeconds: 300, memory: '512MB', maxInstances: 1 })
+  .pubsub.schedule('every 1 minutes').timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    if (!GEOAPIFY_KEY) {
+      console.warn('[geocodeDrain] GEOAPIFY_KEY not configured; skipping run');
+      return null;
+    }
+
+    // Configurable rate and daily cap
+    const ratePerMin = Number(getEnv('GEOCODE_RATE_PER_MIN', getEnv('geocode.rate_per_min', '25')));
+    const dailyCap = Number(getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
+    const perMinute = isFinite(ratePerMin) && ratePerMin > 0 ? Math.min(100, Math.max(1, ratePerMin)) : 25;
+    const cap = isFinite(dailyCap) && dailyCap > 0 ? Math.min(50000, Math.max(1000, dailyCap)) : 40000;
+
+    try {
+      // Honor daily remaining first
+      const remainingToday = await getGeoapifyRemainingToday(db, cap);
+      if (remainingToday <= 0) {
+        console.log('[geocodeDrain] daily cap reached; pausing until tomorrow');
+        return null;
+      }
+
+      const budgetThisRun = Math.min(perMinute, remainingToday);
+      const { processed } = await runGeocodeDrainBudget(db, { budgetThisRun, cap });
+      console.log(`[geocodeDrain] processed=${processed} budget=${budgetThisRun} remainingToday~=${remainingToday - processed}`);
+      return null;
+    } catch (e) {
+      console.error('[geocodeDrain] error', e);
+      return null;
+    }
+  });
+
+// HTTP runner for CI/GitHub Actions. Requires secret header and optional ?limit=
+exports.drainParksGeocodeQueueHttp = functions
+  .runWith({ timeoutSeconds: 300, memory: '512MB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') {
+        res.status(405).json({ ok: false, error: 'Method Not Allowed' });
+        return;
+      }
+      if (!GEOAPIFY_KEY) {
+        res.status(500).json({ ok: false, error: 'GEOAPIFY_KEY not configured' });
+        return;
+      }
+      // Accept either RUNNER_SECRET/geocode.runner_secret or BACKFILL_RUN_SECRET/backfill.run_secret
+      const configured = getEnv('RUNNER_SECRET',
+        getEnv('geocode.runner_secret',
+          getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''))
+        )
+      );
+      const provided = String(req.headers['x-runner-secret'] || req.headers['x-run-secret'] || '').trim();
+      if (!configured || !provided || provided !== configured) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      const db = admin.firestore();
+      // Enforce daily cap even for HTTP invocations
+      const dailyCap = Number(getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
+      const cap = isFinite(dailyCap) && dailyCap > 0 ? Math.min(50000, Math.max(1000, dailyCap)) : 40000;
+      const remainingToday = await getGeoapifyRemainingToday(db, cap);
+      if (remainingToday <= 0) {
+        res.status(200).json({ ok: true, processed: 0, note: 'daily cap reached' });
+        return;
+      }
+      const defaultRate = Number(getEnv('GEOCODE_RATE_PER_MIN', getEnv('geocode.rate_per_min', '25')));
+      const limitParam = Number(req.query.limit || req.body?.limit);
+      const requested = isFinite(limitParam) && limitParam > 0 ? Math.floor(limitParam) : (isFinite(defaultRate) && defaultRate > 0 ? defaultRate : 25);
+      const budgetThisRun = Math.min(remainingToday, Math.min(100, Math.max(1, requested)));
+      const { processed } = await runGeocodeDrainBudget(db, { budgetThisRun, cap });
+      res.status(200).json({ ok: true, processed, budget: budgetThisRun, remainingTodayApprox: Math.max(0, remainingToday - processed) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * Enqueue a reverse-geocode job for a park and mark the park as needing geocode.
+ */
+async function enqueueGeocodeJob(db, { parkId, lat, lng, reason = 'unspecified', priority = 5 }) {
+  const la = Number(lat);
+  const lo = Number(lng);
+  if (!isFinite(la) || !isFinite(lo)) return;
+  const nowIso = new Date().toISOString();
+  try {
+    await db.collection('parks').doc(parkId).set({
+      needsGeocode: true,
+      geocodeQueuedAt: nowIso,
+      updatedAt: nowIso,
+    }, { merge: true });
+  } catch (_) {}
+  try {
+    await db.collection('parks_geocode_queue').doc(parkId).set({
+      parkId,
+      lat: la,
+      lng: lo,
+      reason,
+      priority,
+      status: 'queued',
+      attempts: 0,
+      createdAt: nowIso,
+    }, { merge: true });
+  } catch (e) {
+    console.warn('enqueueGeocodeJob failed', parkId, e && e.message ? e.message : e);
+  }
+}
+
+// Queue on park create
+exports.enqueueGeocodeOnParkCreate = functions.firestore
+  .document('parks/{parkId}')
+  .onCreate(async (snap, context) => {
+    const db = admin.firestore();
+    const d = snap.data() || {};
+    const lat = Number(d.latitude);
+    const lng = Number(d.longitude);
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    await enqueueGeocodeJob(db, { parkId: snap.id, lat, lng, reason: 'park:create', priority: 4 });
+    return null;
+  });
+
+// Queue on relevant park updates
+exports.enqueueGeocodeOnParkUpdate = functions.firestore
+  .document('parks/{parkId}')
+  .onUpdate(async (change, context) => {
+    const db = admin.firestore();
+    const before = change.before.data() || {};
+    const after = change.after.data() || {};
+    const bLat = Number(before.latitude);
+    const bLng = Number(before.longitude);
+    const aLat = Number(after.latitude);
+    const aLng = Number(after.longitude);
+    const coordsChanged = (isFinite(aLat) && isFinite(aLng)) && (aLat !== bLat || aLng !== bLng);
+    const missingAddr = !after.address || !after.city || !after.state || String(after.address).trim().toLowerCase() === 'address not specified';
+    const flagged = after.needsGeocode === true;
+    if (!coordsChanged && !missingAddr && !flagged) return null;
+    if (!isFinite(aLat) || !isFinite(aLng)) return null;
+    const reason = coordsChanged ? 'park:update:coords' : (flagged ? 'park:update:flag' : 'park:update:missing');
+    await enqueueGeocodeJob(db, { parkId: change.after.id, lat: aLat, lng: aLng, reason, priority: coordsChanged ? 2 : 5 });
+    return null;
+  });
+
+/**
  * Callable: Claim importer ownership (sets config/app.adminUid) on first run.
  * - If adminUid is not set, the first authenticated caller becomes the owner.
  * - If adminUid is set, only the current owner can change it to a new UID
@@ -993,6 +1279,9 @@ async function runParksBackfillBatch({ db, settings, ownerUid, startAfterId = nu
   const placesCacheAddr = new Map(); // key -> { addr, city, state }
   const clusterGoodName = new Map(); // key|sport -> name
   const clusterGeocoded = new Set();
+  // Daily Geoapify guardrail for backfill as well
+  const dailyCap = Number(getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
+  let remainingGeoToday = await getGeoapifyRemainingToday(db, isFinite(dailyCap) && dailyCap > 0 ? dailyCap : 40000);
 
   let base = db.collection('parks').orderBy(admin.firestore.FieldPath.documentId());
   if (startAfterId) {
@@ -1061,11 +1350,13 @@ async function runParksBackfillBatch({ db, settings, ownerUid, startAfterId = nu
       const knownName = clusterGoodName.get(spKey);
       if (missingName && knownName) newName = knownName;
       if (!newAddress || isMissingAddress(newAddress) || !newCity || !newState) {
-        if (!clusterGeocoded.has(key) && rgCalls < capPerRun) {
+        if (!clusterGeocoded.has(key) && rgCalls < capPerRun && remainingGeoToday > 0) {
           try {
             rg = await fetchGeoapifyReverse(latitude, longitude);
             if (rg) {
               rgCalls += 1;
+              remainingGeoToday -= 1;
+              try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
               clusterGeocoded.add(key);
               clustersTouched += 1;
               const gotAddr = String(rg.address || '').trim();
@@ -1095,9 +1386,12 @@ async function runParksBackfillBatch({ db, settings, ownerUid, startAfterId = nu
         newName = fallbackNameFromContext({ original: name, address: newAddress, city: newCity, sport: sportType });
       }
     } else { // full
+      if (remainingGeoToday <= 0) { apiMisses += 1; continue; }
       try { rg = await fetchGeoapifyReverse(latitude, longitude); } catch (_) { rg = null; }
       if (!rg) { apiMisses += 1; continue; }
       rgCalls += 1;
+      remainingGeoToday -= 1;
+      try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
       const gotAddr = String(rg.address || '').trim();
       const gotCity = String(rg.city || '').trim();
       const gotState = canonState(String(rg.state || '').trim());
@@ -1886,12 +2180,32 @@ async function importOverpassElements({ db, adminUid, state, elements, maxCreate
       sourceId: `${type}/${osmId}`,
       sourceAttribution: '© OpenStreetMap contributors',
       license: 'ODbL',
+      // Geocoding flags for the queue drainer
+      needsGeocode: true,
+      geocodeQueuedAt: nowIso,
     }, { merge: false });
 
     // Register location key to prevent future dups near-identical coords
     try {
       await locRef.set({ parkId: id, lat, lon, state, registeredAt: nowIso }, { merge: false });
     } catch (_) { /* ignore */ }
+
+    // Enqueue a geocode job for this new park
+    try {
+      const qRef = db.collection('parks_geocode_queue').doc(id);
+      await qRef.set({
+        parkId: id,
+        lat,
+        lng: lon,
+        reason: 'import:new',
+        priority: 5,
+        status: 'queued',
+        attempts: 0,
+        createdAt: nowIso,
+      }, { merge: true });
+    } catch (e) {
+      console.warn('Failed to enqueue geocode job for', id, e && e.message ? e.message : e);
+    }
 
     created += 1;
     if (created >= maxCreates) break;
