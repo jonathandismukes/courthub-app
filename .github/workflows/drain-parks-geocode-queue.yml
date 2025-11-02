@@ -1,0 +1,24 @@
+name: Drain Parks Geocode Queue
+
+on:
+  schedule:
+    - cron: '*/2 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Invoke drain function
+        env:
+          # Project fixed per handoff: courthub-app (region us-central1)
+          FUNCTION_URL: https://us-central1-courthub-app.cloudfunctions.net/drainParksGeocodeQueueHttp
+          BACKFILL_RUN_SECRET: ${{ secrets.BACKFILL_RUN_SECRET }}
+        run: |
+          if [ -z "$BACKFILL_RUN_SECRET" ]; then
+            echo "Missing secrets.BACKFILL_RUN_SECRET" && exit 1
+          fi
+          curl -sS -X POST "$FUNCTION_URL?limit=25" \
+            -H "x-run-secret: $BACKFILL_RUN_SECRET" \
+            -H "Content-Type: application/json" \
+            -d '{}'
