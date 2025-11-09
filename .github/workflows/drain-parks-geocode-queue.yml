@@ -16,7 +16,7 @@ on:
 # the older one will be canceled so they never overlap.
 concurrency:
   group: drain-parks-geocode-queue
-  cancel-in-progress: true
+    cancel-in-progress: false
 
 permissions:
   contents: read
@@ -47,13 +47,23 @@ jobs:
 
           echo "Draining parks geocode queue with limit=${LIM}…"
 
-          # Robust call: fail on HTTP errors, retry transient failures
-          curl -sS \
-            --fail \
+          # Explicitly POST with a JSON body (the function rejects GET → 405)
+          # Capture HTTP code and body for easy troubleshooting. Retry on transient errors.
+          HTTP_CODE=$(curl -sS \
             --retry 5 \
             --retry-all-errors \
             --max-time 60 \
+            -w "%{http_code}" -o /tmp/resp.txt \
+            -X POST "${FUNCTION_URL}?limit=${LIM}" \
             -H "X-Run-Secret: ${BACKFILL_RUN_SECRET}" \
-            "${FUNCTION_URL}?limit=${LIM}" | tee response.json
+            -H "Content-Type: application/json" \
+            -d '{}')
 
-          echo "\nCompleted drain call. See response above."
+          echo "HTTP ${HTTP_CODE}"
+          echo "Response:"
+          cat /tmp/resp.txt
+          echo
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            exit 1
+          fi
