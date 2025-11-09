@@ -3,14 +3,10 @@ name: Drain Parks Geocode Queue
 on:
   schedule:
     - cron: '*/2 * * * *'
-  workflow_dispatch:
-    inputs:
-      limit:
-        description: 'Number of items to process (optional)'
-        required: false
-        default: '25'
+  workflow_dispatch: {}
 
-# Prevent overlapping runs of this workflow
+# Prevent overlapping runs. If a new run starts while another is running,
+# the older one will be allowed to finish (no cancel).
 concurrency:
   group: drain-parks-geocode-queue
   cancel-in-progress: false
@@ -18,114 +14,19 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
       - name: Invoke drain function
         env:
+          # Project fixed per handoff: courthub-app (region us-central1)
           FUNCTION_URL: https://us-central1-courthub-app.cloudfunctions.net/drainParksGeocodeQueueHttp
           BACKFILL_RUN_SECRET: ${{ secrets.BACKFILL_RUN_SECRET }}
-          INPUT_LIMIT: ${{ github.event.inputs.limit }}
-          DEFAULT_LIMIT: '25'
-        shell: bash
         run: |
-          set -euo pipefail
-
-          if [[ -z "${BACKFILL_RUN_SECRET:-}" ]]; then
-            echo "Missing repo secret BACKFILL_RUN_SECRET"
-            exit 1
+          if [ -z "$BACKFILL_RUN_SECRET" ]; then
+            echo "Missing secrets.BACKFILL_RUN_SECRET" && exit 1
           fi
-
-          # Determine limit: use manual input if provided, else default (for schedule)
-          LIMIT="${INPUT_LIMIT:-}"
-          if [[ -z "$LIMIT" ]]; then
-            LIMIT="$DEFAULT_LIMIT"
-          fi
-
-          echo "Calling drain with limit=$LIMIT"
-
-          # Force POST with a tiny JSON body
-          STATUS=$(curl -sS -o response.txt -w "%{http_code}" \
-            -X POST "$FUNCTION_URL?limit=$LIMIT" \
+          # Force POST with small JSON body; fail on non-2xx and show errors
+          curl --fail --show-error -sS -X POST "$FUNCTION_URL?limit=25" \
+            -H "x-run-secret: $BACKFILL_RUN_SECRET" \
             -H "Content-Type: application/json" \
-            -H "X-Run-Secret: $BACKFILL_RUN_SECRET" \
-            --fail --retry 5 --retry-all-errors --max-time 120 \
-            -d '{}')
+            -d '{}'
 
-          echo "HTTP $STATUS"
-          echo "Response:"
-          cat response.txt || true
-
-          # If not 2xx, fail the job
-          if [[ "$STATUS" -lt 200 || "$STATUS" -ge 300 ]]; then
-            exit 1
-          fi
-
-name: Drain Parks Geocode Queue
-
-on:
-  schedule:
-    # Every 2 minutes
-    - cron: '*/2 * * * *'
-  workflow_dispatch:
-    inputs:
-      limit:
-        description: 'How many geocode jobs to process this run'
-        required: false
-        default: '25'
-        type: number
-
-# Prevent overlapping runs. If a new run starts while another is running,
-# the older one will be canceled so they never overlap.
-concurrency:
-  group: drain-parks-geocode-queue
-    cancel-in-progress: false
-
-permissions:
-  contents: read
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      # Fixed project/region per backend
-      FUNCTION_URL: https://us-central1-courthub-app.cloudfunctions.net/drainParksGeocodeQueueHttp
-      BACKFILL_RUN_SECRET: ${{ secrets.BACKFILL_RUN_SECRET }}
-      # If dispatched manually, LIMIT comes from input; otherwise defaults to 25
-      LIMIT: ${{ inputs.limit || '25' }}
-    steps:
-      - name: Invoke drain function
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -z "${BACKFILL_RUN_SECRET:-}" ]; then
-            echo "ERROR: Missing GitHub Action secret BACKFILL_RUN_SECRET." >&2
-            echo "Add it in GitHub → Settings → Secrets and variables → Actions." >&2
-            exit 1
-          fi
-
-          LIM="${LIMIT:-25}"
-
-          echo "Draining parks geocode queue with limit=${LIM}…"
-
-          # Explicitly POST with a JSON body (the function rejects GET → 405)
-          # Capture HTTP code and body for easy troubleshooting. Retry on transient errors.
-          HTTP_CODE=$(curl -sS \
-            --retry 5 \
-            --retry-all-errors \
-            --max-time 60 \
-            -w "%{http_code}" -o /tmp/resp.txt \
-            -X POST "${FUNCTION_URL}?limit=${LIM}" \
-            -H "X-Run-Secret: ${BACKFILL_RUN_SECRET}" \
-            -H "Content-Type: application/json" \
-            -d '{}')
-
-          echo "HTTP ${HTTP_CODE}"
-          echo "Response:"
-          cat /tmp/resp.txt
-          echo
-
-          if [ "$HTTP_CODE" -ge 400 ]; then
-            exit 1
-          fi
