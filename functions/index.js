@@ -127,6 +127,15 @@ async function consumeGeoapifyCalls(db, calls) {
   }
 }
 
+// Resolve a single daily cap value shared by ALL Geoapify usage (reverse geocode + places)
+function getGeoapifyDailyCapValue() {
+  const raw = getEnv('GEOAPIFY_DAILY_CAP', getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
+  const n = Number(raw);
+  if (!isFinite(n) || n <= 0) return 40000;
+  // Reasonable guardrails
+  return Math.max(1000, Math.min(50000, Math.floor(n)));
+}
+
 async function runGeocodeDrainBudget(db, { budgetThisRun, cap }) {
   // Prefer priority then createdAt; if composite index missing, Firestore suggests one in logs
   let q = db.collection('parks_geocode_queue')
@@ -140,11 +149,20 @@ async function runGeocodeDrainBudget(db, { budgetThisRun, cap }) {
   } catch (e) {
     // Fallback to createdAt only if composite index not available
     console.warn('[geocodeDrain] fallback query (missing composite index?)', e.message || e);
-    snap = await db.collection('parks_geocode_queue')
-      .where('status', '==', 'queued')
-      .orderBy('createdAt', 'asc')
-      .limit(budgetThisRun)
-      .get();
+    try {
+      snap = await db.collection('parks_geocode_queue')
+        .where('status', '==', 'queued')
+        .orderBy('createdAt', 'asc')
+        .limit(budgetThisRun)
+        .get();
+    } catch (e2) {
+      // Last-resort fallback: drop ordering to avoid composite index requirement.
+      console.warn('[geocodeDrain] second fallback (createdAt index missing?), using unordered query', e2.message || e2);
+      snap = await db.collection('parks_geocode_queue')
+        .where('status', '==', 'queued')
+        .limit(budgetThisRun)
+        .get();
+    }
   }
   if (snap.empty) {
     console.log('[geocodeDrain] no queued jobs');
@@ -229,11 +247,10 @@ exports.scheduledGeocodeQueueDrain = functions
       return null;
     }
 
-    // Configurable rate and daily cap
+    // Configurable rate and shared daily cap (shared across all Geoapify calls)
     const ratePerMin = Number(getEnv('GEOCODE_RATE_PER_MIN', getEnv('geocode.rate_per_min', '25')));
-    const dailyCap = Number(getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
     const perMinute = isFinite(ratePerMin) && ratePerMin > 0 ? Math.min(100, Math.max(1, ratePerMin)) : 25;
-    const cap = isFinite(dailyCap) && dailyCap > 0 ? Math.min(50000, Math.max(1000, dailyCap)) : 40000;
+    const cap = getGeoapifyDailyCapValue();
 
     try {
       // Honor daily remaining first
@@ -278,9 +295,8 @@ exports.drainParksGeocodeQueueHttp = functions
         return;
       }
       const db = admin.firestore();
-      // Enforce daily cap even for HTTP invocations
-      const dailyCap = Number(getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
-      const cap = isFinite(dailyCap) && dailyCap > 0 ? Math.min(50000, Math.max(1000, dailyCap)) : 40000;
+      // Enforce shared daily cap even for HTTP invocations
+      const cap = getGeoapifyDailyCapValue();
       const remainingToday = await getGeoapifyRemainingToday(db, cap);
       if (remainingToday <= 0) {
         res.status(200).json({ ok: true, processed: 0, note: 'daily cap reached' });
@@ -788,12 +804,22 @@ exports.geoTextSearch = functions.https.onCall(async (data, context) => {
       return cached;
     }
 
-    // Try Geoapify first (low-cost), then optionally Google
+    // Try Geoapify first (low-cost), enforcing shared daily cap; then optionally Google
     let places = [];
     try {
-      const gfea = await fetchGeoapifyTextSearch(text, bias);
-      if (Array.isArray(gfea) && gfea.length > 0) {
-        places = gfea;
+      const cap = getGeoapifyDailyCapValue();
+      const remaining = await getGeoapifyRemainingToday(db, cap);
+      if (remaining > 0) {
+        const gfea = await fetchGeoapifyTextSearch(text, bias);
+        if (gfea) {
+          // Count this successful call toward the daily cap
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+          if (Array.isArray(gfea) && gfea.length > 0) {
+            places = gfea;
+          }
+        }
+      } else {
+        console.log('Geoapify text search skipped: daily cap reached');
       }
     } catch (e) {
       console.warn('Geoapify text search error', e);
@@ -847,12 +873,21 @@ exports.geoTextSearchV2 = functions.https.onCall(async (data, context) => {
       return cached;
     }
 
-    // Geoapify single-page attempt first if key present, then optionally Google paged
+    // Geoapify single-page attempt first if key present (enforcing shared cap), then optionally Google paged
     let places = [];
     try {
-      const gfea = await fetchGeoapifyTextSearch(text, bias);
-      if (Array.isArray(gfea) && gfea.length > 0) {
-        places = gfea;
+      const cap = getGeoapifyDailyCapValue();
+      const remaining = await getGeoapifyRemainingToday(db, cap);
+      if (remaining > 0) {
+        const gfea = await fetchGeoapifyTextSearch(text, bias);
+        if (gfea) {
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+          if (Array.isArray(gfea) && gfea.length > 0) {
+            places = gfea;
+          }
+        }
+      } else {
+        console.log('Geoapify text search v2 skipped: daily cap reached');
       }
     } catch (e) {
       console.warn('Geoapify text search v2 error', e);
@@ -1058,7 +1093,19 @@ exports.geoReverseGeocode = functions.https.onCall(async (data, context) => {
     if (cached) return cached;
 
     let result = null;
-    try { result = await fetchGeoapifyReverse(lat, lng); } catch (e) { console.warn('Geoapify reverse error', e); }
+    // Enforce shared daily cap for Geoapify reverse geocoding as well
+    try {
+      const cap = getGeoapifyDailyCapValue();
+      const remaining = await getGeoapifyRemainingToday(db, cap);
+      if (remaining > 0) {
+        result = await fetchGeoapifyReverse(lat, lng);
+        if (result) {
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+        }
+      } else {
+        console.log('Geoapify reverse skipped: daily cap reached');
+      }
+    } catch (e) { console.warn('Geoapify reverse error', e); }
     const disableGoogle = await isGoogleFallbackDisabled(db);
     if (!result && !disableGoogle) {
       const remaining = await getGoogleRemainingCalls(db);
@@ -1283,8 +1330,8 @@ async function runParksBackfillBatch({ db, settings, ownerUid, startAfterId = nu
   const clusterGoodName = new Map(); // key|sport -> name
   const clusterGeocoded = new Set();
   // Daily Geoapify guardrail for backfill as well
-  const dailyCap = Number(getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
-  let remainingGeoToday = await getGeoapifyRemainingToday(db, isFinite(dailyCap) && dailyCap > 0 ? dailyCap : 40000);
+  const cap = getGeoapifyDailyCapValue();
+  let remainingGeoToday = await getGeoapifyRemainingToday(db, cap);
 
   let base = db.collection('parks').orderBy(admin.firestore.FieldPath.documentId());
   if (startAfterId) {
@@ -1914,6 +1961,7 @@ async function releaseLease(db, ref, { leaseField = 'runLease' } = {}) {
 }
 
 const WEST_TO_EAST_STATE_ORDER = [
+  'AK', 'HI',
   'CA', 'OR', 'WA', // West Coast
   'NV', 'AZ', 'ID', 'UT',
   'NM', 'CO', 'MT', 'WY',
@@ -2105,10 +2153,33 @@ async function importOverpassElements({ db, adminUid, state, elements, maxCreate
     const lon = safeNumber(el.lon || (el.center && el.center.lon), null);
     if (lat === null || lon === null) continue;
 
-    const name = (tags.name && String(tags.name).trim()) || `${(tags.sport || 'court')} court`;
+    // Derive human name + address basics
+    let name = (tags.name && String(tags.name).trim()) || '';
     const city = tags['addr:city'] || '';
     const address = [tags['addr:housenumber'], tags['addr:street']].filter(Boolean).join(' ');
+    // Infer sports with expanded heuristics and allow multi-court creation
     const sportType = inferSportTypeFromTags(tags);
+    // Build multi-sport list based on tags.sport, alt keys, and name hints
+    const sportStr = ((tags && (tags.sport || tags['sport:1'])) || '').toLowerCase();
+    const rawName = (tags && tags.name ? String(tags.name).toLowerCase() : '');
+    const sports = new Set();
+    if (sportStr.includes('basket')) sports.add('basketball');
+    if (sportStr.includes('tennis')) sports.add('tennis');
+    if (sportStr.includes('pickle')) sports.add('pickleball');
+    // Alt keys like basketball=yes, playground:basketball=yes, tennis:yes, etc.
+    if (String(tags['basketball'] || '').toLowerCase() === 'yes' || String(tags['playground:basketball'] || '').toLowerCase() === 'yes') sports.add('basketball');
+    if (String(tags['tennis'] || '').toLowerCase() === 'yes' || String(tags['playground:tennis'] || '').toLowerCase() === 'yes') sports.add('tennis');
+    if (String(tags['pickleball'] || '').toLowerCase() === 'yes') sports.add('pickleball');
+    // Name hints as last resort
+    if (rawName.includes('basket')) sports.add('basketball');
+    if (rawName.includes('tennis')) sports.add('tennis');
+    if (rawName.includes('pickle')) sports.add('pickleball');
+    if (sports.size === 0) {
+      // Fall back to the single inferred sport type
+      if (sportType.includes('pickle')) sports.add('pickleball');
+      else if (sportType.includes('tennis')) sports.add('tennis');
+      else sports.add('basketball');
+    }
 
     // If the exact OSM doc already exists, skip
     const docRef = db.collection('parks').doc(id);
@@ -2137,22 +2208,84 @@ async function importOverpassElements({ db, adminUid, state, elements, maxCreate
       continue;
     }
 
-    const court = {
-      id: 'c1',
-      courtNumber: 1,
-      customName: null,
-      playerCount: 0,
-      sportType: sportType,
-      type: 'fullCourt',
-      condition: 'good',
-      hasLighting: false,
-      isHalfCourt: false,
-      isIndoor: false,
-      surface: tags.surface || null,
-      lastUpdated: nowIso,
-      conditionNotes: null,
-      gotNextQueue: [],
-    };
+    // Helper to read integer counts with fallbacks per sport
+    function readCount(key) {
+      const v = (tags && tags[key]) ? String(tags[key]).trim() : '';
+      const m = v.match(/^(\d{1,3})$/);
+      if (m) return Math.max(1, Math.min(32, Number(m[1])));
+      return 1;
+    }
+    function countFor(s) {
+      if (s === 'basketball') return readCount('basketball:count');
+      if (s === 'tennis') {
+        const t = readCount('tennis:count');
+        return t !== 1 ? t : readCount('courts');
+      }
+      if (s === 'pickleball') {
+        const p = readCount('pickleball:count');
+        return p !== 1 ? p : readCount('courts');
+      }
+      return 1;
+    }
+    // Map sport string -> Firestore enum fields used in app
+    function mapSportType(s) {
+      if (s === 'basketball') return 'basketball';
+      if (s === 'tennis') return 'tennisSingles';
+      if (s === 'pickleball') return 'pickleballSingles';
+      return 'basketball';
+    }
+    function mapCourtType(s) {
+      if (s === 'basketball') return 'fullCourt';
+      if (s === 'tennis') return 'tennisSingles';
+      if (s === 'pickleball') return 'pickleballSingles';
+      return 'fullCourt';
+    }
+    const hasLighting = String(tags['lit'] || '').toLowerCase() === 'yes';
+    const courts = [];
+    let seq = 0;
+    Array.from(sports).forEach((s) => {
+      const n = countFor(s);
+      for (let i = 0; i < n; i++) {
+        seq += 1;
+        courts.push({
+          id: `c${seq}`,
+          courtNumber: seq,
+          customName: null,
+          playerCount: 0,
+          sportType: mapSportType(s),
+          type: mapCourtType(s),
+          condition: 'good',
+          hasLighting,
+          isHalfCourt: false,
+          isIndoor: false,
+          surface: tags.surface || null,
+          lastUpdated: nowIso,
+          conditionNotes: null,
+          gotNextQueue: [],
+        });
+      }
+    });
+    if (courts.length === 0) {
+      // Ensure at least one court exists
+      courts.push({
+        id: 'c1', courtNumber: 1, customName: null, playerCount: 0,
+        sportType: mapSportType(Array.from(sports)[0] || 'basketball'),
+        type: mapCourtType(Array.from(sports)[0] || 'basketball'),
+        condition: 'good', hasLighting, isHalfCourt: false, isIndoor: false,
+        surface: tags.surface || null, lastUpdated: nowIso, conditionNotes: null, gotNextQueue: [],
+      });
+    }
+    // Build sportCategories for fast filtering
+    const sportCategories = Array.from(new Set(courts.map(ct =>
+      ct.sportType.includes('pickle') ? 'pickleball' : (ct.sportType.includes('tennis') ? 'tennis' : 'basketball')
+    ))).sort();
+    // Improve empty/generic names using context
+    if (!name || /^(basketball|tennis|pickleball) court(s)?$/i.test(name) || /^(court|courts)\s*\d*$/i.test(name)) {
+      const primarySport = courts[0] && courts[0].sportType ?
+        (courts[0].sportType.includes('pickle') ? 'pickleball' : (courts[0].sportType.includes('tennis') ? 'tennis' : 'basketball'))
+        : 'basketball';
+      name = fallbackNameFromContext({ original: name, address, city, sport: primarySport });
+    }
 
     await docRef.set({
       id: id,
@@ -2162,7 +2295,8 @@ async function importOverpassElements({ db, adminUid, state, elements, maxCreate
       state: state,
       latitude: lat,
       longitude: lon,
-      courts: [court],
+      courts: courts,
+      sportCategories: sportCategories,
       photoUrls: [],
       amenities: [],
       averageRating: 0.0,
@@ -2565,6 +2699,324 @@ exports.scheduledOsmAuditAndBacklog = functions.pubsub
     return null;
   });
 
+/**
+ * ========================
+ * PLACES (Geoapify) CITY BACKFILL
+ * ========================
+ * Seed a backlog of cities per state, then a scheduler ingests courts around each city
+ * for basketball/tennis/pickleball using Geoapify text search (server-side), auto-approved.
+ */
+
+// Standardize a place object into { id, name, address, lat, lon, provider }
+function normalizeStdPlace(p) {
+  if (!p) return null;
+  const loc = p.location || {};
+  const id = p.id || '';
+  const provider = p.provider || 'geoapify';
+  const name = (p.displayName && p.displayName.text) || p.displayName || 'Unknown';
+  const address = p.formattedAddress || '';
+  const lat = Number(loc.latitude);
+  const lon = Number(loc.longitude);
+  if (!isFinite(lat) || !isFinite(lon)) return null;
+  return { id, name, address, lat, lon, provider };
+}
+
+function buildPlaceDocId(provider, placeId) {
+  const prov = (provider || 'geoapify').toLowerCase();
+  const pid = String(placeId || '').trim();
+  if (!pid) return null;
+  return `place:${prov}:${pid}`;
+}
+
+async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radiusMeters = 16000, maxCreates = 400 }) {
+  const nowIso = new Date().toISOString();
+  // Shared daily cap guardrail across ALL Geoapify usage
+  const cap = getGeoapifyDailyCapValue();
+  let remainingGeoToday = await getGeoapifyRemainingToday(db, cap);
+  const queries = [
+    { text: 'basketball court', sport: 'basketball' },
+    { text: 'basketball courts', sport: 'basketball' },
+    { text: 'tennis court', sport: 'tennis' },
+    { text: 'tennis courts', sport: 'tennis' },
+    { text: 'pickleball court', sport: 'pickleball' },
+    { text: 'pickleball courts', sport: 'pickleball' },
+  ];
+  const bias = (isFinite(lat) && isFinite(lon)) ? { lat, lng: lon, radius: Math.max(4000, Math.min(26000, Math.floor(radiusMeters))) } : null;
+  const aggregated = new Map(); // key=id -> { place, sports:Set }
+
+  for (const q of queries) {
+    if (aggregated.size >= maxCreates) break;
+    if (remainingGeoToday <= 0) {
+      console.log('[placesImport] Geoapify daily cap reached; stopping queries');
+      break;
+    }
+    let list = [];
+    try {
+      const out = await fetchGeoapifyTextSearch(q.text + (city && state ? ` in ${city}, ${state}` : ''), bias);
+      if (out) {
+        list = out;
+        try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+        remainingGeoToday -= 1;
+      } else {
+        list = [];
+      }
+    } catch (_) { list = []; }
+    for (const raw of (list || [])) {
+      const m = normalizeStdPlace(raw);
+      if (!m) continue;
+      const key = buildPlaceDocId(m.provider, m.id) || `${m.name}_${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
+      const entry = aggregated.get(key) || { place: m, sports: new Set() };
+      entry.sports.add(q.sport);
+      // Keep the best name/address if multiple
+      if ((m.name || '').length > (entry.place.name || '').length) entry.place.name = m.name;
+      if ((m.address || '').length > (entry.place.address || '').length) entry.place.address = m.address;
+      aggregated.set(key, entry);
+      if (aggregated.size >= maxCreates) break;
+    }
+  }
+
+  let created = 0;
+  let skippedExists = 0;
+  for (const [key, entry] of aggregated.entries()) {
+    if (created >= maxCreates) break;
+    const m = entry.place;
+    const sports = Array.from(entry.sports);
+    const docId = buildPlaceDocId(m.provider, m.id) || key;
+
+    // Dedupe by location index first
+    const locKey = `ll:${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
+    const locRef = db.collection('parkLocIndex').doc(locKey);
+    const locSnap = await locRef.get().catch(() => null);
+    if (locSnap && locSnap.exists) {
+      const target = locSnap.data() && locSnap.data().parkId;
+      if (target) {
+        try {
+          await db.collection('parks').doc(target).set({
+            altSources: admin.firestore.FieldValue.arrayUnion({ type: 'places', ref: `${m.provider}:${m.id}` }),
+            updatedAt: nowIso,
+          }, { merge: true });
+        } catch (_) {}
+        skippedExists += 1;
+        continue;
+      }
+    }
+
+    // Check direct id existence
+    const ref = db.collection('parks').doc(docId);
+    const exists = await ref.get();
+    if (exists.exists) { skippedExists += 1; continue; }
+
+    // Build courts from sports list
+    const hasLighting = false;
+    const courts = [];
+    let seq = 0;
+    function mapSportType(s) { return s === 'tennis' ? 'tennisSingles' : (s === 'pickleball' ? 'pickleballSingles' : 'basketball'); }
+    function mapCourtType(s) { return s === 'tennis' ? 'tennisSingles' : (s === 'pickleball' ? 'pickleballSingles' : 'fullCourt'); }
+    for (const s of sports) {
+      seq += 1;
+      courts.push({
+        id: `c${seq}`,
+        courtNumber: seq,
+        customName: null,
+        playerCount: 0,
+        sportType: mapSportType(s),
+        type: mapCourtType(s),
+        condition: 'good',
+        hasLighting,
+        isHalfCourt: false,
+        isIndoor: false,
+        surface: null,
+        lastUpdated: nowIso,
+        conditionNotes: null,
+        gotNextQueue: [],
+      });
+    }
+    if (courts.length === 0) {
+      courts.push({ id: 'c1', courtNumber: 1, customName: null, playerCount: 0, sportType: 'basketball', type: 'fullCourt', condition: 'good', hasLighting, isHalfCourt: false, isIndoor: false, surface: null, lastUpdated: nowIso, conditionNotes: null, gotNextQueue: [] });
+    }
+    const sportCategories = Array.from(new Set(courts.map(ct => ct.sportType.includes('pickle') ? 'pickleball' : (ct.sportType.includes('tennis') ? 'tennis' : 'basketball')))).sort();
+    let friendlyName = m.name && String(m.name).trim();
+    if (!friendlyName || /^(basketball|tennis|pickleball) court(s)?$/i.test(friendlyName) || /^(court|courts)\s*\d*$/i.test(friendlyName)) {
+      const primary = courts[0] && courts[0].sportType && (courts[0].sportType.includes('pickle') ? 'pickleball' : (courts[0].sportType.includes('tennis') ? 'tennis' : 'basketball'));
+      friendlyName = fallbackNameFromContext({ original: friendlyName, address: m.address || '', city, sport: primary });
+    }
+
+    await ref.set({
+      id: docId,
+      name: titleCase(friendlyName),
+      address: m.address || '',
+      city: city || '',
+      state: canonState(state || ''),
+      latitude: m.lat,
+      longitude: m.lon,
+      courts,
+      sportCategories,
+      photoUrls: [],
+      amenities: [],
+      averageRating: 0.0,
+      totalReviews: 0,
+      description: null,
+      approved: true,
+      reviewStatus: 'approved',
+      createdByUserId: adminUid || 'system',
+      createdByName: 'Places Import',
+      approvedByUserId: adminUid || 'system',
+      approvedAt: nowIso,
+      reviewedByUserId: adminUid || 'system',
+      reviewedAt: nowIso,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      source: 'places',
+      sourceId: `${m.provider}:${m.id}`,
+      sourceAttribution: 'Geoapify',
+      needsGeocode: true,
+      geocodeQueuedAt: nowIso,
+    }, { merge: false });
+
+    try { await locRef.set({ parkId: docId, lat: m.lat, lon: m.lon, state: canonState(state || ''), registeredAt: nowIso }, { merge: false }); } catch (_) {}
+    try {
+      await db.collection('parks_geocode_queue').doc(docId).set({ parkId: docId, lat: m.lat, lng: m.lon, reason: 'places:new', priority: 5, status: 'queued', attempts: 0, createdAt: nowIso }, { merge: true });
+    } catch (_) {}
+    created += 1;
+  }
+
+  return { created, skippedExists, totalConsidered: aggregated.size };
+}
+
+// Callable: Seed Places backlog for a state using Overpass city discovery
+exports.seedPlacesBacklogForState = functions.https.onCall(async (data, context) => {
+  const db = admin.firestore();
+  if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+  const callerUid = context.auth.uid;
+  const adminUid = await getAdminUid(db);
+  if (!adminUid || callerUid !== adminUid) {
+    throw new functions.https.HttpsError('permission-denied', 'Only the owner can seed backlog');
+  }
+  const state = String(data && data.state || '').toUpperCase();
+  if (!STATE_ISO_MAP[state]) throw new functions.https.HttpsError('invalid-argument', `Unsupported state code: ${state}`);
+  const nowIso = new Date().toISOString();
+  try {
+    const backlog = db.collection('imports').doc('places').collection('backlog');
+    const query = makeOverpassCitiesInStateQuery(state);
+    const res = await overpassPostWithMirrors(query, 'Courthub-PlacesSeed/1.0 (+courthub.app)');
+    if (!res.ok) {
+      const brief = await res.text().catch(() => '');
+      throw new Error(`Overpass failed: ${brief.slice(0,160)}`);
+    }
+    const json = await res.json();
+    const elements = Array.isArray(json.elements) ? json.elements : [];
+    const cities = elements.map(e => ({
+      name: (e.tags && (e.tags.name || e.tags['name:en'])) || 'City',
+      pop: Number(e.tags && e.tags.population ? e.tags.population : 0) || 0,
+      lat: safeNumber(e.lat || (e.center && e.center.lat), null),
+      lon: safeNumber(e.lon || (e.center && e.center.lon), null),
+    })).filter(c => c.lat !== null && c.lon !== null);
+    cities.sort((a, b) => (b.pop - a.pop));
+    const top = cities.slice(0, Math.min(40, cities.length));
+    let added = 0;
+    for (const c of top) {
+      const radiusKm = c.pop >= 100000 ? 25 : (c.pop >= 20000 ? 14 : 9);
+      const backId = `${state}_${String(c.name).replace(/[^A-Za-z0-9]+/g, '_').slice(0, 40)}_${Math.round(c.lat*1000)}_${Math.round(c.lon*1000)}`;
+      const ref = backlog.doc(backId);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        await ref.set({ state, cityName: c.name, lat: c.lat, lon: c.lon, radiusKm, status: 'pending', createdAt: nowIso, attempts: 0 });
+        added += 1;
+      }
+    }
+    return { ok: true, added, totalCandidates: cities.length };
+  } catch (e) {
+    throw new functions.https.HttpsError('internal', e?.message || 'Unknown error');
+  }
+});
+
+// HTTP wrapper for CI/admin: seed Places backlog for a state
+exports.seedPlacesBacklogForStateHttp = functions
+  .runWith({ timeoutSeconds: 300, memory: '512MB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+      const state = String((req.body && req.body.state) || req.query.state || '').toUpperCase();
+      if (!STATE_ISO_MAP[state]) { res.status(400).json({ ok: false, error: `Unsupported state code: ${state}` }); return; }
+      const db = admin.firestore();
+      const nowIso = new Date().toISOString();
+      const backlog = db.collection('imports').doc('places').collection('backlog');
+      const query = makeOverpassCitiesInStateQuery(state);
+      const resp = await overpassPostWithMirrors(query, 'Courthub-PlacesSeedHttp/1.0 (+courthub.app)');
+      if (!resp.ok) { const brief = await resp.text().catch(() => ''); res.status(502).json({ ok: false, error: brief.slice(0, 160) }); return; }
+      const json = await resp.json();
+      const elements = Array.isArray(json.elements) ? json.elements : [];
+      const cities = elements.map(e => ({
+        name: (e.tags && (e.tags.name || e.tags['name:en'])) || 'City',
+        pop: Number(e.tags && e.tags.population ? e.tags.population : 0) || 0,
+        lat: safeNumber(e.lat || (e.center && e.center.lat), null),
+        lon: safeNumber(e.lon || (e.center && e.center.lon), null),
+      })).filter(c => c.lat !== null && c.lon !== null);
+      cities.sort((a, b) => (b.pop - a.pop));
+      const top = cities.slice(0, Math.min(40, cities.length));
+      let added = 0;
+      for (const c of top) {
+        const radiusKm = c.pop >= 100000 ? 25 : (c.pop >= 20000 ? 14 : 9);
+        const backId = `${state}_${String(c.name).replace(/[^A-Za-z0-9]+/g, '_').slice(0, 40)}_${Math.round(c.lat*1000)}_${Math.round(c.lon*1000)}`;
+        const ref = backlog.doc(backId);
+        const snap = await ref.get();
+        if (!snap.exists) { await ref.set({ state, cityName: c.name, lat: c.lat, lon: c.lon, radiusKm, status: 'pending', createdAt: nowIso, attempts: 0 }); added += 1; }
+      }
+      res.status(200).json({ ok: true, added, totalCandidates: cities.length });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+// Scheduler: consume one Places backlog task per run
+exports.scheduledPlacesBackfillCityBatch = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub
+  .schedule('every 20 minutes')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const backlog = db.collection('imports').doc('places').collection('backlog');
+    const statusRef = db.collection('imports').doc('places');
+    const adminUid = await getAdminUid(db);
+    const nowIso = new Date().toISOString();
+    // Run lease to avoid overlap
+    const lease = await tryAcquireLease(db, statusRef, { leaseField: 'runLease', owner: `places:${Math.random().toString(36).slice(2)}`, ttlMs: 12 * 60 * 1000 });
+    if (!lease.acquired) {
+      await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped overlap', leaseHeldUntil: lease.until || null }, { merge: true }).catch(() => {});
+      return null;
+    }
+    try {
+      let q;
+      try {
+        q = await backlog.where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(1).get();
+      } catch (e) {
+        q = await backlog.where('status', '==', 'pending').limit(1).get();
+      }
+      if (q.empty) {
+        await statusRef.set({ lastRunAt: nowIso, note: 'no backlog' }, { merge: true });
+        await releaseLease(db, statusRef, { leaseField: 'runLease' });
+        return null;
+      }
+      const taskDoc = q.docs[0];
+      const task = taskDoc.data() || {};
+      await taskDoc.ref.set({ status: 'running', startedAt: nowIso, attempts: (Number(task.attempts)||0) + 1 }, { merge: true });
+      const radiusM = Math.round(Math.max(4000, Math.min(30000, (task.radiusKm || 10) * 1000)));
+      const res = await importPlacesForCity({ db, adminUid: adminUid || 'system', city: task.cityName || '', state: task.state || '', lat: Number(task.lat), lon: Number(task.lon), radiusMeters: radiusM, maxCreates: 300 });
+      await taskDoc.ref.set({ status: 'done', finishedAt: new Date().toISOString(), created: res.created, skippedExists: res.skippedExists }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, lastCity: task.cityName, lastState: task.state, created: res.created }, { merge: true });
+      await releaseLease(db, statusRef, { leaseField: 'runLease' });
+      return null;
+    } catch (e) {
+      console.error('[scheduledPlacesBackfillCityBatch] error', e);
+      try { await releaseLease(db, statusRef, { leaseField: 'runLease' }); } catch (_) {}
+      return null;
+    }
+  });
+
 // Consume one city backlog task per run and import within radius
 exports.scheduledOsmBackfillCityBatch = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
@@ -2588,8 +3040,14 @@ exports.scheduledOsmBackfillCityBatch = functions
         return null;
       }
 
-      // Pick the oldest pending task
-      const q = await backlogColl.where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(1).get();
+      // Pick the oldest pending task (fallbacks if composite index not yet created)
+      let q;
+      try {
+        q = await backlogColl.where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(1).get();
+      } catch (e) {
+        console.warn('[scheduledOsmBackfillCityBatch] missing composite index for backlog (status+createdAt), falling back to unordered.', e.message || e);
+        q = await backlogColl.where('status', '==', 'pending').limit(1).get();
+      }
       if (q.empty) {
         console.log('[scheduledOsmBackfillCityBatch] no pending backlog tasks');
         return null;
