@@ -3,7 +3,12 @@ name: Drain Parks Geocode Queue
 on:
   schedule:
     - cron: '*/2 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Jobs per run (1-100)'
+        required: false
+        default: '25'
 
 # Prevent overlapping runs. If a new run starts while another is running,
 # the older one will be allowed to finish (no cancel).
@@ -20,13 +25,24 @@ jobs:
           # Project fixed per handoff: courthub-app (region us-central1)
           FUNCTION_URL: https://us-central1-courthub-app.cloudfunctions.net/drainParksGeocodeQueueHttp
           BACKFILL_RUN_SECRET: ${{ secrets.BACKFILL_RUN_SECRET }}
+          INPUT_LIMIT: ${{ github.event.inputs.limit }}
         run: |
-          if [ -z "$BACKFILL_RUN_SECRET" ]; then
+          set -euo pipefail
+          LIMIT="${INPUT_LIMIT:-25}"
+          if [ -z "${BACKFILL_RUN_SECRET:-}" ]; then
             echo "Missing secrets.BACKFILL_RUN_SECRET" && exit 1
           fi
-          # Force POST with small JSON body; fail on non-2xx and show errors
-          curl --fail --show-error -sS -X POST "$FUNCTION_URL?limit=25" \
-            -H "x-run-secret: $BACKFILL_RUN_SECRET" \
+          echo "Calling drain with limit=$LIMIT"
+          STATUS=$(curl -sS -o /tmp/resp.txt -w "%{http_code}" \
+            -X POST "$FUNCTION_URL?limit=$LIMIT" \
+            -H "X-Run-Secret: ${BACKFILL_RUN_SECRET}" \
             -H "Content-Type: application/json" \
-            -d '{}'
-
+            -d '{}')
+          echo "HTTP $STATUS"
+          echo "Response:"
+          cat /tmp/resp.txt || true
+          if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 300 ]; then
+            exit 0
+          else
+            exit 1
+          fi
