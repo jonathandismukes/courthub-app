@@ -341,26 +341,26 @@ exports.enqueueGeocodeOnParkCreate = functions.firestore
     return null;
   });
 
-// Queue on relevant park updates
-exports.enqueueGeocodeOnParkUpdate = functions.firestore
-  .document('parks/{parkId}')
-  .onUpdate(async (change, context) => {
-    const db = admin.firestore();
-    const before = change.before.data() || {};
-    const after = change.after.data() || {};
-    const bLat = Number(before.latitude);
-    const bLng = Number(before.longitude);
-    const aLat = Number(after.latitude);
-    const aLng = Number(after.longitude);
-    const coordsChanged = (isFinite(aLat) && isFinite(aLng)) && (aLat !== bLat || aLng !== bLng);
-    const missingAddr = !after.address || !after.city || !after.state || String(after.address).trim().toLowerCase() === 'address not specified';
-    const flagged = after.needsGeocode === true;
-    if (!coordsChanged && !missingAddr && !flagged) return null;
-    if (!isFinite(aLat) || !isFinite(aLng)) return null;
-    const reason = coordsChanged ? 'park:update:coords' : (flagged ? 'park:update:flag' : 'park:update:missing');
-    await enqueueGeocodeJob(db, { parkId: change.after.id, lat: aLat, lng: aLng, reason, priority: coordsChanged ? 2 : 5 });
-    return null;
-  });
+// Queue on relevant park updates — DISABLED to avoid potential update loops and costs
+// exports.enqueueGeocodeOnParkUpdate = functions.firestore
+//   .document('parks/{parkId}')
+//   .onUpdate(async (change, context) => {
+//     const db = admin.firestore();
+//     const before = change.before.data() || {};
+//     const after = change.after.data() || {};
+//     const bLat = Number(before.latitude);
+//     const bLng = Number(before.longitude);
+//     const aLat = Number(after.latitude);
+//     const aLng = Number(after.longitude);
+//     const coordsChanged = (isFinite(aLat) && isFinite(aLng)) && (aLat !== bLat || aLng !== bLng);
+//     const missingAddr = !after.address || !after.city || !after.state || String(after.address).trim().toLowerCase() === 'address not specified';
+//     const flagged = after.needsGeocode === true;
+//     if (!coordsChanged && !missingAddr && !flagged) return null;
+//     if (!isFinite(aLat) || !isFinite(aLng)) return null;
+//     const reason = coordsChanged ? 'park:update:coords' : (flagged ? 'park:update:flag' : 'park:update:missing');
+//     await enqueueGeocodeJob(db, { parkId: change.after.id, lat: aLat, lng: aLng, reason, priority: coordsChanged ? 2 : 5 });
+//     return null;
+//   });
 
 /**
  * Callable: Claim importer ownership (sets config/app.adminUid) on first run.
@@ -524,6 +524,8 @@ function getEnv(keyPath, fallback = '') {
 // - functions config: maps.google_server_key
 const GOOGLE_KEY = getEnv('GOOGLE_MAPS_SERVER_KEY', getEnv('maps.google_server_key'));
 const GEOAPIFY_KEY = getEnv('GEOAPIFY_KEY', getEnv('maps.geoapify_key'));
+// Global switch: force-disable any Google fallback usage on the server
+const FORCE_DISABLE_GOOGLE_FALLBACK = true;
 
 const GEO_CACHE_COLL = 'geoCache';
 // Search cost guardrails: optionally disable Google fallback entirely
@@ -587,6 +589,7 @@ async function consumeGoogleCalls(db, calls) {
 }
 
 async function isGoogleFallbackDisabled(db) {
+  if (FORCE_DISABLE_GOOGLE_FALLBACK) return true;
   const now = Date.now();
   if (cachedSearchDisableGoogle !== null && (now - cachedSearchCfgAt) < SEARCH_CFG_CACHE_MS) {
     return cachedSearchDisableGoogle;
