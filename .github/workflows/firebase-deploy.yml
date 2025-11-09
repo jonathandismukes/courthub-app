@@ -146,3 +146,18 @@ jobs:
         run: |
           echo "Deploying from $(pwd) using $(ls -1 firebase.json)"
           firebase deploy --only functions --project ${{ env.TARGET_PROJECT }}
+
+      - name: Detect changed Firestore indexes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            indexes:
+              - 'firestore.indexes.json'
+
+      - name: Deploy Firestore Indexes (if changed)
+        if: steps.changes.outputs.indexes == 'true'
+        working-directory: ${{ env.FIREBASE_DIR }}
+        run: |
+          echo "firestore.indexes.json changed in this push — deploying indexes"
+          firebase deploy --only firestore:indexes --project ${{ env.TARGET_PROJECT }}
