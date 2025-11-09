@@ -2,6 +2,68 @@ name: Drain Parks Geocode Queue
 
 on:
   schedule:
+    - cron: '*/2 * * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Number of items to process (optional)'
+        required: false
+        default: '25'
+
+# Prevent overlapping runs of this workflow
+concurrency:
+  group: drain-parks-geocode-queue
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Invoke drain function
+        env:
+          FUNCTION_URL: https://us-central1-courthub-app.cloudfunctions.net/drainParksGeocodeQueueHttp
+          BACKFILL_RUN_SECRET: ${{ secrets.BACKFILL_RUN_SECRET }}
+          INPUT_LIMIT: ${{ github.event.inputs.limit }}
+          DEFAULT_LIMIT: '25'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${BACKFILL_RUN_SECRET:-}" ]]; then
+            echo "Missing repo secret BACKFILL_RUN_SECRET"
+            exit 1
+          fi
+
+          # Determine limit: use manual input if provided, else default (for schedule)
+          LIMIT="${INPUT_LIMIT:-}"
+          if [[ -z "$LIMIT" ]]; then
+            LIMIT="$DEFAULT_LIMIT"
+          fi
+
+          echo "Calling drain with limit=$LIMIT"
+
+          # Force POST with a tiny JSON body
+          STATUS=$(curl -sS -o response.txt -w "%{http_code}" \
+            -X POST "$FUNCTION_URL?limit=$LIMIT" \
+            -H "Content-Type: application/json" \
+            -H "X-Run-Secret: $BACKFILL_RUN_SECRET" \
+            --fail --retry 5 --retry-all-errors --max-time 120 \
+            -d '{}')
+
+          echo "HTTP $STATUS"
+          echo "Response:"
+          cat response.txt || true
+
+          # If not 2xx, fail the job
+          if [[ "$STATUS" -lt 200 || "$STATUS" -ge 300 ]]; then
+            exit 1
+          fi
+
+name: Drain Parks Geocode Queue
+
+on:
+  schedule:
     # Every 2 minutes
     - cron: '*/2 * * * *'
   workflow_dispatch:
