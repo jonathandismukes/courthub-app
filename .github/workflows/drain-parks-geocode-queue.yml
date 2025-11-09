@@ -2,23 +2,58 @@ name: Drain Parks Geocode Queue
 
 on:
   schedule:
+    # Every 2 minutes
     - cron: '*/2 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'How many geocode jobs to process this run'
+        required: false
+        default: '25'
+        type: number
+
+# Prevent overlapping runs. If a new run starts while another is running,
+# the older one will be canceled so they never overlap.
+concurrency:
+  group: drain-parks-geocode-queue
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Fixed project/region per backend
+      FUNCTION_URL: https://us-central1-courthub-app.cloudfunctions.net/drainParksGeocodeQueueHttp
+      BACKFILL_RUN_SECRET: ${{ secrets.BACKFILL_RUN_SECRET }}
+      # If dispatched manually, LIMIT comes from input; otherwise defaults to 25
+      LIMIT: ${{ inputs.limit || '25' }}
     steps:
       - name: Invoke drain function
-        env:
-          # Project fixed per handoff: courthub-app (region us-central1)
-          FUNCTION_URL: https://us-central1-courthub-app.cloudfunctions.net/drainParksGeocodeQueueHttp
-          BACKFILL_RUN_SECRET: ${{ secrets.BACKFILL_RUN_SECRET }}
+        shell: bash
         run: |
-          if [ -z "$BACKFILL_RUN_SECRET" ]; then
-            echo "Missing secrets.BACKFILL_RUN_SECRET" && exit 1
+          set -euo pipefail
+
+          if [ -z "${BACKFILL_RUN_SECRET:-}" ]; then
+            echo "ERROR: Missing GitHub Action secret BACKFILL_RUN_SECRET." >&2
+            echo "Add it in GitHub → Settings → Secrets and variables → Actions." >&2
+            exit 1
           fi
-          curl -sS -X POST "$FUNCTION_URL?limit=25" \
-            -H "x-run-secret: $BACKFILL_RUN_SECRET" \
-            -H "Content-Type: application/json" \
-            -d '{}'
+
+          LIM="${LIMIT:-25}"
+
+          echo "Draining parks geocode queue with limit=${LIM}…"
+
+          # Robust call: fail on HTTP errors, retry transient failures
+          curl -sS \
+            --fail \
+            --retry 5 \
+            --retry-all-errors \
+            --max-time 60 \
+            -H "X-Run-Secret: ${BACKFILL_RUN_SECRET}" \
+            "${FUNCTION_URL}?limit=${LIM}" | tee response.json
+
+          echo "\nCompleted drain call. See response above."
