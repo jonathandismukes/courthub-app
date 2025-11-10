@@ -535,6 +535,34 @@ function getEnv(keyPath, fallback = '') {
   }
 }
 
+/**
+ * Nightly window helper: returns true if the current UTC hour is within the
+ * configured import window. Defaults to 06:00–12:00 UTC (overnight in US timezones).
+ *
+ * Configure via Firestore doc config/app.importWindowUtc = { startHour: 6, endHour: 12 }
+ * - startHour/endHour are integers 0..23
+ * - If startHour < endHour: window is [startHour, endHour)
+ * - If startHour > endHour: window wraps midnight (e.g., 22..02)
+ * - If missing/invalid: defaults are applied
+ */
+async function isWithinNightlyWindowUtc(db) {
+  const nowHour = new Date().getUTCHours();
+  let start = 6, end = 12; // default window: 06:00–12:00 UTC
+  try {
+    const snap = await db.collection('config').doc('app').get();
+    const cfg = snap.exists ? snap.data() : {};
+    const w = cfg && cfg.importWindowUtc;
+    const s = Number(w && w.startHour);
+    const e = Number(w && w.endHour);
+    if (isFinite(s) && s >= 0 && s <= 23) start = s;
+    if (isFinite(e) && e >= 0 && e <= 23) end = e;
+  } catch (_) {}
+  if (start === end) return true; // degenerate => always allowed
+  if (start < end) return nowHour >= start && nowHour < end;
+  // wrap midnight
+  return nowHour >= start || nowHour < end;
+}
+
 // Keys can be provided via:
 // - process.env.GOOGLE_MAPS_SERVER_KEY
 // - functions config: maps.google_server_key
@@ -2430,6 +2458,15 @@ exports.scheduledOsmImportBatch = functions
   .onRun(async (context) => {
     const db = admin.firestore();
     try {
+      // Nightly gate: only run within configured UTC window
+      const allowed = await isWithinNightlyWindowUtc(db);
+      if (!allowed) {
+        const statusRef = db.collection('imports').doc('osm');
+        const nowIso = new Date().toISOString();
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: outside nightly window' }, { merge: true }).catch(() => {});
+        return null;
+      }
+
       const statusRef = db.collection('imports').doc('osm');
       const logsColl = statusRef.collection('logs');
       const adminUid = await getAdminUid(db);
@@ -2983,6 +3020,12 @@ exports.scheduledPlacesBackfillCityBatch = functions
     const statusRef = db.collection('imports').doc('places');
     const adminUid = await getAdminUid(db);
     const nowIso = new Date().toISOString();
+    // Nightly gate
+    const allowed = await isWithinNightlyWindowUtc(db);
+    if (!allowed) {
+      await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: outside nightly window' }, { merge: true }).catch(() => {});
+      return null;
+    }
     // Run lease to avoid overlap
     const lease = await tryAcquireLease(db, statusRef, { leaseField: 'runLease', owner: `places:${Math.random().toString(36).slice(2)}`, ttlMs: 12 * 60 * 1000 });
     if (!lease.acquired) {
@@ -3029,6 +3072,12 @@ exports.scheduledOsmBackfillCityBatch = functions
     const statusRef = db.collection('imports').doc('osm');
     const adminUid = await getAdminUid(db);
     const nowIso = new Date().toISOString();
+    // Nightly gate
+    const allowed = await isWithinNightlyWindowUtc(db);
+    if (!allowed) {
+      await statusRef.set({ lastBackfillAt: nowIso, lastNote: 'skipped city: outside nightly window' }, { merge: true }).catch(() => {});
+      return null;
+    }
 
     try {
       // Run lease for city backfill to avoid overlapping consumption
