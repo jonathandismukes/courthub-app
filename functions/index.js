@@ -248,8 +248,9 @@ exports.scheduledGeocodeQueueDrain = functions
     }
 
     // Configurable rate and shared daily cap (shared across all Geoapify calls)
-    const ratePerMin = Number(getEnv('GEOCODE_RATE_PER_MIN', getEnv('geocode.rate_per_min', '25')));
-    const perMinute = isFinite(ratePerMin) && ratePerMin > 0 ? Math.min(100, Math.max(1, ratePerMin)) : 25;
+    // Default to 1/min so Places can use most of the daily budget unless explicitly overridden
+    const ratePerMin = Number(getEnv('GEOCODE_RATE_PER_MIN', getEnv('geocode.rate_per_min', '1')));
+    const perMinute = isFinite(ratePerMin) && ratePerMin > 0 ? Math.min(100, Math.max(1, ratePerMin)) : 1;
     const cap = getGeoapifyDailyCapValue();
 
     try {
@@ -715,6 +716,33 @@ function standardizePlacesFromGeoapify(features) {
       provider: 'geoapify'
     };
   }).filter(p => p.location);
+}
+
+// Resolve a city/town Geoapify place_id for boundary filtering
+async function fetchGeoapifyCityPlaceId({ city, state, lat = null, lon = null }) {
+  if (!GEOAPIFY_KEY) return null;
+  const parts = [String(city || '').trim(), String(state || '').trim()].filter(Boolean).join(', ');
+  if (!parts) return null;
+  let url = `https://api.geoapify.com/v1/geocode/search?text=${encodeURIComponent(parts)}&limit=1&filter=countrycode:us&apiKey=${GEOAPIFY_KEY}`;
+  if (isFinite(lat) && isFinite(lon)) {
+    url += `&bias=proximity:${lon},${lat}`;
+  }
+  const res = await httpRequest('GET', url);
+  if (!res.ok) return null;
+  const data = await res.json();
+  const f = Array.isArray(data.features) && data.features.length ? data.features[0] : null;
+  const id = f && f.properties ? (f.properties.place_id || null) : null;
+  return id || null;
+}
+
+// Geoapify text search constrained to a city administrative boundary using filter=place:place_id
+async function fetchGeoapifyTextSearchInCity({ cityPlaceId, text, limit = 50 }) {
+  if (!GEOAPIFY_KEY || !cityPlaceId || !text) return [];
+  const url = `https://api.geoapify.com/v2/places?text=${encodeURIComponent(text)}&filter=place:${encodeURIComponent(cityPlaceId)}&limit=${Math.max(1, Math.min(100, limit))}&apiKey=${GEOAPIFY_KEY}`;
+  const res = await httpRequest('GET', url);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return standardizePlacesFromGeoapify(Array.isArray(data.features) ? data.features : []);
 }
 
 function standardizePlacesFromGoogleV1(resp) {
@@ -2781,6 +2809,15 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
   const bias = (isFinite(lat) && isFinite(lon)) ? { lat, lng: lon, radius: Math.max(4000, Math.min(26000, Math.floor(radiusMeters))) } : null;
   const aggregated = new Map(); // key=id -> { place, sports:Set }
 
+  // Try to resolve strict city boundary first; if not available, fall back to radius bias
+  let cityPlaceId = null;
+  try {
+    if (remainingGeoToday > 0) {
+      cityPlaceId = await fetchGeoapifyCityPlaceId({ city, state, lat, lon });
+      if (cityPlaceId) { try { await consumeGeoapifyCalls(db, 1); } catch (_) {} remainingGeoToday -= 1; }
+    }
+  } catch (_) { cityPlaceId = null; }
+
   for (const q of queries) {
     if (aggregated.size >= maxCreates) break;
     if (remainingGeoToday <= 0) {
@@ -2789,7 +2826,14 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     }
     let list = [];
     try {
-      const out = await fetchGeoapifyTextSearch(q.text + (city && state ? ` in ${city}, ${state}` : ''), bias);
+      let out = null;
+      if (cityPlaceId) {
+        // Boundary-constrained search to avoid cross-city mislabeling
+        out = await fetchGeoapifyTextSearchInCity({ cityPlaceId, text: q.text, limit: 50 });
+      } else {
+        // Fallback to proximity + radius around the city's centroid
+        out = await fetchGeoapifyTextSearch(q.text + (city && state ? ` in ${city}, ${state}` : ''), bias);
+      }
       if (out) {
         list = out;
         try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
@@ -3008,11 +3052,69 @@ exports.seedPlacesBacklogForStateHttp = functions
     }
   });
 
+// Scheduled: seed Places backlog across all states, rotating West→East
+exports.scheduledSeedPlacesBacklogAllStates = functions
+  .runWith({ timeoutSeconds: 360, memory: '1GB', maxInstances: 1 })
+  .pubsub
+  .schedule('every 30 minutes')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const nowIso = new Date().toISOString();
+    const statusRef = db.collection('imports').doc('places');
+    const backlog = statusRef.collection('backlog');
+    try {
+      // Rotate state pointer
+      const statusSnap = await statusRef.get().catch(() => null);
+      let nextIndex = 0;
+      if (statusSnap && statusSnap.exists) {
+        const d = statusSnap.data() || {};
+        nextIndex = Math.max(0, Math.min(WEST_TO_EAST_STATE_ORDER.length - 1, Number(d.nextIndex) || 0));
+      }
+      const state = WEST_TO_EAST_STATE_ORDER[nextIndex];
+      const nextIdx = (nextIndex + 1) % WEST_TO_EAST_STATE_ORDER.length;
+
+      const query = makeOverpassCitiesInStateQuery(state);
+      const res = await overpassPostWithMirrors(query, 'Courthub-PlacesSeedScheduled/1.0 (+courthub.app)');
+      if (!res.ok) {
+        const brief = await res.text().catch(() => '');
+        await statusRef.set({ lastSeedAt: nowIso, lastSeedError: brief.slice(0, 160), nextIndex: nextIdx }, { merge: true });
+        return null;
+      }
+      const json = await res.json();
+      const elements = Array.isArray(json.elements) ? json.elements : [];
+      const cities = elements.map(e => ({
+        name: (e.tags && (e.tags.name || e.tags['name:en'])) || 'City',
+        pop: Number(e.tags && e.tags.population ? e.tags.population : 0) || 0,
+        lat: safeNumber(e.lat || (e.center && e.center.lat), null),
+        lon: safeNumber(e.lon || (e.center && e.center.lon), null),
+      })).filter(c => c.lat !== null && c.lon !== null);
+      cities.sort((a, b) => (b.pop - a.pop));
+      const top = cities.slice(0, Math.min(40, cities.length));
+      let added = 0;
+      for (const c of top) {
+        const radiusKm = c.pop >= 100000 ? 25 : (c.pop >= 20000 ? 14 : 9);
+        const backId = `${state}_${String(c.name).replace(/[^A-Za-z0-9]+/g, '_').slice(0, 40)}_${Math.round(c.lat*1000)}_${Math.round(c.lon*1000)}`;
+        const ref = backlog.doc(backId);
+        const snap = await ref.get();
+        if (!snap.exists) {
+          await ref.set({ state, cityName: c.name, lat: c.lat, lon: c.lon, radiusKm, status: 'pending', createdAt: nowIso, attempts: 0 });
+          added += 1;
+        }
+      }
+      await statusRef.set({ lastSeedAt: nowIso, lastSeedState: state, added, nextIndex: nextIdx }, { merge: true });
+      return null;
+    } catch (e) {
+      await statusRef.set({ lastSeedAt: nowIso, lastSeedError: (e && e.message) ? String(e.message).slice(0, 160) : 'Unknown error' }, { merge: true }).catch(() => {});
+      return null;
+    }
+  });
+
 // Scheduler: consume one Places backlog task per run
 exports.scheduledPlacesBackfillCityBatch = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
   .pubsub
-  .schedule('every 20 minutes')
+  .schedule('every 1 minutes')
   .timeZone('Etc/UTC')
   .onRun(async () => {
     const db = admin.firestore();
@@ -3020,12 +3122,9 @@ exports.scheduledPlacesBackfillCityBatch = functions
     const statusRef = db.collection('imports').doc('places');
     const adminUid = await getAdminUid(db);
     const nowIso = new Date().toISOString();
-    // Nightly gate
-    const allowed = await isWithinNightlyWindowUtc(db);
-    if (!allowed) {
-      await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: outside nightly window' }, { merge: true }).catch(() => {});
-      return null;
-    }
+    // Allow tuning how many backlog city tasks we consume per run
+    // Note: this is further constrained by remaining daily budget
+    const MAX_TASKS_PER_RUN = 30;
     // Run lease to avoid overlap
     const lease = await tryAcquireLease(db, statusRef, { leaseField: 'runLease', owner: `places:${Math.random().toString(36).slice(2)}`, ttlMs: 12 * 60 * 1000 });
     if (!lease.acquired) {
@@ -3033,24 +3132,45 @@ exports.scheduledPlacesBackfillCityBatch = functions
       return null;
     }
     try {
+      // Budget-aware concurrency: estimate ~7 Geoapify calls per city (1 for city id + ~6 queries)
+      const dailyCap = getGeoapifyDailyCapValue();
+      const remaining = await getGeoapifyRemainingToday(db, dailyCap);
+      if (remaining <= 0) {
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: daily cap reached' }, { merge: true });
+        await releaseLease(db, statusRef, { leaseField: 'runLease' });
+        return null;
+      }
+      const estCallsPerCity = 7;
+      const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
+      const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
+
       let q;
       try {
-        q = await backlog.where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(1).get();
+        q = await backlog.where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(targetBatch).get();
       } catch (e) {
-        q = await backlog.where('status', '==', 'pending').limit(1).get();
+        q = await backlog.where('status', '==', 'pending').limit(targetBatch).get();
       }
       if (q.empty) {
         await statusRef.set({ lastRunAt: nowIso, note: 'no backlog' }, { merge: true });
         await releaseLease(db, statusRef, { leaseField: 'runLease' });
         return null;
       }
-      const taskDoc = q.docs[0];
-      const task = taskDoc.data() || {};
-      await taskDoc.ref.set({ status: 'running', startedAt: nowIso, attempts: (Number(task.attempts)||0) + 1 }, { merge: true });
-      const radiusM = Math.round(Math.max(4000, Math.min(30000, (task.radiusKm || 10) * 1000)));
-      const res = await importPlacesForCity({ db, adminUid: adminUid || 'system', city: task.cityName || '', state: task.state || '', lat: Number(task.lat), lon: Number(task.lon), radiusMeters: radiusM, maxCreates: 300 });
-      await taskDoc.ref.set({ status: 'done', finishedAt: new Date().toISOString(), created: res.created, skippedExists: res.skippedExists }, { merge: true });
-      await statusRef.set({ lastRunAt: nowIso, lastCity: task.cityName, lastState: task.state, created: res.created }, { merge: true });
+
+      let totalCreated = 0;
+      let processed = 0;
+      for (const doc of q.docs) {
+        // Re-check cap between cities
+        const remainingNow = await getGeoapifyRemainingToday(db, dailyCap);
+        if (remainingNow < estCallsPerCity) break;
+        const task = doc.data() || {};
+        await doc.ref.set({ status: 'running', startedAt: new Date().toISOString(), attempts: (Number(task.attempts)||0) + 1 }, { merge: true });
+        const radiusM = Math.round(Math.max(4000, Math.min(30000, (task.radiusKm || 10) * 1000)));
+        const res = await importPlacesForCity({ db, adminUid: adminUid || 'system', city: task.cityName || '', state: task.state || '', lat: Number(task.lat), lon: Number(task.lon), radiusMeters: radiusM, maxCreates: 300 });
+        await doc.ref.set({ status: 'done', finishedAt: new Date().toISOString(), created: res.created, skippedExists: res.skippedExists }, { merge: true });
+        totalCreated += Number(res.created || 0);
+        processed += 1;
+      }
+      await statusRef.set({ lastRunAt: nowIso, lastNote: `processed ${processed} city task(s)`, created: totalCreated }, { merge: true });
       await releaseLease(db, statusRef, { leaseField: 'runLease' });
       return null;
     } catch (e) {
