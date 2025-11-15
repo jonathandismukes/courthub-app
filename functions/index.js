@@ -2812,13 +2812,25 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
   // Shared daily cap guardrail across ALL Geoapify usage
   const cap = getGeoapifyDailyCapValue();
   let remainingGeoToday = await getGeoapifyRemainingToday(db, cap);
+  // Broaden coverage: try text queries and category queries. In many cities
+  // Geoapify POIs are tagged with categories instead of matching the plain text.
   const queries = [
+    // Basketball
     { text: 'basketball court', sport: 'basketball' },
-    { text: 'basketball courts', sport: 'basketball' },
+    { text: 'outdoor basketball', sport: 'basketball' },
+    { text: 'basketball hoops', sport: 'basketball' },
+    // Tennis
     { text: 'tennis court', sport: 'tennis' },
     { text: 'tennis courts', sport: 'tennis' },
+    // Pickleball
     { text: 'pickleball court', sport: 'pickleball' },
     { text: 'pickleball courts', sport: 'pickleball' },
+  ];
+
+  const categoryQueries = [
+    { categories: ['sport.basketball'], sport: 'basketball' },
+    { categories: ['sport.tennis'], sport: 'tennis' },
+    { categories: ['sport.pickleball'], sport: 'pickleball' },
   ];
   const bias = (isFinite(lat) && isFinite(lon)) ? { lat, lng: lon, radius: Math.max(4000, Math.min(26000, Math.floor(radiusMeters))) } : null;
   const aggregated = new Map(); // key=id -> { place, sports:Set }
@@ -2832,6 +2844,23 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     }
   } catch (_) { cityPlaceId = null; }
 
+  // Helper that merges a list of standardized places into aggregator
+  const takeAll = (list, sport) => {
+    for (const raw of (list || [])) {
+      const m = normalizeStdPlace(raw);
+      if (!m) continue;
+      const key = buildPlaceDocId(m.provider, m.id) || `${m.name}_${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
+      const entry = aggregated.get(key) || { place: m, sports: new Set() };
+      entry.sports.add(sport);
+      // Keep the best name/address if multiple
+      if ((m.name || '').length > (entry.place.name || '').length) entry.place.name = m.name;
+      if ((m.address || '').length > (entry.place.address || '').length) entry.place.address = m.address;
+      aggregated.set(key, entry);
+      if (aggregated.size >= maxCreates) break;
+    }
+  };
+
+  // 1) Text queries first
   for (const q of queries) {
     if (aggregated.size >= maxCreates) break;
     if (remainingGeoToday <= 0) {
@@ -2856,18 +2885,30 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
         list = [];
       }
     } catch (_) { list = []; }
-    for (const raw of (list || [])) {
-      const m = normalizeStdPlace(raw);
-      if (!m) continue;
-      const key = buildPlaceDocId(m.provider, m.id) || `${m.name}_${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
-      const entry = aggregated.get(key) || { place: m, sports: new Set() };
-      entry.sports.add(q.sport);
-      // Keep the best name/address if multiple
-      if ((m.name || '').length > (entry.place.name || '').length) entry.place.name = m.name;
-      if ((m.address || '').length > (entry.place.address || '').length) entry.place.address = m.address;
-      aggregated.set(key, entry);
-      if (aggregated.size >= maxCreates) break;
-    }
+    takeAll(list, q.sport);
+  }
+
+  // 2) Category queries as a fallback/expansion pass
+  for (const q of categoryQueries) {
+    if (aggregated.size >= maxCreates) break;
+    if (remainingGeoToday <= 0) break;
+    try {
+      const cats = q.categories.join(',');
+      let url = `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(cats)}&limit=${Math.max(1, Math.min(100, maxCreates))}&apiKey=${GEOAPIFY_KEY}`;
+      if (cityPlaceId) {
+        url += `&filter=place:${encodeURIComponent(cityPlaceId)}`;
+      } else if (bias) {
+        url += `&filter=circle:${bias.lng},${bias.lat},${Math.max(2000, Math.min(40000, bias.radius || 16000))}`;
+      }
+      const res = await httpRequest('GET', url);
+      if (res.ok) {
+        const data = await res.json();
+        const std = standardizePlacesFromGeoapify(Array.isArray(data.features) ? data.features : []);
+        takeAll(std, q.sport);
+        try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+        remainingGeoToday -= 1;
+      }
+    } catch (_) { /* ignore */ }
   }
 
   let created = 0;
@@ -3154,7 +3195,9 @@ exports.scheduledPlacesBackfillCityBatch = functions
         await releaseLease(db, statusRef, { leaseField: 'runLease' });
         return null;
       }
-      const estCallsPerCity = 7;
+      // Approximate: 1 call to resolve city boundary + several text queries + category queries
+      // Keep a conservative estimate to avoid overrunning daily cap.
+      const estCallsPerCity = 12;
       const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
       const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
 
@@ -3344,7 +3387,7 @@ exports.runPlacesBackfillCityBatchHttp = functions
         res.status(200).json({ ok: true, processed: 0, created: 0, note: 'daily cap reached' });
         return;
       }
-      const estCallsPerCity = 7;
+      const estCallsPerCity = 12;
       const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
       const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
 
