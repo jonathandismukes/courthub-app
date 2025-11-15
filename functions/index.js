@@ -2514,8 +2514,8 @@ exports.scheduledOsmImportBatch = functions
       // Config gate
       const cfgDoc = await db.collection('config').doc('app').get();
       const cfg = cfgDoc.exists ? cfgDoc.data() : {};
-      // Default ON unless explicitly disabled
-      const autoEnabled = cfg && cfg.autoOsmImportEnabled !== false;
+      // Default OFF unless explicitly enabled (pivoting to Places)
+      const autoEnabled = cfg && cfg.autoOsmImportEnabled === true;
       if (!autoEnabled) {
         const nowIso = new Date().toISOString();
         console.log('[scheduledOsmImportBatch] disabled by config (config/app.autoOsmImportEnabled=false).');
@@ -2669,6 +2669,20 @@ exports.scheduledOsmAuditAndBacklog = functions.pubsub
   .onRun(async () => {
     const db = admin.firestore();
     const nowIso = new Date().toISOString();
+    // Config gate (default OFF)
+    try {
+      const cfgDoc = await db.collection('config').doc('app').get();
+      const cfg = cfgDoc.exists ? cfgDoc.data() : {};
+      const enabled = cfg && cfg.autoOsmAuditEnabled === true;
+      if (!enabled) {
+        await db.collection('imports').doc('osm').set({ lastAuditAt: nowIso, lastAuditNote: 'skipped: autoOsmAuditEnabled=false' }, { merge: true });
+        return null;
+      }
+    } catch (_) {
+      // If config cannot be read, default to disabled
+      await db.collection('imports').doc('osm').set({ lastAuditAt: nowIso, lastAuditNote: 'skipped: config read failed' }, { merge: true });
+      return null;
+    }
     const statsColl = db.collection('imports').doc('osm').collection('stats');
     const backlogColl = db.collection('imports').doc('osm').collection('backlog');
     const statusRef = db.collection('imports').doc('osm');
@@ -3180,6 +3194,265 @@ exports.scheduledPlacesBackfillCityBatch = functions
     }
   });
 
+/**
+ * Aggressive backlog seeder: keeps imports/places/backlog filled so the drainer
+ * always has work. Rotates West→East and seeds multiple states per run.
+ *
+ * Config (Firestore doc: imports/places/config):
+ *  - targetBacklog: desired pending tasks (default 600)
+ *  - citiesPerState: max cities to add per state per seeding (default 80)
+ *  - statesPerRun: how many states to seed per run (default 3)
+ *  - enabled: boolean (default true)
+ *
+ * Status/progress is written to imports/places with lastEnsureAt/lastEnsureNote/nextIndex
+ */
+exports.scheduledEnsurePlacesBacklogCapacity = functions
+  .runWith({ timeoutSeconds: 360, memory: '1GB', maxInstances: 1 })
+  .pubsub
+  .schedule('every 5 minutes')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const nowIso = new Date().toISOString();
+    const statusRef = db.collection('imports').doc('places');
+    const cfgRef = statusRef.collection('config').doc('seeder');
+    const backlog = statusRef.collection('backlog');
+
+    try {
+      // Read config with safe defaults
+      let cfg = {};
+      try { const c = await cfgRef.get(); cfg = c.exists ? (c.data() || {}) : {}; } catch (_) {}
+      const enabled = cfg.enabled !== false; // default true
+      const targetBacklog = Math.max(100, Math.min(5000, Number(cfg.targetBacklog) || 600));
+      const citiesPerState = Math.max(20, Math.min(200, Number(cfg.citiesPerState) || 80));
+      const statesPerRun = Math.max(1, Math.min(10, Number(cfg.statesPerRun) || 3));
+
+      if (!enabled) {
+        await statusRef.set({ lastEnsureAt: nowIso, lastEnsureNote: 'skipped: disabled' }, { merge: true });
+        return null;
+      }
+
+      // If backlog already healthy, do nothing
+      let pendingCount = 0;
+      try {
+        const agg = await backlog.where('status', '==', 'pending').count().get();
+        pendingCount = Number(agg.data().count || 0);
+      } catch (_) {
+        // Fallback: approximate by fetching a small page
+        const snap = await backlog.where('status', '==', 'pending').limit(1).get();
+        pendingCount = snap.size >= 1 ? 200 : 0; // pessimistic estimate
+      }
+
+      if (pendingCount >= targetBacklog) {
+        await statusRef.set({ lastEnsureAt: nowIso, lastEnsureNote: `ok: ${pendingCount} pending >= target ${targetBacklog}` }, { merge: true });
+        return null;
+      }
+
+      // Determine how many tasks to add and plan states to seed
+      const need = Math.max(0, targetBacklog - pendingCount);
+      // Rotate pointer from imports/places.nextIndex, reusing seeder if present
+      let nextIndex = 0;
+      try {
+        const s = await statusRef.get();
+        if (s.exists) {
+          const d = s.data() || {};
+          nextIndex = Math.max(0, Math.min(WEST_TO_EAST_STATE_ORDER.length - 1, Number(d.nextIndex) || 0));
+        }
+      } catch (_) {}
+
+      let addedTotal = 0;
+      let statesTouched = 0;
+      for (let i = 0; i < statesPerRun && addedTotal < need; i++) {
+        const state = WEST_TO_EAST_STATE_ORDER[(nextIndex + i) % WEST_TO_EAST_STATE_ORDER.length];
+        try {
+          const query = makeOverpassCitiesInStateQuery(state);
+          const res = await overpassPostWithMirrors(query, 'Courthub-PlacesEnsure/1.0 (+courthub.app)');
+          if (!res.ok) {
+            const brief = await res.text().catch(() => '');
+            console.warn('[ensurePlacesBacklog] Overpass failed for', state, brief.slice(0, 120));
+            continue;
+          }
+          const json = await res.json();
+          const elements = Array.isArray(json.elements) ? json.elements : [];
+          const cities = elements.map(e => ({
+            name: (e.tags && (e.tags.name || e.tags['name:en'])) || 'City',
+            pop: Number(e.tags && e.tags.population ? e.tags.population : 0) || 0,
+            lat: safeNumber(e.lat || (e.center && e.center.lat), null),
+            lon: safeNumber(e.lon || (e.center && e.center.lon), null),
+          })).filter(c => c.lat !== null && c.lon !== null);
+          cities.sort((a, b) => (b.pop - a.pop));
+          const top = cities.slice(0, Math.min(citiesPerState, cities.length));
+
+          let addedState = 0;
+          for (const c of top) {
+            if (addedTotal >= need) break;
+            const radiusKm = c.pop >= 100000 ? 25 : (c.pop >= 20000 ? 14 : 9);
+            const backId = `${state}_${String(c.name).replace(/[^A-Za-z0-9]+/g, '_').slice(0, 40)}_${Math.round(c.lat*1000)}_${Math.round(c.lon*1000)}`;
+            const ref = backlog.doc(backId);
+            const snap = await ref.get();
+            if (!snap.exists) {
+              await ref.set({ state, cityName: c.name, lat: c.lat, lon: c.lon, radiusKm, status: 'pending', createdAt: nowIso, attempts: 0 });
+              addedState += 1;
+              addedTotal += 1;
+            }
+          }
+          if (addedState > 0) statesTouched += 1;
+        } catch (e) {
+          console.warn('[ensurePlacesBacklog] error seeding state', state, e.message || e);
+        }
+      }
+
+      const newIndex = (nextIndex + statesPerRun) % WEST_TO_EAST_STATE_ORDER.length;
+      await statusRef.set({
+        lastEnsureAt: nowIso,
+        lastEnsureNote: `added=${addedTotal} touchedStates=${statesTouched} pendingBefore=${pendingCount} target=${targetBacklog}`,
+        nextIndex: newIndex,
+      }, { merge: true });
+      return null;
+    } catch (e) {
+      await statusRef.set({ lastEnsureAt: nowIso, lastEnsureError: (e && e.message) ? String(e.message).slice(0, 200) : 'Unknown error' }, { merge: true }).catch(() => {});
+      return null;
+    }
+  });
+
+/**
+ * HTTP: Run the Places city backfill batch immediately (same logic as the scheduler).
+ * Security: requires X-Run-Secret header matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ * Optional body: { maxTasksPerRun?: number }
+ */
+exports.runPlacesBackfillCityBatchHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+
+      const db = admin.firestore();
+      const backlog = db.collection('imports').doc('places').collection('backlog');
+      const statusRef = db.collection('imports').doc('places');
+      const adminUid = await getAdminUid(db);
+      const nowIso = new Date().toISOString();
+      const MAX_TASKS_PER_RUN = Math.max(1, Math.min(60, Number(req.body?.maxTasksPerRun) || 30));
+
+      // Budget-aware concurrency (same as scheduler)
+      const dailyCap = getGeoapifyDailyCapValue();
+      const remaining = await getGeoapifyRemainingToday(db, dailyCap);
+      if (remaining <= 0) {
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: daily cap reached' }, { merge: true });
+        res.status(200).json({ ok: true, processed: 0, created: 0, note: 'daily cap reached' });
+        return;
+      }
+      const estCallsPerCity = 7;
+      const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
+      const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
+
+      let q;
+      try { q = await backlog.where('status', '==', 'pending').orderBy('createdAt', 'asc').limit(targetBatch).get(); }
+      catch (e) { q = await backlog.where('status', '==', 'pending').limit(targetBatch).get(); }
+      if (q.empty) {
+        await statusRef.set({ lastRunAt: nowIso, note: 'no backlog' }, { merge: true });
+        res.status(200).json({ ok: true, processed: 0, created: 0, note: 'no backlog' });
+        return;
+      }
+
+      let totalCreated = 0;
+      let processed = 0;
+      for (const doc of q.docs) {
+        const remainingNow = await getGeoapifyRemainingToday(db, dailyCap);
+        if (remainingNow < estCallsPerCity) break;
+        const task = doc.data() || {};
+        await doc.ref.set({ status: 'running', startedAt: new Date().toISOString(), attempts: (Number(task.attempts)||0) + 1 }, { merge: true });
+        const radiusM = Math.round(Math.max(4000, Math.min(30000, (task.radiusKm || 10) * 1000)));
+        const resCity = await importPlacesForCity({ db, adminUid: adminUid || 'system', city: task.cityName || '', state: task.state || '', lat: Number(task.lat), lon: Number(task.lon), radiusMeters: radiusM, maxCreates: 300 });
+        await doc.ref.set({ status: 'done', finishedAt: new Date().toISOString(), created: resCity.created, skippedExists: resCity.skippedExists }, { merge: true });
+        totalCreated += Number(resCity.created || 0);
+        processed += 1;
+      }
+      await statusRef.set({ lastRunAt: nowIso, lastNote: `processed ${processed} city task(s)`, created: totalCreated }, { merge: true });
+      res.status(200).json({ ok: true, processed, created: totalCreated });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * HTTP: Ensure Places backlog capacity now (same as scheduledEnsurePlacesBacklogCapacity, one pass).
+ * Security: X-Run-Secret as above.
+ */
+exports.ensurePlacesBacklogCapacityHttp = functions
+  .runWith({ timeoutSeconds: 360, memory: '1GB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+
+      const db = admin.firestore();
+      const nowIso = new Date().toISOString();
+      const statusRef = db.collection('imports').doc('places');
+      const cfgRef = statusRef.collection('config').doc('seeder');
+      const backlog = statusRef.collection('backlog');
+
+      let cfg = {};
+      try { const c = await cfgRef.get(); cfg = c.exists ? (c.data() || {}) : {}; } catch (_) {}
+      const targetBacklog = Math.max(100, Math.min(5000, Number(cfg.targetBacklog) || 600));
+      const citiesPerState = Math.max(20, Math.min(200, Number(cfg.citiesPerState) || 80));
+      const statesPerRun = Math.max(1, Math.min(10, Number(cfg.statesPerRun) || 3));
+
+      let pendingCount = 0;
+      try { const agg = await backlog.where('status', '==', 'pending').count().get(); pendingCount = Number(agg.data().count || 0); }
+      catch (_) { const snap = await backlog.where('status', '==', 'pending').limit(1).get(); pendingCount = snap.size >= 1 ? 200 : 0; }
+
+      if (pendingCount >= targetBacklog) {
+        await statusRef.set({ lastEnsureAt: nowIso, lastEnsureNote: `ok: ${pendingCount} pending >= target ${targetBacklog}` }, { merge: true });
+        res.status(200).json({ ok: true, added: 0, pending: pendingCount, note: 'already healthy' });
+        return;
+      }
+
+      let nextIndex = 0;
+      try { const s = await statusRef.get(); if (s.exists) { const d = s.data() || {}; nextIndex = Math.max(0, Math.min(WEST_TO_EAST_STATE_ORDER.length - 1, Number(d.nextIndex) || 0)); } }
+      catch (_) {}
+
+      const need = Math.max(0, targetBacklog - pendingCount);
+      let addedTotal = 0; let statesTouched = 0;
+      for (let i = 0; i < statesPerRun && addedTotal < need; i++) {
+        const state = WEST_TO_EAST_STATE_ORDER[(nextIndex + i) % WEST_TO_EAST_STATE_ORDER.length];
+        try {
+          const query = makeOverpassCitiesInStateQuery(state);
+          const resp = await overpassPostWithMirrors(query, 'Courthub-PlacesEnsureHttp/1.0 (+courthub.app)');
+          if (!resp.ok) continue;
+          const json = await resp.json();
+          const elements = Array.isArray(json.elements) ? json.elements : [];
+          const cities = elements.map(e => ({
+            name: (e.tags && (e.tags.name || e.tags['name:en'])) || 'City',
+            pop: Number(e.tags && e.tags.population ? e.tags.population : 0) || 0,
+            lat: safeNumber(e.lat || (e.center && e.center.lat), null),
+            lon: safeNumber(e.lon || (e.center && e.center.lon), null),
+          })).filter(c => c.lat !== null && c.lon !== null);
+          cities.sort((a, b) => (b.pop - a.pop));
+          const top = cities.slice(0, Math.min(citiesPerState, cities.length));
+          for (const c of top) {
+            if (addedTotal >= need) break;
+            const radiusKm = c.pop >= 100000 ? 25 : (c.pop >= 20000 ? 14 : 9);
+            const backId = `${state}_${String(c.name).replace(/[^A-Za-z0-9]+/g, '_').slice(0, 40)}_${Math.round(c.lat*1000)}_${Math.round(c.lon*1000)}`;
+            const ref = backlog.doc(backId);
+            const snap = await ref.get();
+            if (!snap.exists) { await ref.set({ state, cityName: c.name, lat: c.lat, lon: c.lon, radiusKm, status: 'pending', createdAt: nowIso, attempts: 0 }); addedTotal += 1; }
+          }
+          if (addedTotal > 0) statesTouched += 1;
+        } catch (_) {}
+      }
+      const newIndex = (nextIndex + statesPerRun) % WEST_TO_EAST_STATE_ORDER.length;
+      await statusRef.set({ lastEnsureAt: nowIso, lastEnsureNote: `added=${addedTotal} touchedStates=${statesTouched} pendingBefore=${pendingCount} target=${targetBacklog}`, nextIndex: newIndex }, { merge: true });
+      res.status(200).json({ ok: true, added: addedTotal, pendingBefore: pendingCount, target: targetBacklog, nextIndex: newIndex });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
 // Consume one city backlog task per run and import within radius
 exports.scheduledOsmBackfillCityBatch = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
@@ -3192,6 +3465,19 @@ exports.scheduledOsmBackfillCityBatch = functions
     const statusRef = db.collection('imports').doc('osm');
     const adminUid = await getAdminUid(db);
     const nowIso = new Date().toISOString();
+    // Config gate (default OFF)
+    try {
+      const cfgDoc = await db.collection('config').doc('app').get();
+      const cfg = cfgDoc.exists ? cfgDoc.data() : {};
+      const enabled = cfg && cfg.autoOsmCityBackfillEnabled === true;
+      if (!enabled) {
+        await statusRef.set({ lastBackfillAt: nowIso, lastNote: 'skipped city: autoOsmCityBackfillEnabled=false' }, { merge: true }).catch(() => {});
+        return null;
+      }
+    } catch (_) {
+      await statusRef.set({ lastBackfillAt: nowIso, lastNote: 'skipped city: config read failed' }, { merge: true }).catch(() => {});
+      return null;
+    }
     // Nightly gate
     const allowed = await isWithinNightlyWindowUtc(db);
     if (!allowed) {
