@@ -77,6 +77,42 @@ exports.enforceSingleAdminOnUserWrite = functions.firestore
   });
 
 /**
+ * HTTP: Import courts for a single city immediately (admin/debug tool).
+ * Body: { city: string, state: string, lat?: number, lon?: number, radiusMeters?: number, maxCreates?: number, dryRun?: boolean }
+ * Security: requires X-Run-Secret header matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ */
+exports.runPlacesBackfillForCityHttp = functions
+  .runWith({ timeoutSeconds: 360, memory: '1GB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+
+      const db = admin.firestore();
+      const adminUid = await getAdminUid(db);
+      const city = String(req.body?.city || '').trim();
+      const state = String(req.body?.state || '').trim().toUpperCase();
+      const lat = req.body?.lat != null ? Number(req.body.lat) : undefined;
+      const lon = req.body?.lon != null ? Number(req.body.lon) : undefined;
+      const radiusMeters = Math.max(2000, Math.min(40000, Number(req.body?.radiusMeters) || 12000));
+      const maxCreates = Math.max(1, Math.min(400, Number(req.body?.maxCreates) || 200));
+      const dryRun = req.body?.dryRun === true;
+
+      if (!city || !STATE_ISO_MAP[state]) {
+        res.status(400).json({ ok: false, error: 'city and valid 2-letter state are required' });
+        return;
+      }
+
+      const out = await importPlacesForCity({ db, adminUid: adminUid || 'system', city, state, lat: isFinite(lat) ? lat : undefined, lon: isFinite(lon) ? lon : undefined, radiusMeters, maxCreates, dryRun });
+      res.status(200).json({ ok: true, city, state, dryRun, ...out });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
  * ========================
  * PARKS GEO-CODE QUEUE DRAINER
  * ========================
@@ -764,7 +800,7 @@ async function fetchGeoapifyTextSearch(text, bias) {
   if (!GEOAPIFY_KEY) return null;
   // Use generic places text endpoint. Prefer a hard spatial filter so we don't
   // waste calls on results outside the target city.
-  let url = `https://api.geoapify.com/v2/places?text=${encodeURIComponent(text)}&limit=20&apiKey=${GEOAPIFY_KEY}`;
+  let url = `https://api.geoapify.com/v2/places?text=${encodeURIComponent(text)}&limit=50&apiKey=${GEOAPIFY_KEY}`;
   if (bias && typeof bias.lng === 'number' && typeof bias.lat === 'number') {
     // If a radius is provided, use a strict circle filter instead of a soft bias.
     if (typeof bias.radius === 'number' && isFinite(bias.radius) && bias.radius > 0) {
@@ -2814,7 +2850,7 @@ function buildPlaceDocId(provider, placeId) {
   return `place:${prov}:${pid}`;
 }
 
-async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radiusMeters = 16000, maxCreates = 400 }) {
+async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radiusMeters = 16000, maxCreates = 400, dryRun = false }) {
   const nowIso = new Date().toISOString();
   // Shared daily cap guardrail across ALL Geoapify usage
   const cap = getGeoapifyDailyCapValue();
@@ -2822,11 +2858,40 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
   // Broaden coverage: try text queries and category queries. In many cities
   // Geoapify POIs are tagged with categories instead of matching the plain text.
   // Keep the text query set lean to reduce burn; rely on categories for breadth
-  const queries = [
-    { text: 'basketball court', sport: 'basketball' },
-    { text: 'tennis court', sport: 'tennis' },
-    { text: 'pickleball court', sport: 'pickleball' },
-  ];
+  // Expanded synonyms per sport with caps per sport and total to guard cost
+  const textSynonyms = {
+    basketball: [
+      'basketball court',
+      'basketball courts',
+      'outdoor basketball',
+      'public basketball court',
+      'basketball hoop',
+      'basket ball court',
+      'streetball court',
+      'playground basketball',
+      'basketball park'
+    ],
+    tennis: [
+      'tennis court',
+      'tennis courts',
+      'public tennis',
+      'tennis center',
+      'tennis centre',
+      'tennis complex',
+      'tennis club',
+      'community tennis'
+    ],
+    pickleball: [
+      'pickleball court',
+      'pickleball courts',
+      'public pickleball',
+      'pickleball center',
+      'pickleball complex',
+      'pickleball club',
+      'pickleball park',
+      'community pickleball'
+    ],
+  };
 
   const categoryQueries = [
     { categories: ['sport.basketball'], sport: 'basketball' },
@@ -2857,26 +2922,42 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
   };
 
   // 1) Text queries first (always with a concrete circle filter around the city centroid)
-  for (const q of queries) {
+  const TEXT_PER_SPORT_CAP = 4; // max text calls per sport
+  const TEXT_TOTAL_CAP = 12;    // overall cap across sports
+  let textCallsUsed = 0;
+  const sportOrder = ['basketball', 'tennis', 'pickleball'];
+  for (const sport of sportOrder) {
     if (aggregated.size >= maxCreates) break;
-    if (remainingGeoToday <= 0) {
-      console.log('[placesImport] Geoapify daily cap reached; stopping queries');
-      break;
-    }
-    let list = [];
-    try {
-      let out = null;
-      // Use proximity+radius; appending city/state text helps ranking without hard clipping
-      out = await fetchGeoapifyTextSearch(q.text + (city && state ? ` in ${city}, ${state}` : ''), bias);
-      if (out) {
-        list = out;
-        try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
-        remainingGeoToday -= 1;
-      } else {
-        list = [];
+    const syns = textSynonyms[sport] || [];
+    let perSportUsed = 0;
+    for (const base of syns) {
+      if (aggregated.size >= maxCreates) break;
+      if (remainingGeoToday <= 0) break;
+      if (perSportUsed >= TEXT_PER_SPORT_CAP) break;
+      if (textCallsUsed >= TEXT_TOTAL_CAP) break;
+      // If we already have solid coverage for this sport, skip remaining synonyms
+      const preCountForSport = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
+      if (preCountForSport >= Math.min(60, Math.floor(maxCreates / 2))) break;
+      let list = [];
+      try {
+        const q = base + (city && state ? ` in ${city}, ${state}` : '');
+        const out = await fetchGeoapifyTextSearch(q, bias);
+        if (out) {
+          list = out;
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+          remainingGeoToday -= 1;
+          perSportUsed += 1;
+          textCallsUsed += 1;
+        }
+      } catch (_) { /* ignore */ }
+      if (Array.isArray(list) && list.length > 0) {
+        takeAll(list, sport);
+        // If this synonym produced no new entries (all dups), continue to next synonym
+        const postCountForSport = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
+        // If after adding we crossed a reasonable threshold, stop for this sport
+        if (postCountForSport >= Math.min(80, Math.floor(maxCreates * 0.7))) break;
       }
-    } catch (_) { list = []; }
-    takeAll(list, q.sport);
+    }
   }
 
   // 2) Category queries as a fallback/expansion pass
@@ -2899,6 +2980,24 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
         remainingGeoToday -= 1;
       }
     } catch (_) { /* ignore */ }
+  }
+
+  // 3) If still nothing found, try a stricter in-city boundary filter once (extra call)
+  if (aggregated.size === 0 && remainingGeoToday > 0 && city && state) {
+    try {
+      const placeId = await fetchGeoapifyCityPlaceId({ city, state, lat, lon });
+      if (placeId) {
+        // Try a single basketball text search within the admin boundary to validate signal
+        const list = await fetchGeoapifyTextSearchInCity({ cityPlaceId: placeId, text: 'basketball court', limit: 50 });
+        if (Array.isArray(list) && list.length > 0) {
+          takeAll(list, 'basketball');
+        }
+        try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+        remainingGeoToday -= 1;
+      }
+    } catch (e) {
+      // ignore, fall through
+    }
   }
 
   let created = 0;
@@ -2967,6 +3066,12 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
       friendlyName = fallbackNameFromContext({ original: friendlyName, address: m.address || '', city, sport: primary });
     }
 
+    // If dryRun, skip writes but still count as would-create
+    if (dryRun) {
+      created += 1;
+      continue;
+    }
+
     await ref.set({
       id: docId,
       name: titleCase(friendlyName),
@@ -3004,6 +3109,10 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
       await db.collection('parks_geocode_queue').doc(docId).set({ parkId: docId, lat: m.lat, lng: m.lon, reason: 'places:new', priority: 5, status: 'queued', attempts: 0, createdAt: nowIso }, { merge: true });
     } catch (_) {}
     created += 1;
+  }
+
+  if (aggregated.size === 0) {
+    console.log('[placesImport] zero results for', { city, state, lat, lon, radiusMeters });
   }
 
   return { created, skippedExists, totalConsidered: aggregated.size };
@@ -3171,7 +3280,7 @@ exports.scheduledPlacesBackfillCityBatch = functions
     const adminUid = await getAdminUid(db);
     const nowIso = new Date().toISOString();
     // Read drainer config (kill switch + throttle)
-    let DR_CFG = { enabled: false, maxTasksPerRun: 3, estCallsPerCity: 6 };
+    let DR_CFG = { enabled: false, maxTasksPerRun: 3, estCallsPerCity: 12 };
     try {
       const cfgDoc = await statusRef.collection('config').doc('drainer').get();
       if (cfgDoc.exists) {
@@ -3196,7 +3305,7 @@ exports.scheduledPlacesBackfillCityBatch = functions
       return null;
     }
     try {
-      // Budget-aware concurrency: estimate ~7 Geoapify calls per city (1 for city id + ~6 queries)
+      // Budget-aware concurrency: estimate ~12 Geoapify calls per city after synonym expansion
       const dailyCap = getGeoapifyDailyCapValue();
       const remaining = await getGeoapifyRemainingToday(db, dailyCap);
       if (remaining <= 0) {
@@ -3222,6 +3331,7 @@ exports.scheduledPlacesBackfillCityBatch = functions
       }
 
       let totalCreated = 0;
+      let totalSkipped = 0;
       let processed = 0;
       for (const doc of q.docs) {
         // Re-check cap between cities
@@ -3233,9 +3343,10 @@ exports.scheduledPlacesBackfillCityBatch = functions
         const res = await importPlacesForCity({ db, adminUid: adminUid || 'system', city: task.cityName || '', state: task.state || '', lat: Number(task.lat), lon: Number(task.lon), radiusMeters: radiusM, maxCreates: 300 });
         await doc.ref.set({ status: 'done', finishedAt: new Date().toISOString(), created: res.created, skippedExists: res.skippedExists }, { merge: true });
         totalCreated += Number(res.created || 0);
+        totalSkipped += Number(res.skippedExists || 0);
         processed += 1;
       }
-      await statusRef.set({ lastRunAt: nowIso, lastNote: `processed ${processed} city task(s)`, created: totalCreated }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, lastNote: `processed ${processed} city task(s)`, created: totalCreated, skipped: totalSkipped }, { merge: true });
       await releaseLease(db, statusRef, { leaseField: 'runLease' });
       return null;
     } catch (e) {
@@ -3395,7 +3506,7 @@ exports.runPlacesBackfillCityBatchHttp = functions
         res.status(200).json({ ok: true, processed: 0, created: 0, note: 'daily cap reached' });
         return;
       }
-      const estCallsPerCity = 8;
+      const estCallsPerCity = 12;
       const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
       const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
 
@@ -3409,6 +3520,7 @@ exports.runPlacesBackfillCityBatchHttp = functions
       }
 
       let totalCreated = 0;
+      let totalSkipped = 0;
       let processed = 0;
       for (const doc of q.docs) {
         const remainingNow = await getGeoapifyRemainingToday(db, dailyCap);
@@ -3419,10 +3531,11 @@ exports.runPlacesBackfillCityBatchHttp = functions
         const resCity = await importPlacesForCity({ db, adminUid: adminUid || 'system', city: task.cityName || '', state: task.state || '', lat: Number(task.lat), lon: Number(task.lon), radiusMeters: radiusM, maxCreates: 300 });
         await doc.ref.set({ status: 'done', finishedAt: new Date().toISOString(), created: resCity.created, skippedExists: resCity.skippedExists }, { merge: true });
         totalCreated += Number(resCity.created || 0);
+        totalSkipped += Number(resCity.skippedExists || 0);
         processed += 1;
       }
       await statusRef.set({ lastRunAt: nowIso, lastNote: `processed ${processed} city task(s)`, created: totalCreated }, { merge: true });
-      res.status(200).json({ ok: true, processed, created: totalCreated });
+      res.status(200).json({ ok: true, processed, created: totalCreated, skipped: totalSkipped });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
     }
