@@ -762,10 +762,17 @@ function standardizePlacesFromGoogleV1(resp) {
 
 async function fetchGeoapifyTextSearch(text, bias) {
   if (!GEOAPIFY_KEY) return null;
-  // Use generic places text endpoint; optionally bias by proximity if lat/lng available.
+  // Use generic places text endpoint. Prefer a hard spatial filter so we don't
+  // waste calls on results outside the target city.
   let url = `https://api.geoapify.com/v2/places?text=${encodeURIComponent(text)}&limit=20&apiKey=${GEOAPIFY_KEY}`;
   if (bias && typeof bias.lng === 'number' && typeof bias.lat === 'number') {
-    url += `&bias=proximity:${bias.lng},${bias.lat}`;
+    // If a radius is provided, use a strict circle filter instead of a soft bias.
+    if (typeof bias.radius === 'number' && isFinite(bias.radius) && bias.radius > 0) {
+      const r = Math.max(2000, Math.min(40000, Math.floor(bias.radius)));
+      url += `&filter=circle:${bias.lng},${bias.lat},${r}`;
+    } else {
+      url += `&bias=proximity:${bias.lng},${bias.lat}`;
+    }
   }
   const res = await httpRequest('GET', url);
   if (!res.ok) return null;
@@ -2894,10 +2901,12 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     if (remainingGeoToday <= 0) break;
     try {
       const cats = q.categories.join(',');
+      // NOTE: We've seen Geoapify return empty sets for categories when used
+      // with filter=place:<place_id> in some regions. To avoid wasting calls,
+      // always apply a concrete circle filter around the city centroid instead
+      // of place-boundary for category lookups.
       let url = `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(cats)}&limit=${Math.max(1, Math.min(100, maxCreates))}&apiKey=${GEOAPIFY_KEY}`;
-      if (cityPlaceId) {
-        url += `&filter=place:${encodeURIComponent(cityPlaceId)}`;
-      } else if (bias) {
+      if (bias) {
         url += `&filter=circle:${bias.lng},${bias.lat},${Math.max(2000, Math.min(40000, bias.radius || 16000))}`;
       }
       const res = await httpRequest('GET', url);
@@ -3179,7 +3188,8 @@ exports.scheduledPlacesBackfillCityBatch = functions
     const nowIso = new Date().toISOString();
     // Allow tuning how many backlog city tasks we consume per run
     // Note: this is further constrained by remaining daily budget
-    const MAX_TASKS_PER_RUN = 30;
+    // Throttle to reduce Geoapify burn while we tune queries.
+    const MAX_TASKS_PER_RUN = 8;
     // Run lease to avoid overlap
     const lease = await tryAcquireLease(db, statusRef, { leaseField: 'runLease', owner: `places:${Math.random().toString(36).slice(2)}`, ttlMs: 12 * 60 * 1000 });
     if (!lease.acquired) {
@@ -3197,7 +3207,8 @@ exports.scheduledPlacesBackfillCityBatch = functions
       }
       // Approximate: 1 call to resolve city boundary + several text queries + category queries
       // Keep a conservative estimate to avoid overrunning daily cap.
-      const estCallsPerCity = 12;
+      // With tightened circle filters there are fewer retries; be conservative.
+      const estCallsPerCity = 8;
       const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
       const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
 
@@ -3377,7 +3388,7 @@ exports.runPlacesBackfillCityBatchHttp = functions
       const statusRef = db.collection('imports').doc('places');
       const adminUid = await getAdminUid(db);
       const nowIso = new Date().toISOString();
-      const MAX_TASKS_PER_RUN = Math.max(1, Math.min(60, Number(req.body?.maxTasksPerRun) || 30));
+      const MAX_TASKS_PER_RUN = Math.max(1, Math.min(60, Number(req.body?.maxTasksPerRun) || 8));
 
       // Budget-aware concurrency (same as scheduler)
       const dailyCap = getGeoapifyDailyCapValue();
@@ -3387,7 +3398,7 @@ exports.runPlacesBackfillCityBatchHttp = functions
         res.status(200).json({ ok: true, processed: 0, created: 0, note: 'daily cap reached' });
         return;
       }
-      const estCallsPerCity = 12;
+      const estCallsPerCity = 8;
       const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
       const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
 
