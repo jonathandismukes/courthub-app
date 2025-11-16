@@ -164,12 +164,22 @@ async function consumeGeoapifyCalls(db, calls) {
 }
 
 // Resolve a single daily cap value shared by ALL Geoapify usage (reverse geocode + places)
+// IMPORTANT: We now allow a hard global pause via env/config and allow cap=0.
+// Ways to pause all Geoapify calls immediately after deploy:
+//  - Env var: GEOAPIFY_HARD_PAUSE=true (or '1')
+//  - functions config: geocode.pause_all=true
+//  - Set geocode.daily_cap=0 (cap may now be 0 — previously clamped)
 function getGeoapifyDailyCapValue() {
+  // Hard pause switch via env or functions config
+  const pauseRaw = getEnv('GEOAPIFY_HARD_PAUSE', getEnv('geocode.pause_all', ''));
+  const paused = String(pauseRaw || '').trim().toLowerCase();
+  if (paused === 'true' || paused === '1' || paused === 'yes') return 0;
+
   const raw = getEnv('GEOAPIFY_DAILY_CAP', getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
   const n = Number(raw);
-  if (!isFinite(n) || n <= 0) return 40000;
-  // Reasonable guardrails
-  return Math.max(1000, Math.min(50000, Math.floor(n)));
+  if (!isFinite(n)) return 40000;
+  // Allow explicit 0 to fully stop calls; otherwise guardrails within [0, 50000]
+  return Math.max(0, Math.min(50000, Math.floor(n)));
 }
 
 async function runGeocodeDrainBudget(db, { budgetThisRun, cap }) {
@@ -3118,6 +3128,231 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
   return { created, skippedExists, totalConsidered: aggregated.size };
 }
 
+/**
+ * Simple importer that writes parks immediately with address/city/state resolved inline.
+ * - No geocode queue is used.
+ * - Uses the same Geoapify text+category search aggregator as importPlacesForCity
+ * - Optionally performs reverse geocode per created park to ensure city/state
+ *
+ * Params:
+ * { city, state, lat, lon, radiusMeters, maxCreates, dryRun, inlineReverse }
+ */
+async function importPlacesForCitySimple({ db, adminUid, city, state, lat, lon, radiusMeters = 16000, maxCreates = 200, dryRun = false, inlineReverse = true }) {
+  const nowIso = new Date().toISOString();
+  const cap = getGeoapifyDailyCapValue();
+  let remainingGeoToday = await getGeoapifyRemainingToday(db, cap);
+
+  const textSynonyms = {
+    basketball: [
+      'basketball court', 'basketball courts', 'outdoor basketball', 'public basketball court',
+      'basketball hoop', 'basket ball court', 'streetball court', 'playground basketball', 'basketball park'
+    ],
+    tennis: [
+      'tennis court', 'tennis courts', 'public tennis', 'tennis center', 'tennis centre', 'tennis complex', 'tennis club', 'community tennis'
+    ],
+    pickleball: [
+      'pickleball court', 'pickleball courts', 'public pickleball', 'pickleball center', 'pickleball complex', 'pickleball club', 'pickleball park', 'community pickleball'
+    ],
+  };
+
+  const categoryQueries = [
+    { categories: ['sport.basketball'], sport: 'basketball' },
+    { categories: ['sport.tennis'], sport: 'tennis' },
+    { categories: ['sport.pickleball'], sport: 'pickleball' },
+  ];
+
+  const bias = (isFinite(lat) && isFinite(lon)) ? { lat, lng: lon, radius: Math.max(4000, Math.min(26000, Math.floor(radiusMeters))) } : null;
+  const aggregated = new Map(); // key=id -> { place, sports:Set }
+
+  const takeAll = (list, sport) => {
+    for (const raw of (list || [])) {
+      const m = normalizeStdPlace(raw);
+      if (!m) continue;
+      const key = buildPlaceDocId(m.provider, m.id) || `${m.name}_${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
+      const entry = aggregated.get(key) || { place: m, sports: new Set() };
+      entry.sports.add(sport);
+      if ((m.name || '').length > (entry.place.name || '').length) entry.place.name = m.name;
+      if ((m.address || '').length > (entry.place.address || '').length) entry.place.address = m.address;
+      aggregated.set(key, entry);
+      if (aggregated.size >= maxCreates) break;
+    }
+  };
+
+  const TEXT_PER_SPORT_CAP = 4;
+  const TEXT_TOTAL_CAP = 12;
+  let textCallsUsed = 0;
+  const sportOrder = ['basketball', 'tennis', 'pickleball'];
+  for (const sport of sportOrder) {
+    if (aggregated.size >= maxCreates) break;
+    const syns = textSynonyms[sport] || [];
+    let perSportUsed = 0;
+    for (const base of syns) {
+      if (aggregated.size >= maxCreates) break;
+      if (remainingGeoToday <= 0) break;
+      if (perSportUsed >= TEXT_PER_SPORT_CAP) break;
+      if (textCallsUsed >= TEXT_TOTAL_CAP) break;
+      const preCountForSport = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
+      if (preCountForSport >= Math.min(60, Math.floor(maxCreates / 2))) break;
+      let list = [];
+      try {
+        const q = base + (city && state ? ` in ${city}, ${state}` : '');
+        const out = await fetchGeoapifyTextSearch(q, bias);
+        if (out) {
+          list = out;
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+          remainingGeoToday -= 1;
+          perSportUsed += 1;
+          textCallsUsed += 1;
+        }
+      } catch (_) { /* ignore */ }
+      if (Array.isArray(list) && list.length > 0) {
+        takeAll(list, sport);
+        const postCountForSport = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
+        if (postCountForSport >= Math.min(80, Math.floor(maxCreates * 0.7))) break;
+      }
+    }
+  }
+
+  for (const q of categoryQueries) {
+    if (aggregated.size >= maxCreates) break;
+    if (remainingGeoToday <= 0) break;
+    try {
+      const cats = q.categories.join(',');
+      let url = `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(cats)}&limit=${Math.max(1, Math.min(100, maxCreates))}&apiKey=${GEOAPIFY_KEY}`;
+      if (bias) {
+        url += `&filter=circle:${bias.lng},${bias.lat},${Math.max(2000, Math.min(40000, bias.radius || 16000))}`;
+      }
+      const res = await httpRequest('GET', url);
+      if (res.ok) {
+        const data = await res.json();
+        const std = standardizePlacesFromGeoapify(Array.isArray(data.features) ? data.features : []);
+        takeAll(std, q.sport);
+        try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+        remainingGeoToday -= 1;
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  let created = 0;
+  let skippedExists = 0;
+  let rgCalls = 0;
+  for (const [key, entry] of aggregated.entries()) {
+    if (created >= maxCreates) break;
+    const m = entry.place;
+    const sports = Array.from(entry.sports);
+    const docId = buildPlaceDocId(m.provider, m.id) || key;
+
+    // Dedupe by loc key
+    const locKey = `ll:${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
+    const locRef = db.collection('parkLocIndex').doc(locKey);
+    const locSnap = await locRef.get().catch(() => null);
+    if (locSnap && locSnap.exists) {
+      const target = locSnap.data() && locSnap.data().parkId;
+      if (target) {
+        try {
+          await db.collection('parks').doc(target).set({
+            altSources: admin.firestore.FieldValue.arrayUnion({ type: 'places', ref: `${m.provider}:${m.id}` }),
+            updatedAt: nowIso,
+          }, { merge: true });
+        } catch (_) {}
+        skippedExists += 1;
+        continue;
+      }
+    }
+
+    const ref = db.collection('parks').doc(docId);
+    const exists = await ref.get();
+    if (exists.exists) { skippedExists += 1; continue; }
+
+    // Build courts
+    const hasLighting = false;
+    const courts = [];
+    let seq = 0;
+    const mapSportType = (s) => s === 'tennis' ? 'tennisSingles' : (s === 'pickleball' ? 'pickleballSingles' : 'basketball');
+    const mapCourtType = (s) => s === 'tennis' ? 'tennisSingles' : (s === 'pickleball' ? 'pickleballSingles' : 'fullCourt');
+    for (const s of sports) {
+      seq += 1;
+      courts.push({ id: `c${seq}`, courtNumber: seq, customName: null, playerCount: 0, sportType: mapSportType(s), type: mapCourtType(s), condition: 'good', hasLighting, isHalfCourt: false, isIndoor: false, surface: null, lastUpdated: nowIso, conditionNotes: null, gotNextQueue: [] });
+    }
+    if (courts.length === 0) {
+      courts.push({ id: 'c1', courtNumber: 1, customName: null, playerCount: 0, sportType: 'basketball', type: 'fullCourt', condition: 'good', hasLighting, isHalfCourt: false, isIndoor: false, surface: null, lastUpdated: nowIso, conditionNotes: null, gotNextQueue: [] });
+    }
+    const sportCategories = Array.from(new Set(courts.map(ct => ct.sportType.includes('pickle') ? 'pickleball' : (ct.sportType.includes('tennis') ? 'tennis' : 'basketball')))).sort();
+
+    // Friendly name and address
+    let friendlyName = m.name && String(m.name).trim();
+    let address = String(m.address || '').trim();
+    let cityOut = city || '';
+    let stateOut = canonState(state || '');
+    if (!friendlyName || /^(basketball|tennis|pickleball) court(s)?$/i.test(friendlyName) || /^(court|courts)\s*\d*$/i.test(friendlyName)) {
+      const primary = courts[0] && courts[0].sportType && (courts[0].sportType.includes('pickle') ? 'pickleball' : (courts[0].sportType.includes('tennis') ? 'tennis' : 'basketball'));
+      friendlyName = fallbackNameFromContext({ original: friendlyName, address, city: cityOut, sport: primary });
+    }
+    // Try to parse city/state from formatted address if not explicitly provided
+    if (!cityOut || !stateOut) {
+      const parsed = parseCityStateFromAddress(address);
+      if (!cityOut && parsed.city) cityOut = parsed.city;
+      if (!stateOut && parsed.state) stateOut = parsed.state;
+    }
+    // Inline reverse geocode to improve address/city/state if requested and budget remains
+    if (inlineReverse && remainingGeoToday > 0) {
+      try {
+        const rg = await fetchGeoapifyReverse(m.lat, m.lon);
+        if (rg) {
+          address = rg.address || address;
+          if (!cityOut && rg.city) cityOut = rg.city;
+          if (!stateOut && rg.state) stateOut = canonState(rg.state);
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+          remainingGeoToday -= 1;
+          rgCalls += 1;
+        }
+      } catch (_) { /* ignore */ }
+    }
+
+    if (dryRun) { created += 1; continue; }
+
+    await ref.set({
+      id: docId,
+      name: titleCase(friendlyName),
+      address: address || '',
+      city: cityOut || '',
+      state: canonState(stateOut || ''),
+      latitude: m.lat,
+      longitude: m.lon,
+      courts,
+      sportCategories,
+      photoUrls: [],
+      amenities: [],
+      averageRating: 0.0,
+      totalReviews: 0,
+      description: null,
+      approved: true,
+      reviewStatus: 'approved',
+      createdByUserId: adminUid || 'system',
+      createdByName: 'Places Simple Import',
+      approvedByUserId: adminUid || 'system',
+      approvedAt: nowIso,
+      reviewedByUserId: adminUid || 'system',
+      reviewedAt: nowIso,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      source: 'places',
+      sourceId: `${m.provider}:${m.id}`,
+      sourceAttribution: 'Geoapify',
+      needsGeocode: false,
+    }, { merge: false });
+
+    try { await locRef.set({ parkId: docId, lat: m.lat, lon: m.lon, state: canonState(stateOut || ''), registeredAt: nowIso }, { merge: false }); } catch (_) {}
+    created += 1;
+  }
+
+  if (aggregated.size === 0) {
+    console.log('[geoSimpleImport] zero results for', { city, state, lat, lon, radiusMeters });
+  }
+
+  return { created, skippedExists, totalConsidered: aggregated.size, reverseCalls: rgCalls };
+}
+
 // Callable: Seed Places backlog for a state using Overpass city discovery
 exports.seedPlacesBacklogForState = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
@@ -3538,6 +3773,124 @@ exports.runPlacesBackfillCityBatchHttp = functions
       res.status(200).json({ ok: true, processed, created: totalCreated, skipped: totalSkipped });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * HTTP: Direct Geoapify importer (no queue/drainer). Writes parks immediately.
+ * Security: requires X-Run-Secret header matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ * Body: { city, state, lat, lon, radiusMeters, maxCreates, dryRun, inlineReverse }
+ */
+exports.geoSimpleImportHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+
+      const db = admin.firestore();
+      const adminUid = await getAdminUid(db);
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const city = String(body.city || '').trim();
+      const state = String(body.state || '').trim();
+      const lat = body.lat != null ? Number(body.lat) : undefined;
+      const lon = body.lon != null ? Number(body.lon) : undefined;
+      const radiusMeters = Math.max(2000, Math.min(40000, Number(body.radiusMeters) || 12000));
+      const maxCreates = Math.max(1, Math.min(400, Number(body.maxCreates) || 200));
+      const dryRun = body.dryRun === true;
+      const inlineReverse = body.inlineReverse !== false; // default true
+
+      if (!((city && state) || (isFinite(lat) && isFinite(lon)))) {
+        res.status(400).json({ ok: false, error: 'Provide city+state or lat+lon' });
+        return;
+      }
+
+      const out = await importPlacesForCitySimple({ db, adminUid: adminUid || 'system', city, state, lat: isFinite(lat) ? lat : undefined, lon: isFinite(lon) ? lon : undefined, radiusMeters, maxCreates, dryRun, inlineReverse });
+      res.status(200).json({ ok: true, city, state: canonState(state || ''), dryRun, ...out });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * Scheduled: Rotate through configured target cities and run geoSimpleImport once per tick.
+ * Config path: imports/geoSimple (doc)
+ *  - enabled: boolean (default false)
+ *  - useWindow: boolean (default true; honors nightly window)
+ *  - nextIndex: number (managed by scheduler)
+ * Targets path: imports/geoSimple/targets (collection)
+ *  - { city, state, lat, lon, radiusKm, maxCreates }
+ */
+exports.scheduledGeoSimpleImportBatch = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub
+  .schedule('every 10 minutes')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const statusRef = db.collection('imports').doc('geoSimple');
+    const targetsColl = statusRef.collection('targets');
+    const nowIso = new Date().toISOString();
+    try {
+      const statSnap = await statusRef.get().catch(() => null);
+      const cfg = statSnap && statSnap.exists ? (statSnap.data() || {}) : {};
+      const enabled = cfg.enabled === true; // default OFF for safety
+      if (!enabled) {
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: disabled' }, { merge: true }).catch(() => {});
+        return null;
+      }
+      const useWindow = cfg.useWindow !== false; // default true
+      if (useWindow) {
+        const allowed = await isWithinNightlyWindowUtc(db);
+        if (!allowed) {
+          await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: outside nightly window' }, { merge: true }).catch(() => {});
+          return null;
+        }
+      }
+
+      const tSnap = await targetsColl.get();
+      if (tSnap.empty) {
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'no targets' }, { merge: true }).catch(() => {});
+        return null;
+      }
+      // Deterministic West→East ordering, then by city name
+      const stateOrderIndex = new Map(WEST_TO_EAST_STATE_ORDER.map((s, i) => [s, i]));
+      const targets = tSnap.docs.map(d => ({ id: d.id, ...(d.data()||{}) }));
+      const sortedTargets = targets.slice().sort((a, b) => {
+        const sa = canonState(a.state || '');
+        const sb = canonState(b.state || '');
+        const ia = stateOrderIndex.has(sa) ? stateOrderIndex.get(sa) : Number.MAX_SAFE_INTEGER;
+        const ib = stateOrderIndex.has(sb) ? stateOrderIndex.get(sb) : Number.MAX_SAFE_INTEGER;
+        if (ia !== ib) return ia - ib;
+        const ca = String(a.city || '').trim().toLowerCase();
+        const cb = String(b.city || '').trim().toLowerCase();
+        if (ca < cb) return -1;
+        if (ca > cb) return 1;
+        return 0;
+      });
+      let nextIndex = Math.max(0, Math.min(sortedTargets.length - 1, Number(cfg.nextIndex) || 0));
+      const target = sortedTargets[nextIndex];
+      nextIndex = (nextIndex + 1) % sortedTargets.length;
+
+      const adminUid = await getAdminUid(db);
+      const city = String(target.city || '').trim();
+      const state = String(target.state || '').trim();
+      const lat = Number(target.lat);
+      const lon = Number(target.lon);
+      const radiusMeters = Math.max(2000, Math.min(40000, Math.round((Number(target.radiusKm)||10) * 1000)));
+      const maxCreates = Math.max(1, Math.min(400, Number(target.maxCreates) || 200));
+
+      const resSimple = await importPlacesForCitySimple({ db, adminUid: adminUid || 'system', city, state, lat: isFinite(lat)?lat:undefined, lon: isFinite(lon)?lon:undefined, radiusMeters, maxCreates, dryRun: false, inlineReverse: true });
+      await statusRef.set({ lastRunAt: nowIso, lastRunCity: city, lastRunState: canonState(state || ''), lastCreated: resSimple.created, lastTotalConsidered: resSimple.totalConsidered, nextIndex }, { merge: true });
+      // Log per run
+      const runId = `${nowIso.replace(/[:.]/g, '-')}_${city || 'coord'}_${state || 'NA'}`.slice(0, 120);
+      try { await statusRef.collection('logs').doc(runId).set({ runId, ts: nowIso, ok: true, target, result: resSimple }); } catch (_) {}
+      return null;
+    } catch (e) {
+      try { await statusRef.set({ lastRunAt: nowIso, lastErrorAt: nowIso, lastError: (e && e.message) ? String(e.message).slice(0, 300) : String(e).slice(0, 300) }, { merge: true }); } catch (_) {}
+      return null;
     }
   });
 
