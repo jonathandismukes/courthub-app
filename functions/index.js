@@ -2821,17 +2821,11 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
   let remainingGeoToday = await getGeoapifyRemainingToday(db, cap);
   // Broaden coverage: try text queries and category queries. In many cities
   // Geoapify POIs are tagged with categories instead of matching the plain text.
+  // Keep the text query set lean to reduce burn; rely on categories for breadth
   const queries = [
-    // Basketball
     { text: 'basketball court', sport: 'basketball' },
-    { text: 'outdoor basketball', sport: 'basketball' },
-    { text: 'basketball hoops', sport: 'basketball' },
-    // Tennis
     { text: 'tennis court', sport: 'tennis' },
-    { text: 'tennis courts', sport: 'tennis' },
-    // Pickleball
     { text: 'pickleball court', sport: 'pickleball' },
-    { text: 'pickleball courts', sport: 'pickleball' },
   ];
 
   const categoryQueries = [
@@ -2842,14 +2836,9 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
   const bias = (isFinite(lat) && isFinite(lon)) ? { lat, lng: lon, radius: Math.max(4000, Math.min(26000, Math.floor(radiusMeters))) } : null;
   const aggregated = new Map(); // key=id -> { place, sports:Set }
 
-  // Try to resolve strict city boundary first; if not available, fall back to radius bias
+  // Skip resolving a strict city boundary to avoid an extra call that often returns 0 results
+  // and to prevent boundary clipping from hiding courts just outside the admin polygon.
   let cityPlaceId = null;
-  try {
-    if (remainingGeoToday > 0) {
-      cityPlaceId = await fetchGeoapifyCityPlaceId({ city, state, lat, lon });
-      if (cityPlaceId) { try { await consumeGeoapifyCalls(db, 1); } catch (_) {} remainingGeoToday -= 1; }
-    }
-  } catch (_) { cityPlaceId = null; }
 
   // Helper that merges a list of standardized places into aggregator
   const takeAll = (list, sport) => {
@@ -2867,7 +2856,7 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     }
   };
 
-  // 1) Text queries first
+  // 1) Text queries first (always with a concrete circle filter around the city centroid)
   for (const q of queries) {
     if (aggregated.size >= maxCreates) break;
     if (remainingGeoToday <= 0) {
@@ -2877,13 +2866,8 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     let list = [];
     try {
       let out = null;
-      if (cityPlaceId) {
-        // Boundary-constrained search to avoid cross-city mislabeling
-        out = await fetchGeoapifyTextSearchInCity({ cityPlaceId, text: q.text, limit: 50 });
-      } else {
-        // Fallback to proximity + radius around the city's centroid
-        out = await fetchGeoapifyTextSearch(q.text + (city && state ? ` in ${city}, ${state}` : ''), bias);
-      }
+      // Use proximity+radius; appending city/state text helps ranking without hard clipping
+      out = await fetchGeoapifyTextSearch(q.text + (city && state ? ` in ${city}, ${state}` : ''), bias);
       if (out) {
         list = out;
         try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
@@ -2901,10 +2885,7 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     if (remainingGeoToday <= 0) break;
     try {
       const cats = q.categories.join(',');
-      // NOTE: We've seen Geoapify return empty sets for categories when used
-      // with filter=place:<place_id> in some regions. To avoid wasting calls,
-      // always apply a concrete circle filter around the city centroid instead
-      // of place-boundary for category lookups.
+      // Always apply a concrete circle filter around the city centroid for categories.
       let url = `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(cats)}&limit=${Math.max(1, Math.min(100, maxCreates))}&apiKey=${GEOAPIFY_KEY}`;
       if (bias) {
         url += `&filter=circle:${bias.lng},${bias.lat},${Math.max(2000, Math.min(40000, bias.radius || 16000))}`;
@@ -3175,6 +3156,9 @@ exports.scheduledSeedPlacesBacklogAllStates = functions
   });
 
 // Scheduler: consume one Places backlog task per run
+// Now honors a Firestore config kill switch:
+//   imports/places/config/drainer { enabled: boolean, maxTasksPerRun?: number, estCallsPerCity?: number }
+// Default: disabled until explicitly enabled to prevent accidental API burn.
 exports.scheduledPlacesBackfillCityBatch = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
   .pubsub
@@ -3186,10 +3170,25 @@ exports.scheduledPlacesBackfillCityBatch = functions
     const statusRef = db.collection('imports').doc('places');
     const adminUid = await getAdminUid(db);
     const nowIso = new Date().toISOString();
+    // Read drainer config (kill switch + throttle)
+    let DR_CFG = { enabled: false, maxTasksPerRun: 3, estCallsPerCity: 6 };
+    try {
+      const cfgDoc = await statusRef.collection('config').doc('drainer').get();
+      if (cfgDoc.exists) {
+        const d = cfgDoc.data() || {};
+        DR_CFG.enabled = d.enabled === true; // default OFF
+        if (isFinite(Number(d.maxTasksPerRun))) DR_CFG.maxTasksPerRun = Math.max(1, Math.min(30, Number(d.maxTasksPerRun)));
+        if (isFinite(Number(d.estCallsPerCity))) DR_CFG.estCallsPerCity = Math.max(2, Math.min(20, Number(d.estCallsPerCity)));
+      }
+    } catch (_) { /* keep defaults */ }
+
+    if (!DR_CFG.enabled) {
+      await statusRef.set({ lastRunAt: nowIso, lastNote: 'drainer disabled (imports/places/config/drainer.enabled=false)' }, { merge: true }).catch(() => {});
+      return null;
+    }
     // Allow tuning how many backlog city tasks we consume per run
     // Note: this is further constrained by remaining daily budget
-    // Throttle to reduce Geoapify burn while we tune queries.
-    const MAX_TASKS_PER_RUN = 8;
+    const MAX_TASKS_PER_RUN = DR_CFG.maxTasksPerRun;
     // Run lease to avoid overlap
     const lease = await tryAcquireLease(db, statusRef, { leaseField: 'runLease', owner: `places:${Math.random().toString(36).slice(2)}`, ttlMs: 12 * 60 * 1000 });
     if (!lease.acquired) {
@@ -3205,10 +3204,8 @@ exports.scheduledPlacesBackfillCityBatch = functions
         await releaseLease(db, statusRef, { leaseField: 'runLease' });
         return null;
       }
-      // Approximate: 1 call to resolve city boundary + several text queries + category queries
-      // Keep a conservative estimate to avoid overrunning daily cap.
-      // With tightened circle filters there are fewer retries; be conservative.
-      const estCallsPerCity = 8;
+      // Approximate: several Geoapify calls per city; configurable to stay under cap
+      const estCallsPerCity = DR_CFG.estCallsPerCity;
       const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
       const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
 
