@@ -3895,6 +3895,230 @@ exports.scheduledGeoSimpleImportBatch = functions
   });
 
 /**
+ * HTTP: Seed imports/geoSimple/targets with curated Tier 1–3 metro split targets.
+ * One‑time admin endpoint so you don’t have to create dozens of docs manually.
+ *
+ * Security: requires X-Run-Secret matching BACKFILL_RUN_SECRET/backfill.run_secret
+ * Body (optional):
+ *  - preset: 'all' | 'tier1' | 'tier2' | 'tier3' (default 'all')
+ *  - overwrite: boolean (default false) — if true, update existing targets' radius/maxCreates
+ *  - dryRun: boolean (default false) — preview without writing
+ *  - enableNow: boolean (default false) — also set imports/geoSimple.enabled=true and optionally useWindow
+ *  - useWindow: boolean (default true) — when enableNow=true, sets nightly window honoring flag
+ */
+exports.seedGeoSimpleTargetsHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+
+      const db = admin.firestore();
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const preset = String(body.preset || 'all').toLowerCase();
+      const overwrite = body.overwrite === true;
+      const dryRun = body.dryRun === true;
+      const enableNow = body.enableNow === true;
+      const useWindow = body.useWindow !== false; // default true when enabling
+
+      // Helper to clamp values within scheduler guardrails
+      const clampRadius = (km) => Math.max(2, Math.min(40, Math.round(Number(km) || 10)));
+      const clampCreates = (n) => Math.max(1, Math.min(400, Math.round(Number(n) || 200)));
+
+      // Curated split targets across Tier 1–3 metros. Tuned for coverage and scheduler clamps.
+      // Each item: { id, tier, city, state, lat, lon, radiusKm, maxCreates }
+      const curated = [
+        // Tier 1 — NYC metro
+        { id: 'nyc_manhattan', tier: 1, city: 'Manhattan', state: 'NY', lat: 40.7831, lon: -73.9712, radiusKm: 12, maxCreates: 400 },
+        { id: 'nyc_brooklyn', tier: 1, city: 'Brooklyn', state: 'NY', lat: 40.6782, lon: -73.9442, radiusKm: 15, maxCreates: 400 },
+        { id: 'nyc_queens', tier: 1, city: 'Queens', state: 'NY', lat: 40.7282, lon: -73.7949, radiusKm: 18, maxCreates: 400 },
+        { id: 'nyc_bronx', tier: 1, city: 'Bronx', state: 'NY', lat: 40.8448, lon: -73.8648, radiusKm: 10, maxCreates: 350 },
+        { id: 'nyc_staten_island', tier: 1, city: 'Staten Island', state: 'NY', lat: 40.5795, lon: -74.1502, radiusKm: 12, maxCreates: 250 },
+        { id: 'nj_jersey_city_newark', tier: 1, city: 'Jersey City/Newark', state: 'NJ', lat: 40.7282, lon: -74.0776, radiusKm: 16, maxCreates: 380 },
+        { id: 'ny_nassau_west', tier: 1, city: 'Nassau (West)', state: 'NY', lat: 40.7380, lon: -73.5840, radiusKm: 18, maxCreates: 380 },
+        { id: 'ny_westchester', tier: 1, city: 'Westchester', state: 'NY', lat: 41.0330, lon: -73.7629, radiusKm: 15, maxCreates: 350 },
+        { id: 'ny_long_island_central', tier: 1, city: 'Long Island (Central)', state: 'NY', lat: 40.7891, lon: -73.1350, radiusKm: 22, maxCreates: 380 },
+        { id: 'ct_stamford_norwalk', tier: 1, city: 'Stamford/Norwalk', state: 'CT', lat: 41.0670, lon: -73.5170, radiusKm: 14, maxCreates: 320 },
+
+        // Tier 1 — Los Angeles/OC
+        { id: 'la_downtown_basin', tier: 1, city: 'Los Angeles (Downtown/Basin)', state: 'CA', lat: 34.0407, lon: -118.2468, radiusKm: 16, maxCreates: 380 },
+        { id: 'la_san_fernando_valley', tier: 1, city: 'San Fernando Valley', state: 'CA', lat: 34.2000, lon: -118.4500, radiusKm: 18, maxCreates: 380 },
+        { id: 'la_westside_santamonica', tier: 1, city: 'Westside/Santa Monica', state: 'CA', lat: 34.0195, lon: -118.4912, radiusKm: 14, maxCreates: 350 },
+        { id: 'la_south_la_inglewood', tier: 1, city: 'South LA/Inglewood', state: 'CA', lat: 33.9550, lon: -118.3530, radiusKm: 14, maxCreates: 350 },
+        { id: 'la_long_beach', tier: 1, city: 'Long Beach', state: 'CA', lat: 33.7701, lon: -118.1937, radiusKm: 12, maxCreates: 320 },
+        { id: 'oc_anaheim_north', tier: 1, city: 'Anaheim/Fullerton', state: 'CA', lat: 33.8366, lon: -117.9143, radiusKm: 16, maxCreates: 350 },
+        { id: 'oc_irvine_south', tier: 1, city: 'Irvine', state: 'CA', lat: 33.6846, lon: -117.8265, radiusKm: 16, maxCreates: 350 },
+        { id: 'la_san_gabriel_valley', tier: 1, city: 'Pasadena/San Gabriel', state: 'CA', lat: 34.1478, lon: -118.1445, radiusKm: 16, maxCreates: 350 },
+
+        // Tier 1 — Chicago
+        { id: 'chi_core', tier: 1, city: 'Chicago (Loop)', state: 'IL', lat: 41.8781, lon: -87.6298, radiusKm: 14, maxCreates: 360 },
+        { id: 'chi_north_side', tier: 1, city: 'Chicago North Side', state: 'IL', lat: 41.9530, lon: -87.6540, radiusKm: 12, maxCreates: 320 },
+        { id: 'chi_south_side', tier: 1, city: 'Chicago South Side', state: 'IL', lat: 41.7440, lon: -87.6040, radiusKm: 14, maxCreates: 340 },
+        { id: 'chi_oak_park', tier: 1, city: 'Oak Park/West Suburbs', state: 'IL', lat: 41.8850, lon: -87.7845, radiusKm: 12, maxCreates: 300 },
+        { id: 'chi_schaumburg', tier: 1, city: 'Schaumburg/NW Suburbs', state: 'IL', lat: 42.0334, lon: -88.0834, radiusKm: 12, maxCreates: 280 },
+        { id: 'chi_orland_park', tier: 1, city: 'Orland Park/SW Suburbs', state: 'IL', lat: 41.6303, lon: -87.8539, radiusKm: 12, maxCreates: 260 },
+
+        // Tier 1 — Houston
+        { id: 'houston_core', tier: 1, city: 'Houston', state: 'TX', lat: 29.7604, lon: -95.3698, radiusKm: 20, maxCreates: 380 },
+        { id: 'houston_katy', tier: 1, city: 'Katy/West Houston', state: 'TX', lat: 29.7858, lon: -95.8245, radiusKm: 18, maxCreates: 320 },
+        { id: 'houston_woodlands', tier: 1, city: 'The Woodlands', state: 'TX', lat: 30.1658, lon: -95.4613, radiusKm: 14, maxCreates: 260 },
+        { id: 'houston_sugar_land', tier: 1, city: 'Sugar Land', state: 'TX', lat: 29.6197, lon: -95.6349, radiusKm: 14, maxCreates: 260 },
+        { id: 'houston_bay_area', tier: 1, city: 'Pasadena/Clear Lake', state: 'TX', lat: 29.6150, lon: -95.1500, radiusKm: 14, maxCreates: 280 },
+
+        // Tier 1 — Dallas–Fort Worth
+        { id: 'dfw_dallas_core', tier: 1, city: 'Dallas', state: 'TX', lat: 32.7767, lon: -96.7970, radiusKm: 16, maxCreates: 360 },
+        { id: 'dfw_north_plano', tier: 1, city: 'Plano/Richardson', state: 'TX', lat: 33.0198, lon: -96.6989, radiusKm: 14, maxCreates: 300 },
+        { id: 'dfw_fort_worth', tier: 1, city: 'Fort Worth', state: 'TX', lat: 32.7555, lon: -97.3308, radiusKm: 16, maxCreates: 340 },
+        { id: 'dfw_arlington', tier: 1, city: 'Arlington/Grand Prairie', state: 'TX', lat: 32.7357, lon: -97.1081, radiusKm: 14, maxCreates: 300 },
+        { id: 'dfw_frisco_mckinney', tier: 1, city: 'Frisco/McKinney', state: 'TX', lat: 33.1507, lon: -96.8236, radiusKm: 12, maxCreates: 260 },
+
+        // Tier 1 — Miami–Fort Lauderdale–WPB
+        { id: 'mia_core', tier: 1, city: 'Miami', state: 'FL', lat: 25.7617, lon: -80.1918, radiusKm: 14, maxCreates: 360 },
+        { id: 'mia_hialeah', tier: 1, city: 'Hialeah/Miami NW', state: 'FL', lat: 25.8699, lon: -80.3029, radiusKm: 12, maxCreates: 300 },
+        { id: 'mia_kendall', tier: 1, city: 'Kendall/West Kendall', state: 'FL', lat: 25.6670, lon: -80.3573, radiusKm: 12, maxCreates: 280 },
+        { id: 'miami_beach', tier: 1, city: 'Miami Beach', state: 'FL', lat: 25.7907, lon: -80.1300, radiusKm: 10, maxCreates: 240 },
+        { id: 'fll_core', tier: 1, city: 'Fort Lauderdale', state: 'FL', lat: 26.1224, lon: -80.1373, radiusKm: 12, maxCreates: 300 },
+        { id: 'wpb_core', tier: 1, city: 'West Palm Beach', state: 'FL', lat: 26.7153, lon: -80.0534, radiusKm: 12, maxCreates: 260 },
+
+        // Tier 1 — SF Bay Area
+        { id: 'sf_city', tier: 1, city: 'San Francisco', state: 'CA', lat: 37.7749, lon: -122.4194, radiusKm: 10, maxCreates: 320 },
+        { id: 'oakland_berkeley', tier: 1, city: 'Oakland/Berkeley', state: 'CA', lat: 37.8044, lon: -122.2711, radiusKm: 12, maxCreates: 320 },
+        { id: 'san_jose', tier: 1, city: 'San Jose', state: 'CA', lat: 37.3382, lon: -121.8863, radiusKm: 14, maxCreates: 340 },
+        { id: 'peninsula', tier: 1, city: 'San Mateo/Redwood City', state: 'CA', lat: 37.5629, lon: -122.3255, radiusKm: 12, maxCreates: 300 },
+        { id: 'east_bay_concord', tier: 1, city: 'Concord/Walnut Creek', state: 'CA', lat: 37.9779, lon: -122.0311, radiusKm: 12, maxCreates: 280 },
+
+        // Tier 1 — DC metro
+        { id: 'dc_core', tier: 1, city: 'Washington', state: 'DC', lat: 38.9072, lon: -77.0369, radiusKm: 12, maxCreates: 340 },
+        { id: 'va_arlington_alex', tier: 1, city: 'Arlington/Alexandria', state: 'VA', lat: 38.8500, lon: -77.0500, radiusKm: 12, maxCreates: 300 },
+        { id: 'md_moco', tier: 1, city: 'Bethesda/Rockville', state: 'MD', lat: 39.0800, lon: -77.1500, radiusKm: 14, maxCreates: 300 },
+        { id: 'va_fairfax', tier: 1, city: 'Tysons/Reston', state: 'VA', lat: 38.9248, lon: -77.2397, radiusKm: 14, maxCreates: 300 },
+        { id: 'md_pg', tier: 1, city: "Prince George's County", state: 'MD', lat: 38.8307, lon: -76.9080, radiusKm: 12, maxCreates: 300 },
+
+        // Tier 1 — Philadelphia
+        { id: 'phl_core', tier: 1, city: 'Philadelphia', state: 'PA', lat: 39.9526, lon: -75.1652, radiusKm: 12, maxCreates: 340 },
+        { id: 'phl_west', tier: 1, city: 'West Philadelphia', state: 'PA', lat: 39.9578, lon: -75.2000, radiusKm: 8, maxCreates: 220 },
+        { id: 'phl_north', tier: 1, city: 'North Philadelphia', state: 'PA', lat: 40.0084, lon: -75.1477, radiusKm: 10, maxCreates: 240 },
+        { id: 'phl_camden', tier: 1, city: 'Camden/Cherry Hill', state: 'NJ', lat: 39.9260, lon: -75.0310, radiusKm: 12, maxCreates: 260 },
+        { id: 'phl_kop', tier: 1, city: 'King of Prussia', state: 'PA', lat: 40.1013, lon: -75.3830, radiusKm: 12, maxCreates: 240 },
+
+        // Tier 1 — Boston
+        { id: 'bos_core', tier: 1, city: 'Boston', state: 'MA', lat: 42.3601, lon: -71.0589, radiusKm: 10, maxCreates: 320 },
+        { id: 'bos_cambridge', tier: 1, city: 'Cambridge/Somerville', state: 'MA', lat: 42.3736, lon: -71.1097, radiusKm: 8, maxCreates: 220 },
+        { id: 'bos_brookline_newton', tier: 1, city: 'Brookline/Newton', state: 'MA', lat: 42.3318, lon: -71.1212, radiusKm: 10, maxCreates: 240 },
+        { id: 'bos_quincy', tier: 1, city: 'Quincy', state: 'MA', lat: 42.2529, lon: -71.0023, radiusKm: 10, maxCreates: 220 },
+        { id: 'bos_waltham', tier: 1, city: 'Waltham/Watertown', state: 'MA', lat: 42.3765, lon: -71.2356, radiusKm: 10, maxCreates: 220 },
+
+        // Tier 2 — Large metros needing 2–4 targets
+        { id: 'sd_core', tier: 2, city: 'San Diego', state: 'CA', lat: 32.7157, lon: -117.1611, radiusKm: 16, maxCreates: 320 },
+        { id: 'sd_north_county', tier: 2, city: 'North County (Oceanside/Carlsbad)', state: 'CA', lat: 33.1581, lon: -117.3506, radiusKm: 14, maxCreates: 260 },
+
+        { id: 'phx_core', tier: 2, city: 'Phoenix', state: 'AZ', lat: 33.4484, lon: -112.0740, radiusKm: 18, maxCreates: 340 },
+        { id: 'phx_east_valley', tier: 2, city: 'Tempe/Mesa/Chandler', state: 'AZ', lat: 33.3635, lon: -111.9640, radiusKm: 16, maxCreates: 320 },
+
+        { id: 'sea_core', tier: 2, city: 'Seattle', state: 'WA', lat: 47.6062, lon: -122.3321, radiusKm: 12, maxCreates: 300 },
+        { id: 'sea_eastside', tier: 2, city: 'Bellevue/Redmond', state: 'WA', lat: 47.6101, lon: -122.2015, radiusKm: 12, maxCreates: 260 },
+
+        { id: 'atl_core', tier: 2, city: 'Atlanta', state: 'GA', lat: 33.7490, lon: -84.3880, radiusKm: 14, maxCreates: 320 },
+        { id: 'atl_north', tier: 2, city: 'Sandy Springs/Roswell', state: 'GA', lat: 33.9807, lon: -84.3513, radiusKm: 14, maxCreates: 260 },
+
+        { id: 'det_core', tier: 2, city: 'Detroit', state: 'MI', lat: 42.3314, lon: -83.0458, radiusKm: 14, maxCreates: 300 },
+        { id: 'det_oakland_county', tier: 2, city: 'Oakland County', state: 'MI', lat: 42.5869, lon: -83.4302, radiusKm: 14, maxCreates: 260 },
+
+        { id: 'msp_minneapolis', tier: 2, city: 'Minneapolis', state: 'MN', lat: 44.9778, lon: -93.2650, radiusKm: 12, maxCreates: 260 },
+        { id: 'msp_st_paul', tier: 2, city: 'St. Paul', state: 'MN', lat: 44.9537, lon: -93.0900, radiusKm: 12, maxCreates: 240 },
+
+        { id: 'denver_core', tier: 2, city: 'Denver', state: 'CO', lat: 39.7392, lon: -104.9903, radiusKm: 14, maxCreates: 300 },
+        { id: 'denver_south', tier: 2, city: 'DTC/Centennial', state: 'CO', lat: 39.5970, lon: -104.9010, radiusKm: 12, maxCreates: 220 },
+
+        { id: 'satx_core', tier: 2, city: 'San Antonio', state: 'TX', lat: 29.4241, lon: -98.4936, radiusKm: 16, maxCreates: 320 },
+        { id: 'aus_core', tier: 2, city: 'Austin', state: 'TX', lat: 30.2672, lon: -97.7431, radiusKm: 16, maxCreates: 320 },
+
+        { id: 'orl_core', tier: 2, city: 'Orlando', state: 'FL', lat: 28.5384, lon: -81.3789, radiusKm: 14, maxCreates: 300 },
+        { id: 'tpa_core', tier: 2, city: 'Tampa', state: 'FL', lat: 27.9506, lon: -82.4572, radiusKm: 14, maxCreates: 300 },
+        { id: 'stp_clearwater', tier: 2, city: 'St. Petersburg/Clearwater', state: 'FL', lat: 27.9738, lon: -82.7996, radiusKm: 12, maxCreates: 240 },
+
+        { id: 'clt_core', tier: 2, city: 'Charlotte', state: 'NC', lat: 35.2271, lon: -80.8431, radiusKm: 14, maxCreates: 300 },
+        { id: 'rdus_core', tier: 2, city: 'Raleigh/Durham', state: 'NC', lat: 35.7796, lon: -78.6382, radiusKm: 14, maxCreates: 300 },
+
+        { id: 'pdx_core', tier: 2, city: 'Portland', state: 'OR', lat: 45.5051, lon: -122.6750, radiusKm: 12, maxCreates: 280 },
+        { id: 'bal_core', tier: 2, city: 'Baltimore', state: 'MD', lat: 39.2904, lon: -76.6122, radiusKm: 12, maxCreates: 280 },
+
+        { id: 'bna_core', tier: 2, city: 'Nashville', state: 'TN', lat: 36.1627, lon: -86.7816, radiusKm: 12, maxCreates: 260 },
+        { id: 'las_core', tier: 2, city: 'Las Vegas', state: 'NV', lat: 36.1699, lon: -115.1398, radiusKm: 14, maxCreates: 280 },
+
+        // Tier 3 — 1–2 targets each
+        { id: 'col_core', tier: 3, city: 'Columbus', state: 'OH', lat: 39.9612, lon: -82.9988, radiusKm: 12, maxCreates: 260 },
+        { id: 'ind_core', tier: 3, city: 'Indianapolis', state: 'IN', lat: 39.7684, lon: -86.1581, radiusKm: 12, maxCreates: 260 },
+        { id: 'kc_core', tier: 3, city: 'Kansas City', state: 'MO', lat: 39.0997, lon: -94.5786, radiusKm: 14, maxCreates: 260 },
+        { id: 'stl_core', tier: 3, city: 'St. Louis', state: 'MO', lat: 38.6270, lon: -90.1994, radiusKm: 12, maxCreates: 240 },
+        { id: 'cle_core', tier: 3, city: 'Cleveland', state: 'OH', lat: 41.4993, lon: -81.6944, radiusKm: 12, maxCreates: 240 },
+        { id: 'cin_core', tier: 3, city: 'Cincinnati', state: 'OH', lat: 39.1031, lon: -84.5120, radiusKm: 12, maxCreates: 240 },
+        { id: 'pit_core', tier: 3, city: 'Pittsburgh', state: 'PA', lat: 40.4406, lon: -79.9959, radiusKm: 12, maxCreates: 240 },
+        { id: 'mke_core', tier: 3, city: 'Milwaukee', state: 'WI', lat: 43.0389, lon: -87.9065, radiusKm: 12, maxCreates: 240 },
+        { id: 'sac_core', tier: 3, city: 'Sacramento', state: 'CA', lat: 38.5816, lon: -121.4944, radiusKm: 14, maxCreates: 260 },
+        { id: 'slc_core', tier: 3, city: 'Salt Lake City', state: 'UT', lat: 40.7608, lon: -111.8910, radiusKm: 12, maxCreates: 240 },
+        { id: 'jax_core', tier: 3, city: 'Jacksonville', state: 'FL', lat: 30.3322, lon: -81.6557, radiusKm: 16, maxCreates: 280 },
+        { id: 'okc_core', tier: 3, city: 'Oklahoma City', state: 'OK', lat: 35.4676, lon: -97.5164, radiusKm: 14, maxCreates: 260 },
+        { id: 'msy_core', tier: 3, city: 'New Orleans', state: 'LA', lat: 29.9511, lon: -90.0715, radiusKm: 12, maxCreates: 240 },
+        { id: 'ric_core', tier: 3, city: 'Richmond', state: 'VA', lat: 37.5407, lon: -77.4360, radiusKm: 12, maxCreates: 220 },
+        { id: 'hfd_core', tier: 3, city: 'Hartford', state: 'CT', lat: 41.7658, lon: -72.6734, radiusKm: 12, maxCreates: 200 },
+        { id: 'pvd_core', tier: 3, city: 'Providence', state: 'RI', lat: 41.8240, lon: -71.4128, radiusKm: 12, maxCreates: 200 },
+        { id: 'abq_core', tier: 3, city: 'Albuquerque', state: 'NM', lat: 35.0844, lon: -106.6504, radiusKm: 14, maxCreates: 240 },
+        { id: 'tus_core', tier: 3, city: 'Tucson', state: 'AZ', lat: 32.2226, lon: -110.9747, radiusKm: 14, maxCreates: 240 },
+        { id: 'mem_core', tier: 3, city: 'Memphis', state: 'TN', lat: 35.1495, lon: -90.0490, radiusKm: 12, maxCreates: 240 },
+      ];
+
+      const selected = curated.filter(t => (
+        preset === 'all' || (preset === 'tier1' && t.tier === 1) || (preset === 'tier2' && t.tier === 2) || (preset === 'tier3' && t.tier === 3)
+      ));
+
+      const statusRef = db.collection('imports').doc('geoSimple');
+      const targetsColl = statusRef.collection('targets');
+      let added = 0, updated = 0, skipped = 0;
+      const nowIso = new Date().toISOString();
+
+      if (!dryRun) {
+        // Optionally enable scheduler right away
+        if (enableNow) {
+          await statusRef.set({ enabled: true, useWindow, nextIndex: 0, lastSeedAt: nowIso }, { merge: true });
+        }
+      }
+
+      for (const t of selected) {
+        const docRef = targetsColl.doc(t.id);
+        const snap = await docRef.get();
+        const payload = {
+          city: t.city,
+          state: canonState(t.state),
+          lat: Number(t.lat),
+          lon: Number(t.lon),
+          radiusKm: clampRadius(t.radiusKm),
+          maxCreates: clampCreates(t.maxCreates),
+          tier: t.tier,
+          seededAt: nowIso,
+        };
+        if (snap.exists) {
+          if (overwrite) {
+            if (!dryRun) await docRef.set(payload, { merge: true });
+            updated += 1;
+          } else {
+            skipped += 1;
+          }
+        } else {
+          if (!dryRun) await docRef.set(payload, { merge: false });
+          added += 1;
+        }
+      }
+
+      res.status(200).json({ ok: true, preset, totalCandidates: selected.length, added, updated, skipped, dryRun, enabled: enableNow });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
  * HTTP: Ensure Places backlog capacity now (same as scheduledEnsurePlacesBacklogCapacity, one pass).
  * Security: X-Run-Secret as above.
  */
@@ -4671,4 +4895,4 @@ exports.scheduledDedupeParks = functions.pubsub
       console.warn('scheduledDedupeParks error', e);
       return null;
     }
-  });
+  }); only way
