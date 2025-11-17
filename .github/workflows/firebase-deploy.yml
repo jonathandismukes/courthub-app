@@ -144,5 +144,6 @@ jobs:
         working-directory: ${{ env.FIREBASE_DIR }}
         run: |
           echo "Deploying from $(pwd) using $(ls -1 firebase.json)"
-          firebase deploy --only functions --project ${{ env.TARGET_PROJECT }}
-
+          # --non-interactive avoids prompts in CI
+          # --force auto-confirms deletion of functions that were removed from source
+          firebase deploy --only functions --project ${{ env.TARGET_PROJECT }} --non-interactive --force
