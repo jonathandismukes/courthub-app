@@ -24,6 +24,7 @@ jobs:
     env:
       TARGET_PROJECT: courthub-app
       GEOAPIFY_KEY: ${{ secrets.GEOAPIFY_KEY }}
+      MAPS_GOOGLE_SERVER_KEY: ${{ secrets.MAPS_GOOGLE_SERVER_KEY }}
     steps:
       - name: WORKFLOW SIGNATURE
         run: |
@@ -139,6 +140,14 @@ jobs:
         run: |
           echo "Setting functions config for maps.geoapify_key"
           firebase --project ${{ env.TARGET_PROJECT }} functions:config:set maps.geoapify_key="$GEOAPIFY_KEY"
+
+      - name: Set Firebase functions config (maps.google_server_key)
+        if: ${{ env.MAPS_GOOGLE_SERVER_KEY != '' }}
+        continue-on-error: true
+        working-directory: ${{ env.FIREBASE_DIR }}
+        run: |
+          echo "Setting functions config for maps.google_server_key"
+          firebase --project ${{ env.TARGET_PROJECT }} functions:config:set maps.google_server_key="$MAPS_GOOGLE_SERVER_KEY"
 
       - name: Deploy Cloud Functions
         working-directory: ${{ env.FIREBASE_DIR }}
