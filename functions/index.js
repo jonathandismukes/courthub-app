@@ -235,6 +235,11 @@ async function runGeocodeDrainBudget(db, { budgetThisRun, cap }) {
         continue;
       }
       const pd = parkSnap.data() || {};
+      // NEW: Only reverse geocode approved parks. Skip unapproved to avoid any client-triggered API burn.
+      if (!pd.approved) {
+        await ref.set({ status: 'done', note: 'skipped: not approved', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+        continue;
+      }
       const needs = pd.needsGeocode === true;
       const lastAt = pd.lastGeocodedAt ? new Date(pd.lastGeocodedAt).getTime() : 0;
       const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
@@ -1477,6 +1482,18 @@ exports.notifyParkModerationUpdate = functions.firestore
         const data = { type: 'park_approval', parkId: change.after.id };
         await sendNotificationsToUsers(db, [submitterId], title, body, data);
         console.log(`Approval notification sent to ${submitterId} for park ${change.after.id}`);
+
+        // Also enqueue reverse geocoding now that the park is approved, if needed.
+        try {
+          const lat = Number(after.latitude);
+          const lng = Number(after.longitude);
+          const missingAddr = !after.address || !after.city || !after.state || String(after.address).trim().toLowerCase() === 'address not specified';
+          if (isFinite(lat) && isFinite(lng) && missingAddr) {
+            await enqueueGeocodeJob(db, { parkId: change.after.id, lat, lng, reason: 'park:approved', priority: 3 });
+          }
+        } catch (e) {
+          console.warn('enqueue on approval failed', e && e.message ? e.message : e);
+        }
       } else if (afterStatus === 'denied' && beforeStatus !== 'denied') {
         const reason = after.reviewMessage || 'Not approved.';
         const title = 'Park denied ❌';
