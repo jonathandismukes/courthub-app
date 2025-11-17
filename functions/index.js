@@ -77,6 +77,42 @@ exports.enforceSingleAdminOnUserWrite = functions.firestore
   });
 
 /**
+ * HTTP: Import courts for a single city immediately (admin/debug tool).
+ * Body: { city: string, state: string, lat?: number, lon?: number, radiusMeters?: number, maxCreates?: number, dryRun?: boolean }
+ * Security: requires X-Run-Secret header matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ */
+exports.runPlacesBackfillForCityHttp = functions
+  .runWith({ timeoutSeconds: 360, memory: '1GB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+
+      const db = admin.firestore();
+      const adminUid = await getAdminUid(db);
+      const city = String(req.body?.city || '').trim();
+      const state = String(req.body?.state || '').trim().toUpperCase();
+      const lat = req.body?.lat != null ? Number(req.body.lat) : undefined;
+      const lon = req.body?.lon != null ? Number(req.body.lon) : undefined;
+      const radiusMeters = Math.max(2000, Math.min(40000, Number(req.body?.radiusMeters) || 12000));
+      const maxCreates = Math.max(1, Math.min(400, Number(req.body?.maxCreates) || 200));
+      const dryRun = req.body?.dryRun === true;
+
+      if (!city || !STATE_ISO_MAP[state]) {
+        res.status(400).json({ ok: false, error: 'city and valid 2-letter state are required' });
+        return;
+      }
+
+      const out = await importPlacesForCity({ db, adminUid: adminUid || 'system', city, state, lat: isFinite(lat) ? lat : undefined, lon: isFinite(lon) ? lon : undefined, radiusMeters, maxCreates, dryRun });
+      res.status(200).json({ ok: true, city, state, dryRun, ...out });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
  * ========================
  * PARKS GEO-CODE QUEUE DRAINER
  * ========================
@@ -128,12 +164,22 @@ async function consumeGeoapifyCalls(db, calls) {
 }
 
 // Resolve a single daily cap value shared by ALL Geoapify usage (reverse geocode + places)
+// IMPORTANT: We now allow a hard global pause via env/config and allow cap=0.
+// Ways to pause all Geoapify calls immediately after deploy:
+//  - Env var: GEOAPIFY_HARD_PAUSE=true (or '1')
+//  - functions config: geocode.pause_all=true
+//  - Set geocode.daily_cap=0 (cap may now be 0 — previously clamped)
 function getGeoapifyDailyCapValue() {
+  // Hard pause switch via env or functions config
+  const pauseRaw = getEnv('GEOAPIFY_HARD_PAUSE', getEnv('geocode.pause_all', ''));
+  const paused = String(pauseRaw || '').trim().toLowerCase();
+  if (paused === 'true' || paused === '1' || paused === 'yes') return 0;
+
   const raw = getEnv('GEOAPIFY_DAILY_CAP', getEnv('GEOCODE_DAILY_CAP', getEnv('geocode.daily_cap', '40000')));
   const n = Number(raw);
-  if (!isFinite(n) || n <= 0) return 40000;
-  // Reasonable guardrails
-  return Math.max(1000, Math.min(50000, Math.floor(n)));
+  if (!isFinite(n)) return 40000;
+  // Allow explicit 0 to fully stop calls; otherwise guardrails within [0, 50000]
+  return Math.max(0, Math.min(50000, Math.floor(n)));
 }
 
 async function runGeocodeDrainBudget(db, { budgetThisRun, cap }) {
@@ -764,7 +810,7 @@ async function fetchGeoapifyTextSearch(text, bias) {
   if (!GEOAPIFY_KEY) return null;
   // Use generic places text endpoint. Prefer a hard spatial filter so we don't
   // waste calls on results outside the target city.
-  let url = `https://api.geoapify.com/v2/places?text=${encodeURIComponent(text)}&limit=20&apiKey=${GEOAPIFY_KEY}`;
+  let url = `https://api.geoapify.com/v2/places?text=${encodeURIComponent(text)}&limit=50&apiKey=${GEOAPIFY_KEY}`;
   if (bias && typeof bias.lng === 'number' && typeof bias.lat === 'number') {
     // If a radius is provided, use a strict circle filter instead of a soft bias.
     if (typeof bias.radius === 'number' && isFinite(bias.radius) && bias.radius > 0) {
@@ -2814,25 +2860,48 @@ function buildPlaceDocId(provider, placeId) {
   return `place:${prov}:${pid}`;
 }
 
-async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radiusMeters = 16000, maxCreates = 400 }) {
+async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radiusMeters = 16000, maxCreates = 400, dryRun = false }) {
   const nowIso = new Date().toISOString();
   // Shared daily cap guardrail across ALL Geoapify usage
   const cap = getGeoapifyDailyCapValue();
   let remainingGeoToday = await getGeoapifyRemainingToday(db, cap);
   // Broaden coverage: try text queries and category queries. In many cities
   // Geoapify POIs are tagged with categories instead of matching the plain text.
-  const queries = [
-    // Basketball
-    { text: 'basketball court', sport: 'basketball' },
-    { text: 'outdoor basketball', sport: 'basketball' },
-    { text: 'basketball hoops', sport: 'basketball' },
-    // Tennis
-    { text: 'tennis court', sport: 'tennis' },
-    { text: 'tennis courts', sport: 'tennis' },
-    // Pickleball
-    { text: 'pickleball court', sport: 'pickleball' },
-    { text: 'pickleball courts', sport: 'pickleball' },
-  ];
+  // Keep the text query set lean to reduce burn; rely on categories for breadth
+  // Expanded synonyms per sport with caps per sport and total to guard cost
+  const textSynonyms = {
+    basketball: [
+      'basketball court',
+      'basketball courts',
+      'outdoor basketball',
+      'public basketball court',
+      'basketball hoop',
+      'basket ball court',
+      'streetball court',
+      'playground basketball',
+      'basketball park'
+    ],
+    tennis: [
+      'tennis court',
+      'tennis courts',
+      'public tennis',
+      'tennis center',
+      'tennis centre',
+      'tennis complex',
+      'tennis club',
+      'community tennis'
+    ],
+    pickleball: [
+      'pickleball court',
+      'pickleball courts',
+      'public pickleball',
+      'pickleball center',
+      'pickleball complex',
+      'pickleball club',
+      'pickleball park',
+      'community pickleball'
+    ],
+  };
 
   const categoryQueries = [
     { categories: ['sport.basketball'], sport: 'basketball' },
@@ -2842,14 +2911,9 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
   const bias = (isFinite(lat) && isFinite(lon)) ? { lat, lng: lon, radius: Math.max(4000, Math.min(26000, Math.floor(radiusMeters))) } : null;
   const aggregated = new Map(); // key=id -> { place, sports:Set }
 
-  // Try to resolve strict city boundary first; if not available, fall back to radius bias
+  // Skip resolving a strict city boundary to avoid an extra call that often returns 0 results
+  // and to prevent boundary clipping from hiding courts just outside the admin polygon.
   let cityPlaceId = null;
-  try {
-    if (remainingGeoToday > 0) {
-      cityPlaceId = await fetchGeoapifyCityPlaceId({ city, state, lat, lon });
-      if (cityPlaceId) { try { await consumeGeoapifyCalls(db, 1); } catch (_) {} remainingGeoToday -= 1; }
-    }
-  } catch (_) { cityPlaceId = null; }
 
   // Helper that merges a list of standardized places into aggregator
   const takeAll = (list, sport) => {
@@ -2867,32 +2931,43 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     }
   };
 
-  // 1) Text queries first
-  for (const q of queries) {
+  // 1) Text queries first (always with a concrete circle filter around the city centroid)
+  const TEXT_PER_SPORT_CAP = 4; // max text calls per sport
+  const TEXT_TOTAL_CAP = 12;    // overall cap across sports
+  let textCallsUsed = 0;
+  const sportOrder = ['basketball', 'tennis', 'pickleball'];
+  for (const sport of sportOrder) {
     if (aggregated.size >= maxCreates) break;
-    if (remainingGeoToday <= 0) {
-      console.log('[placesImport] Geoapify daily cap reached; stopping queries');
-      break;
+    const syns = textSynonyms[sport] || [];
+    let perSportUsed = 0;
+    for (const base of syns) {
+      if (aggregated.size >= maxCreates) break;
+      if (remainingGeoToday <= 0) break;
+      if (perSportUsed >= TEXT_PER_SPORT_CAP) break;
+      if (textCallsUsed >= TEXT_TOTAL_CAP) break;
+      // If we already have solid coverage for this sport, skip remaining synonyms
+      const preCountForSport = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
+      if (preCountForSport >= Math.min(60, Math.floor(maxCreates / 2))) break;
+      let list = [];
+      try {
+        const q = base + (city && state ? ` in ${city}, ${state}` : '');
+        const out = await fetchGeoapifyTextSearch(q, bias);
+        if (out) {
+          list = out;
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+          remainingGeoToday -= 1;
+          perSportUsed += 1;
+          textCallsUsed += 1;
+        }
+      } catch (_) { /* ignore */ }
+      if (Array.isArray(list) && list.length > 0) {
+        takeAll(list, sport);
+        // If this synonym produced no new entries (all dups), continue to next synonym
+        const postCountForSport = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
+        // If after adding we crossed a reasonable threshold, stop for this sport
+        if (postCountForSport >= Math.min(80, Math.floor(maxCreates * 0.7))) break;
+      }
     }
-    let list = [];
-    try {
-      let out = null;
-      if (cityPlaceId) {
-        // Boundary-constrained search to avoid cross-city mislabeling
-        out = await fetchGeoapifyTextSearchInCity({ cityPlaceId, text: q.text, limit: 50 });
-      } else {
-        // Fallback to proximity + radius around the city's centroid
-        out = await fetchGeoapifyTextSearch(q.text + (city && state ? ` in ${city}, ${state}` : ''), bias);
-      }
-      if (out) {
-        list = out;
-        try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
-        remainingGeoToday -= 1;
-      } else {
-        list = [];
-      }
-    } catch (_) { list = []; }
-    takeAll(list, q.sport);
   }
 
   // 2) Category queries as a fallback/expansion pass
@@ -2901,10 +2976,7 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     if (remainingGeoToday <= 0) break;
     try {
       const cats = q.categories.join(',');
-      // NOTE: We've seen Geoapify return empty sets for categories when used
-      // with filter=place:<place_id> in some regions. To avoid wasting calls,
-      // always apply a concrete circle filter around the city centroid instead
-      // of place-boundary for category lookups.
+      // Always apply a concrete circle filter around the city centroid for categories.
       let url = `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(cats)}&limit=${Math.max(1, Math.min(100, maxCreates))}&apiKey=${GEOAPIFY_KEY}`;
       if (bias) {
         url += `&filter=circle:${bias.lng},${bias.lat},${Math.max(2000, Math.min(40000, bias.radius || 16000))}`;
@@ -2918,6 +2990,24 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
         remainingGeoToday -= 1;
       }
     } catch (_) { /* ignore */ }
+  }
+
+  // 3) If still nothing found, try a stricter in-city boundary filter once (extra call)
+  if (aggregated.size === 0 && remainingGeoToday > 0 && city && state) {
+    try {
+      const placeId = await fetchGeoapifyCityPlaceId({ city, state, lat, lon });
+      if (placeId) {
+        // Try a single basketball text search within the admin boundary to validate signal
+        const list = await fetchGeoapifyTextSearchInCity({ cityPlaceId: placeId, text: 'basketball court', limit: 50 });
+        if (Array.isArray(list) && list.length > 0) {
+          takeAll(list, 'basketball');
+        }
+        try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+        remainingGeoToday -= 1;
+      }
+    } catch (e) {
+      // ignore, fall through
+    }
   }
 
   let created = 0;
@@ -2986,6 +3076,12 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
       friendlyName = fallbackNameFromContext({ original: friendlyName, address: m.address || '', city, sport: primary });
     }
 
+    // If dryRun, skip writes but still count as would-create
+    if (dryRun) {
+      created += 1;
+      continue;
+    }
+
     await ref.set({
       id: docId,
       name: titleCase(friendlyName),
@@ -3025,7 +3121,236 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
     created += 1;
   }
 
+  if (aggregated.size === 0) {
+    console.log('[placesImport] zero results for', { city, state, lat, lon, radiusMeters });
+  }
+
   return { created, skippedExists, totalConsidered: aggregated.size };
+}
+
+/**
+ * Simple importer that writes parks immediately with address/city/state resolved inline.
+ * - No geocode queue is used.
+ * - Uses the same Geoapify text+category search aggregator as importPlacesForCity
+ * - Optionally performs reverse geocode per created park to ensure city/state
+ *
+ * Params:
+ * { city, state, lat, lon, radiusMeters, maxCreates, dryRun, inlineReverse }
+ */
+async function importPlacesForCitySimple({ db, adminUid, city, state, lat, lon, radiusMeters = 16000, maxCreates = 200, dryRun = false, inlineReverse = true }) {
+  const nowIso = new Date().toISOString();
+  const cap = getGeoapifyDailyCapValue();
+  let remainingGeoToday = await getGeoapifyRemainingToday(db, cap);
+
+  const textSynonyms = {
+    basketball: [
+      'basketball court', 'basketball courts', 'outdoor basketball', 'public basketball court',
+      'basketball hoop', 'basket ball court', 'streetball court', 'playground basketball', 'basketball park'
+    ],
+    tennis: [
+      'tennis court', 'tennis courts', 'public tennis', 'tennis center', 'tennis centre', 'tennis complex', 'tennis club', 'community tennis'
+    ],
+    pickleball: [
+      'pickleball court', 'pickleball courts', 'public pickleball', 'pickleball center', 'pickleball complex', 'pickleball club', 'pickleball park', 'community pickleball'
+    ],
+  };
+
+  const categoryQueries = [
+    { categories: ['sport.basketball'], sport: 'basketball' },
+    { categories: ['sport.tennis'], sport: 'tennis' },
+    { categories: ['sport.pickleball'], sport: 'pickleball' },
+  ];
+
+  const bias = (isFinite(lat) && isFinite(lon)) ? { lat, lng: lon, radius: Math.max(4000, Math.min(26000, Math.floor(radiusMeters))) } : null;
+  const aggregated = new Map(); // key=id -> { place, sports:Set }
+
+  const takeAll = (list, sport) => {
+    for (const raw of (list || [])) {
+      const m = normalizeStdPlace(raw);
+      if (!m) continue;
+      const key = buildPlaceDocId(m.provider, m.id) || `${m.name}_${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
+      const entry = aggregated.get(key) || { place: m, sports: new Set() };
+      entry.sports.add(sport);
+      if ((m.name || '').length > (entry.place.name || '').length) entry.place.name = m.name;
+      if ((m.address || '').length > (entry.place.address || '').length) entry.place.address = m.address;
+      aggregated.set(key, entry);
+      if (aggregated.size >= maxCreates) break;
+    }
+  };
+
+  const TEXT_PER_SPORT_CAP = 4;
+  const TEXT_TOTAL_CAP = 12;
+  let textCallsUsed = 0;
+  const sportOrder = ['basketball', 'tennis', 'pickleball'];
+  for (const sport of sportOrder) {
+    if (aggregated.size >= maxCreates) break;
+    const syns = textSynonyms[sport] || [];
+    let perSportUsed = 0;
+    for (const base of syns) {
+      if (aggregated.size >= maxCreates) break;
+      if (remainingGeoToday <= 0) break;
+      if (perSportUsed >= TEXT_PER_SPORT_CAP) break;
+      if (textCallsUsed >= TEXT_TOTAL_CAP) break;
+      const preCountForSport = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
+      if (preCountForSport >= Math.min(60, Math.floor(maxCreates / 2))) break;
+      let list = [];
+      try {
+        const q = base + (city && state ? ` in ${city}, ${state}` : '');
+        const out = await fetchGeoapifyTextSearch(q, bias);
+        if (out) {
+          list = out;
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+          remainingGeoToday -= 1;
+          perSportUsed += 1;
+          textCallsUsed += 1;
+        }
+      } catch (_) { /* ignore */ }
+      if (Array.isArray(list) && list.length > 0) {
+        takeAll(list, sport);
+        const postCountForSport = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
+        if (postCountForSport >= Math.min(80, Math.floor(maxCreates * 0.7))) break;
+      }
+    }
+  }
+
+  for (const q of categoryQueries) {
+    if (aggregated.size >= maxCreates) break;
+    if (remainingGeoToday <= 0) break;
+    try {
+      const cats = q.categories.join(',');
+      let url = `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(cats)}&limit=${Math.max(1, Math.min(100, maxCreates))}&apiKey=${GEOAPIFY_KEY}`;
+      if (bias) {
+        url += `&filter=circle:${bias.lng},${bias.lat},${Math.max(2000, Math.min(40000, bias.radius || 16000))}`;
+      }
+      const res = await httpRequest('GET', url);
+      if (res.ok) {
+        const data = await res.json();
+        const std = standardizePlacesFromGeoapify(Array.isArray(data.features) ? data.features : []);
+        takeAll(std, q.sport);
+        try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+        remainingGeoToday -= 1;
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  let created = 0;
+  let skippedExists = 0;
+  let rgCalls = 0;
+  for (const [key, entry] of aggregated.entries()) {
+    if (created >= maxCreates) break;
+    const m = entry.place;
+    const sports = Array.from(entry.sports);
+    const docId = buildPlaceDocId(m.provider, m.id) || key;
+
+    // Dedupe by loc key
+    const locKey = `ll:${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
+    const locRef = db.collection('parkLocIndex').doc(locKey);
+    const locSnap = await locRef.get().catch(() => null);
+    if (locSnap && locSnap.exists) {
+      const target = locSnap.data() && locSnap.data().parkId;
+      if (target) {
+        try {
+          await db.collection('parks').doc(target).set({
+            altSources: admin.firestore.FieldValue.arrayUnion({ type: 'places', ref: `${m.provider}:${m.id}` }),
+            updatedAt: nowIso,
+          }, { merge: true });
+        } catch (_) {}
+        skippedExists += 1;
+        continue;
+      }
+    }
+
+    const ref = db.collection('parks').doc(docId);
+    const exists = await ref.get();
+    if (exists.exists) { skippedExists += 1; continue; }
+
+    // Build courts
+    const hasLighting = false;
+    const courts = [];
+    let seq = 0;
+    const mapSportType = (s) => s === 'tennis' ? 'tennisSingles' : (s === 'pickleball' ? 'pickleballSingles' : 'basketball');
+    const mapCourtType = (s) => s === 'tennis' ? 'tennisSingles' : (s === 'pickleball' ? 'pickleballSingles' : 'fullCourt');
+    for (const s of sports) {
+      seq += 1;
+      courts.push({ id: `c${seq}`, courtNumber: seq, customName: null, playerCount: 0, sportType: mapSportType(s), type: mapCourtType(s), condition: 'good', hasLighting, isHalfCourt: false, isIndoor: false, surface: null, lastUpdated: nowIso, conditionNotes: null, gotNextQueue: [] });
+    }
+    if (courts.length === 0) {
+      courts.push({ id: 'c1', courtNumber: 1, customName: null, playerCount: 0, sportType: 'basketball', type: 'fullCourt', condition: 'good', hasLighting, isHalfCourt: false, isIndoor: false, surface: null, lastUpdated: nowIso, conditionNotes: null, gotNextQueue: [] });
+    }
+    const sportCategories = Array.from(new Set(courts.map(ct => ct.sportType.includes('pickle') ? 'pickleball' : (ct.sportType.includes('tennis') ? 'tennis' : 'basketball')))).sort();
+
+    // Friendly name and address
+    let friendlyName = m.name && String(m.name).trim();
+    let address = String(m.address || '').trim();
+    let cityOut = city || '';
+    let stateOut = canonState(state || '');
+    if (!friendlyName || /^(basketball|tennis|pickleball) court(s)?$/i.test(friendlyName) || /^(court|courts)\s*\d*$/i.test(friendlyName)) {
+      const primary = courts[0] && courts[0].sportType && (courts[0].sportType.includes('pickle') ? 'pickleball' : (courts[0].sportType.includes('tennis') ? 'tennis' : 'basketball'));
+      friendlyName = fallbackNameFromContext({ original: friendlyName, address, city: cityOut, sport: primary });
+    }
+    // Try to parse city/state from formatted address if not explicitly provided
+    if (!cityOut || !stateOut) {
+      const parsed = parseCityStateFromAddress(address);
+      if (!cityOut && parsed.city) cityOut = parsed.city;
+      if (!stateOut && parsed.state) stateOut = parsed.state;
+    }
+    // Inline reverse geocode to improve address/city/state if requested and budget remains
+    if (inlineReverse && remainingGeoToday > 0) {
+      try {
+        const rg = await fetchGeoapifyReverse(m.lat, m.lon);
+        if (rg) {
+          address = rg.address || address;
+          if (!cityOut && rg.city) cityOut = rg.city;
+          if (!stateOut && rg.state) stateOut = canonState(rg.state);
+          try { await consumeGeoapifyCalls(db, 1); } catch (_) {}
+          remainingGeoToday -= 1;
+          rgCalls += 1;
+        }
+      } catch (_) { /* ignore */ }
+    }
+
+    if (dryRun) { created += 1; continue; }
+
+    await ref.set({
+      id: docId,
+      name: titleCase(friendlyName),
+      address: address || '',
+      city: cityOut || '',
+      state: canonState(stateOut || ''),
+      latitude: m.lat,
+      longitude: m.lon,
+      courts,
+      sportCategories,
+      photoUrls: [],
+      amenities: [],
+      averageRating: 0.0,
+      totalReviews: 0,
+      description: null,
+      approved: true,
+      reviewStatus: 'approved',
+      createdByUserId: adminUid || 'system',
+      createdByName: 'Places Simple Import',
+      approvedByUserId: adminUid || 'system',
+      approvedAt: nowIso,
+      reviewedByUserId: adminUid || 'system',
+      reviewedAt: nowIso,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      source: 'places',
+      sourceId: `${m.provider}:${m.id}`,
+      sourceAttribution: 'Geoapify',
+      needsGeocode: false,
+    }, { merge: false });
+
+    try { await locRef.set({ parkId: docId, lat: m.lat, lon: m.lon, state: canonState(stateOut || ''), registeredAt: nowIso }, { merge: false }); } catch (_) {}
+    created += 1;
+  }
+
+  if (aggregated.size === 0) {
+    console.log('[geoSimpleImport] zero results for', { city, state, lat, lon, radiusMeters });
+  }
+
+  return { created, skippedExists, totalConsidered: aggregated.size, reverseCalls: rgCalls };
 }
 
 // Callable: Seed Places backlog for a state using Overpass city discovery
@@ -3175,6 +3500,9 @@ exports.scheduledSeedPlacesBacklogAllStates = functions
   });
 
 // Scheduler: consume one Places backlog task per run
+// Now honors a Firestore config kill switch:
+//   imports/places/config/drainer { enabled: boolean, maxTasksPerRun?: number, estCallsPerCity?: number }
+// Default: disabled until explicitly enabled to prevent accidental API burn.
 exports.scheduledPlacesBackfillCityBatch = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
   .pubsub
@@ -3186,10 +3514,25 @@ exports.scheduledPlacesBackfillCityBatch = functions
     const statusRef = db.collection('imports').doc('places');
     const adminUid = await getAdminUid(db);
     const nowIso = new Date().toISOString();
+    // Read drainer config (kill switch + throttle)
+    let DR_CFG = { enabled: false, maxTasksPerRun: 3, estCallsPerCity: 12 };
+    try {
+      const cfgDoc = await statusRef.collection('config').doc('drainer').get();
+      if (cfgDoc.exists) {
+        const d = cfgDoc.data() || {};
+        DR_CFG.enabled = d.enabled === true; // default OFF
+        if (isFinite(Number(d.maxTasksPerRun))) DR_CFG.maxTasksPerRun = Math.max(1, Math.min(30, Number(d.maxTasksPerRun)));
+        if (isFinite(Number(d.estCallsPerCity))) DR_CFG.estCallsPerCity = Math.max(2, Math.min(20, Number(d.estCallsPerCity)));
+      }
+    } catch (_) { /* keep defaults */ }
+
+    if (!DR_CFG.enabled) {
+      await statusRef.set({ lastRunAt: nowIso, lastNote: 'drainer disabled (imports/places/config/drainer.enabled=false)' }, { merge: true }).catch(() => {});
+      return null;
+    }
     // Allow tuning how many backlog city tasks we consume per run
     // Note: this is further constrained by remaining daily budget
-    // Throttle to reduce Geoapify burn while we tune queries.
-    const MAX_TASKS_PER_RUN = 8;
+    const MAX_TASKS_PER_RUN = DR_CFG.maxTasksPerRun;
     // Run lease to avoid overlap
     const lease = await tryAcquireLease(db, statusRef, { leaseField: 'runLease', owner: `places:${Math.random().toString(36).slice(2)}`, ttlMs: 12 * 60 * 1000 });
     if (!lease.acquired) {
@@ -3197,7 +3540,7 @@ exports.scheduledPlacesBackfillCityBatch = functions
       return null;
     }
     try {
-      // Budget-aware concurrency: estimate ~7 Geoapify calls per city (1 for city id + ~6 queries)
+      // Budget-aware concurrency: estimate ~12 Geoapify calls per city after synonym expansion
       const dailyCap = getGeoapifyDailyCapValue();
       const remaining = await getGeoapifyRemainingToday(db, dailyCap);
       if (remaining <= 0) {
@@ -3205,10 +3548,8 @@ exports.scheduledPlacesBackfillCityBatch = functions
         await releaseLease(db, statusRef, { leaseField: 'runLease' });
         return null;
       }
-      // Approximate: 1 call to resolve city boundary + several text queries + category queries
-      // Keep a conservative estimate to avoid overrunning daily cap.
-      // With tightened circle filters there are fewer retries; be conservative.
-      const estCallsPerCity = 8;
+      // Approximate: several Geoapify calls per city; configurable to stay under cap
+      const estCallsPerCity = DR_CFG.estCallsPerCity;
       const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
       const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
 
@@ -3225,6 +3566,7 @@ exports.scheduledPlacesBackfillCityBatch = functions
       }
 
       let totalCreated = 0;
+      let totalSkipped = 0;
       let processed = 0;
       for (const doc of q.docs) {
         // Re-check cap between cities
@@ -3236,9 +3578,10 @@ exports.scheduledPlacesBackfillCityBatch = functions
         const res = await importPlacesForCity({ db, adminUid: adminUid || 'system', city: task.cityName || '', state: task.state || '', lat: Number(task.lat), lon: Number(task.lon), radiusMeters: radiusM, maxCreates: 300 });
         await doc.ref.set({ status: 'done', finishedAt: new Date().toISOString(), created: res.created, skippedExists: res.skippedExists }, { merge: true });
         totalCreated += Number(res.created || 0);
+        totalSkipped += Number(res.skippedExists || 0);
         processed += 1;
       }
-      await statusRef.set({ lastRunAt: nowIso, lastNote: `processed ${processed} city task(s)`, created: totalCreated }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, lastNote: `processed ${processed} city task(s)`, created: totalCreated, skipped: totalSkipped }, { merge: true });
       await releaseLease(db, statusRef, { leaseField: 'runLease' });
       return null;
     } catch (e) {
@@ -3398,7 +3741,7 @@ exports.runPlacesBackfillCityBatchHttp = functions
         res.status(200).json({ ok: true, processed: 0, created: 0, note: 'daily cap reached' });
         return;
       }
-      const estCallsPerCity = 8;
+      const estCallsPerCity = 12;
       const maxCitiesByBudget = Math.max(1, Math.floor(remaining / estCallsPerCity));
       const targetBatch = Math.max(5, Math.min(MAX_TASKS_PER_RUN, maxCitiesByBudget));
 
@@ -3412,6 +3755,7 @@ exports.runPlacesBackfillCityBatchHttp = functions
       }
 
       let totalCreated = 0;
+      let totalSkipped = 0;
       let processed = 0;
       for (const doc of q.docs) {
         const remainingNow = await getGeoapifyRemainingToday(db, dailyCap);
@@ -3422,10 +3766,353 @@ exports.runPlacesBackfillCityBatchHttp = functions
         const resCity = await importPlacesForCity({ db, adminUid: adminUid || 'system', city: task.cityName || '', state: task.state || '', lat: Number(task.lat), lon: Number(task.lon), radiusMeters: radiusM, maxCreates: 300 });
         await doc.ref.set({ status: 'done', finishedAt: new Date().toISOString(), created: resCity.created, skippedExists: resCity.skippedExists }, { merge: true });
         totalCreated += Number(resCity.created || 0);
+        totalSkipped += Number(resCity.skippedExists || 0);
         processed += 1;
       }
       await statusRef.set({ lastRunAt: nowIso, lastNote: `processed ${processed} city task(s)`, created: totalCreated }, { merge: true });
-      res.status(200).json({ ok: true, processed, created: totalCreated });
+      res.status(200).json({ ok: true, processed, created: totalCreated, skipped: totalSkipped });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * HTTP: Direct Geoapify importer (no queue/drainer). Writes parks immediately.
+ * Security: requires X-Run-Secret header matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ * Body: { city, state, lat, lon, radiusMeters, maxCreates, dryRun, inlineReverse }
+ */
+exports.geoSimpleImportHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+
+      const db = admin.firestore();
+      const adminUid = await getAdminUid(db);
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const city = String(body.city || '').trim();
+      const state = String(body.state || '').trim();
+      const lat = body.lat != null ? Number(body.lat) : undefined;
+      const lon = body.lon != null ? Number(body.lon) : undefined;
+      const radiusMeters = Math.max(2000, Math.min(40000, Number(body.radiusMeters) || 12000));
+      const maxCreates = Math.max(1, Math.min(400, Number(body.maxCreates) || 200));
+      const dryRun = body.dryRun === true;
+      const inlineReverse = body.inlineReverse !== false; // default true
+
+      if (!((city && state) || (isFinite(lat) && isFinite(lon)))) {
+        res.status(400).json({ ok: false, error: 'Provide city+state or lat+lon' });
+        return;
+      }
+
+      const out = await importPlacesForCitySimple({ db, adminUid: adminUid || 'system', city, state, lat: isFinite(lat) ? lat : undefined, lon: isFinite(lon) ? lon : undefined, radiusMeters, maxCreates, dryRun, inlineReverse });
+      res.status(200).json({ ok: true, city, state: canonState(state || ''), dryRun, ...out });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * Scheduled: Rotate through configured target cities and run geoSimpleImport once per tick.
+ * Config path: imports/geoSimple (doc)
+ *  - enabled: boolean (default false)
+ *  - useWindow: boolean (default true; honors nightly window)
+ *  - nextIndex: number (managed by scheduler)
+ * Targets path: imports/geoSimple/targets (collection)
+ *  - { city, state, lat, lon, radiusKm, maxCreates }
+ */
+exports.scheduledGeoSimpleImportBatch = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub
+  .schedule('every 10 minutes')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const statusRef = db.collection('imports').doc('geoSimple');
+    const targetsColl = statusRef.collection('targets');
+    const nowIso = new Date().toISOString();
+    try {
+      const statSnap = await statusRef.get().catch(() => null);
+      const cfg = statSnap && statSnap.exists ? (statSnap.data() || {}) : {};
+      const enabled = cfg.enabled === true; // default OFF for safety
+      if (!enabled) {
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: disabled' }, { merge: true }).catch(() => {});
+        return null;
+      }
+      const useWindow = cfg.useWindow !== false; // default true
+      if (useWindow) {
+        const allowed = await isWithinNightlyWindowUtc(db);
+        if (!allowed) {
+          await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: outside nightly window' }, { merge: true }).catch(() => {});
+          return null;
+        }
+      }
+
+      const tSnap = await targetsColl.get();
+      if (tSnap.empty) {
+        await statusRef.set({ lastRunAt: nowIso, lastNote: 'no targets' }, { merge: true }).catch(() => {});
+        return null;
+      }
+      // Deterministic West→East ordering, then by city name
+      const stateOrderIndex = new Map(WEST_TO_EAST_STATE_ORDER.map((s, i) => [s, i]));
+      const targets = tSnap.docs.map(d => ({ id: d.id, ...(d.data()||{}) }));
+      const sortedTargets = targets.slice().sort((a, b) => {
+        const sa = canonState(a.state || '');
+        const sb = canonState(b.state || '');
+        const ia = stateOrderIndex.has(sa) ? stateOrderIndex.get(sa) : Number.MAX_SAFE_INTEGER;
+        const ib = stateOrderIndex.has(sb) ? stateOrderIndex.get(sb) : Number.MAX_SAFE_INTEGER;
+        if (ia !== ib) return ia - ib;
+        const ca = String(a.city || '').trim().toLowerCase();
+        const cb = String(b.city || '').trim().toLowerCase();
+        if (ca < cb) return -1;
+        if (ca > cb) return 1;
+        return 0;
+      });
+      let nextIndex = Math.max(0, Math.min(sortedTargets.length - 1, Number(cfg.nextIndex) || 0));
+      const target = sortedTargets[nextIndex];
+      nextIndex = (nextIndex + 1) % sortedTargets.length;
+
+      const adminUid = await getAdminUid(db);
+      const city = String(target.city || '').trim();
+      const state = String(target.state || '').trim();
+      const lat = Number(target.lat);
+      const lon = Number(target.lon);
+      const radiusMeters = Math.max(2000, Math.min(40000, Math.round((Number(target.radiusKm)||10) * 1000)));
+      const maxCreates = Math.max(1, Math.min(400, Number(target.maxCreates) || 200));
+
+      const resSimple = await importPlacesForCitySimple({ db, adminUid: adminUid || 'system', city, state, lat: isFinite(lat)?lat:undefined, lon: isFinite(lon)?lon:undefined, radiusMeters, maxCreates, dryRun: false, inlineReverse: true });
+      await statusRef.set({ lastRunAt: nowIso, lastRunCity: city, lastRunState: canonState(state || ''), lastCreated: resSimple.created, lastTotalConsidered: resSimple.totalConsidered, nextIndex }, { merge: true });
+      // Log per run
+      const runId = `${nowIso.replace(/[:.]/g, '-')}_${city || 'coord'}_${state || 'NA'}`.slice(0, 120);
+      try { await statusRef.collection('logs').doc(runId).set({ runId, ts: nowIso, ok: true, target, result: resSimple }); } catch (_) {}
+      return null;
+    } catch (e) {
+      try { await statusRef.set({ lastRunAt: nowIso, lastErrorAt: nowIso, lastError: (e && e.message) ? String(e.message).slice(0, 300) : String(e).slice(0, 300) }, { merge: true }); } catch (_) {}
+      return null;
+    }
+  });
+
+/**
+ * HTTP: Seed imports/geoSimple/targets with curated Tier 1–3 metro split targets.
+ * One‑time admin endpoint so you don’t have to create dozens of docs manually.
+ *
+ * Security: requires X-Run-Secret matching BACKFILL_RUN_SECRET/backfill.run_secret
+ * Body (optional):
+ *  - preset: 'all' | 'tier1' | 'tier2' | 'tier3' (default 'all')
+ *  - overwrite: boolean (default false) — if true, update existing targets' radius/maxCreates
+ *  - dryRun: boolean (default false) — preview without writing
+ *  - enableNow: boolean (default false) — also set imports/geoSimple.enabled=true and optionally useWindow
+ *  - useWindow: boolean (default true) — when enableNow=true, sets nightly window honoring flag
+ */
+exports.seedGeoSimpleTargetsHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+
+      const db = admin.firestore();
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const preset = String(body.preset || 'all').toLowerCase();
+      const overwrite = body.overwrite === true;
+      const dryRun = body.dryRun === true;
+      const enableNow = body.enableNow === true;
+      const useWindow = body.useWindow !== false; // default true when enabling
+
+      // Helper to clamp values within scheduler guardrails
+      const clampRadius = (km) => Math.max(2, Math.min(40, Math.round(Number(km) || 10)));
+      const clampCreates = (n) => Math.max(1, Math.min(400, Math.round(Number(n) || 200)));
+
+      // Curated split targets across Tier 1–3 metros. Tuned for coverage and scheduler clamps.
+      // Each item: { id, tier, city, state, lat, lon, radiusKm, maxCreates }
+      const curated = [
+        // Tier 1 — NYC metro
+        { id: 'nyc_manhattan', tier: 1, city: 'Manhattan', state: 'NY', lat: 40.7831, lon: -73.9712, radiusKm: 12, maxCreates: 400 },
+        { id: 'nyc_brooklyn', tier: 1, city: 'Brooklyn', state: 'NY', lat: 40.6782, lon: -73.9442, radiusKm: 15, maxCreates: 400 },
+        { id: 'nyc_queens', tier: 1, city: 'Queens', state: 'NY', lat: 40.7282, lon: -73.7949, radiusKm: 18, maxCreates: 400 },
+        { id: 'nyc_bronx', tier: 1, city: 'Bronx', state: 'NY', lat: 40.8448, lon: -73.8648, radiusKm: 10, maxCreates: 350 },
+        { id: 'nyc_staten_island', tier: 1, city: 'Staten Island', state: 'NY', lat: 40.5795, lon: -74.1502, radiusKm: 12, maxCreates: 250 },
+        { id: 'nj_jersey_city_newark', tier: 1, city: 'Jersey City/Newark', state: 'NJ', lat: 40.7282, lon: -74.0776, radiusKm: 16, maxCreates: 380 },
+        { id: 'ny_nassau_west', tier: 1, city: 'Nassau (West)', state: 'NY', lat: 40.7380, lon: -73.5840, radiusKm: 18, maxCreates: 380 },
+        { id: 'ny_westchester', tier: 1, city: 'Westchester', state: 'NY', lat: 41.0330, lon: -73.7629, radiusKm: 15, maxCreates: 350 },
+        { id: 'ny_long_island_central', tier: 1, city: 'Long Island (Central)', state: 'NY', lat: 40.7891, lon: -73.1350, radiusKm: 22, maxCreates: 380 },
+        { id: 'ct_stamford_norwalk', tier: 1, city: 'Stamford/Norwalk', state: 'CT', lat: 41.0670, lon: -73.5170, radiusKm: 14, maxCreates: 320 },
+
+        // Tier 1 — Los Angeles/OC
+        { id: 'la_downtown_basin', tier: 1, city: 'Los Angeles (Downtown/Basin)', state: 'CA', lat: 34.0407, lon: -118.2468, radiusKm: 16, maxCreates: 380 },
+        { id: 'la_san_fernando_valley', tier: 1, city: 'San Fernando Valley', state: 'CA', lat: 34.2000, lon: -118.4500, radiusKm: 18, maxCreates: 380 },
+        { id: 'la_westside_santamonica', tier: 1, city: 'Westside/Santa Monica', state: 'CA', lat: 34.0195, lon: -118.4912, radiusKm: 14, maxCreates: 350 },
+        { id: 'la_south_la_inglewood', tier: 1, city: 'South LA/Inglewood', state: 'CA', lat: 33.9550, lon: -118.3530, radiusKm: 14, maxCreates: 350 },
+        { id: 'la_long_beach', tier: 1, city: 'Long Beach', state: 'CA', lat: 33.7701, lon: -118.1937, radiusKm: 12, maxCreates: 320 },
+        { id: 'oc_anaheim_north', tier: 1, city: 'Anaheim/Fullerton', state: 'CA', lat: 33.8366, lon: -117.9143, radiusKm: 16, maxCreates: 350 },
+        { id: 'oc_irvine_south', tier: 1, city: 'Irvine', state: 'CA', lat: 33.6846, lon: -117.8265, radiusKm: 16, maxCreates: 350 },
+        { id: 'la_san_gabriel_valley', tier: 1, city: 'Pasadena/San Gabriel', state: 'CA', lat: 34.1478, lon: -118.1445, radiusKm: 16, maxCreates: 350 },
+
+        // Tier 1 — Chicago
+        { id: 'chi_core', tier: 1, city: 'Chicago (Loop)', state: 'IL', lat: 41.8781, lon: -87.6298, radiusKm: 14, maxCreates: 360 },
+        { id: 'chi_north_side', tier: 1, city: 'Chicago North Side', state: 'IL', lat: 41.9530, lon: -87.6540, radiusKm: 12, maxCreates: 320 },
+        { id: 'chi_south_side', tier: 1, city: 'Chicago South Side', state: 'IL', lat: 41.7440, lon: -87.6040, radiusKm: 14, maxCreates: 340 },
+        { id: 'chi_oak_park', tier: 1, city: 'Oak Park/West Suburbs', state: 'IL', lat: 41.8850, lon: -87.7845, radiusKm: 12, maxCreates: 300 },
+        { id: 'chi_schaumburg', tier: 1, city: 'Schaumburg/NW Suburbs', state: 'IL', lat: 42.0334, lon: -88.0834, radiusKm: 12, maxCreates: 280 },
+        { id: 'chi_orland_park', tier: 1, city: 'Orland Park/SW Suburbs', state: 'IL', lat: 41.6303, lon: -87.8539, radiusKm: 12, maxCreates: 260 },
+
+        // Tier 1 — Houston
+        { id: 'houston_core', tier: 1, city: 'Houston', state: 'TX', lat: 29.7604, lon: -95.3698, radiusKm: 20, maxCreates: 380 },
+        { id: 'houston_katy', tier: 1, city: 'Katy/West Houston', state: 'TX', lat: 29.7858, lon: -95.8245, radiusKm: 18, maxCreates: 320 },
+        { id: 'houston_woodlands', tier: 1, city: 'The Woodlands', state: 'TX', lat: 30.1658, lon: -95.4613, radiusKm: 14, maxCreates: 260 },
+        { id: 'houston_sugar_land', tier: 1, city: 'Sugar Land', state: 'TX', lat: 29.6197, lon: -95.6349, radiusKm: 14, maxCreates: 260 },
+        { id: 'houston_bay_area', tier: 1, city: 'Pasadena/Clear Lake', state: 'TX', lat: 29.6150, lon: -95.1500, radiusKm: 14, maxCreates: 280 },
+
+        // Tier 1 — Dallas–Fort Worth
+        { id: 'dfw_dallas_core', tier: 1, city: 'Dallas', state: 'TX', lat: 32.7767, lon: -96.7970, radiusKm: 16, maxCreates: 360 },
+        { id: 'dfw_north_plano', tier: 1, city: 'Plano/Richardson', state: 'TX', lat: 33.0198, lon: -96.6989, radiusKm: 14, maxCreates: 300 },
+        { id: 'dfw_fort_worth', tier: 1, city: 'Fort Worth', state: 'TX', lat: 32.7555, lon: -97.3308, radiusKm: 16, maxCreates: 340 },
+        { id: 'dfw_arlington', tier: 1, city: 'Arlington/Grand Prairie', state: 'TX', lat: 32.7357, lon: -97.1081, radiusKm: 14, maxCreates: 300 },
+        { id: 'dfw_frisco_mckinney', tier: 1, city: 'Frisco/McKinney', state: 'TX', lat: 33.1507, lon: -96.8236, radiusKm: 12, maxCreates: 260 },
+
+        // Tier 1 — Miami–Fort Lauderdale–WPB
+        { id: 'mia_core', tier: 1, city: 'Miami', state: 'FL', lat: 25.7617, lon: -80.1918, radiusKm: 14, maxCreates: 360 },
+        { id: 'mia_hialeah', tier: 1, city: 'Hialeah/Miami NW', state: 'FL', lat: 25.8699, lon: -80.3029, radiusKm: 12, maxCreates: 300 },
+        { id: 'mia_kendall', tier: 1, city: 'Kendall/West Kendall', state: 'FL', lat: 25.6670, lon: -80.3573, radiusKm: 12, maxCreates: 280 },
+        { id: 'miami_beach', tier: 1, city: 'Miami Beach', state: 'FL', lat: 25.7907, lon: -80.1300, radiusKm: 10, maxCreates: 240 },
+        { id: 'fll_core', tier: 1, city: 'Fort Lauderdale', state: 'FL', lat: 26.1224, lon: -80.1373, radiusKm: 12, maxCreates: 300 },
+        { id: 'wpb_core', tier: 1, city: 'West Palm Beach', state: 'FL', lat: 26.7153, lon: -80.0534, radiusKm: 12, maxCreates: 260 },
+
+        // Tier 1 — SF Bay Area
+        { id: 'sf_city', tier: 1, city: 'San Francisco', state: 'CA', lat: 37.7749, lon: -122.4194, radiusKm: 10, maxCreates: 320 },
+        { id: 'oakland_berkeley', tier: 1, city: 'Oakland/Berkeley', state: 'CA', lat: 37.8044, lon: -122.2711, radiusKm: 12, maxCreates: 320 },
+        { id: 'san_jose', tier: 1, city: 'San Jose', state: 'CA', lat: 37.3382, lon: -121.8863, radiusKm: 14, maxCreates: 340 },
+        { id: 'peninsula', tier: 1, city: 'San Mateo/Redwood City', state: 'CA', lat: 37.5629, lon: -122.3255, radiusKm: 12, maxCreates: 300 },
+        { id: 'east_bay_concord', tier: 1, city: 'Concord/Walnut Creek', state: 'CA', lat: 37.9779, lon: -122.0311, radiusKm: 12, maxCreates: 280 },
+
+        // Tier 1 — DC metro
+        { id: 'dc_core', tier: 1, city: 'Washington', state: 'DC', lat: 38.9072, lon: -77.0369, radiusKm: 12, maxCreates: 340 },
+        { id: 'va_arlington_alex', tier: 1, city: 'Arlington/Alexandria', state: 'VA', lat: 38.8500, lon: -77.0500, radiusKm: 12, maxCreates: 300 },
+        { id: 'md_moco', tier: 1, city: 'Bethesda/Rockville', state: 'MD', lat: 39.0800, lon: -77.1500, radiusKm: 14, maxCreates: 300 },
+        { id: 'va_fairfax', tier: 1, city: 'Tysons/Reston', state: 'VA', lat: 38.9248, lon: -77.2397, radiusKm: 14, maxCreates: 300 },
+        { id: 'md_pg', tier: 1, city: "Prince George's County", state: 'MD', lat: 38.8307, lon: -76.9080, radiusKm: 12, maxCreates: 300 },
+
+        // Tier 1 — Philadelphia
+        { id: 'phl_core', tier: 1, city: 'Philadelphia', state: 'PA', lat: 39.9526, lon: -75.1652, radiusKm: 12, maxCreates: 340 },
+        { id: 'phl_west', tier: 1, city: 'West Philadelphia', state: 'PA', lat: 39.9578, lon: -75.2000, radiusKm: 8, maxCreates: 220 },
+        { id: 'phl_north', tier: 1, city: 'North Philadelphia', state: 'PA', lat: 40.0084, lon: -75.1477, radiusKm: 10, maxCreates: 240 },
+        { id: 'phl_camden', tier: 1, city: 'Camden/Cherry Hill', state: 'NJ', lat: 39.9260, lon: -75.0310, radiusKm: 12, maxCreates: 260 },
+        { id: 'phl_kop', tier: 1, city: 'King of Prussia', state: 'PA', lat: 40.1013, lon: -75.3830, radiusKm: 12, maxCreates: 240 },
+
+        // Tier 1 — Boston
+        { id: 'bos_core', tier: 1, city: 'Boston', state: 'MA', lat: 42.3601, lon: -71.0589, radiusKm: 10, maxCreates: 320 },
+        { id: 'bos_cambridge', tier: 1, city: 'Cambridge/Somerville', state: 'MA', lat: 42.3736, lon: -71.1097, radiusKm: 8, maxCreates: 220 },
+        { id: 'bos_brookline_newton', tier: 1, city: 'Brookline/Newton', state: 'MA', lat: 42.3318, lon: -71.1212, radiusKm: 10, maxCreates: 240 },
+        { id: 'bos_quincy', tier: 1, city: 'Quincy', state: 'MA', lat: 42.2529, lon: -71.0023, radiusKm: 10, maxCreates: 220 },
+        { id: 'bos_waltham', tier: 1, city: 'Waltham/Watertown', state: 'MA', lat: 42.3765, lon: -71.2356, radiusKm: 10, maxCreates: 220 },
+
+        // Tier 2 — Large metros needing 2–4 targets
+        { id: 'sd_core', tier: 2, city: 'San Diego', state: 'CA', lat: 32.7157, lon: -117.1611, radiusKm: 16, maxCreates: 320 },
+        { id: 'sd_north_county', tier: 2, city: 'North County (Oceanside/Carlsbad)', state: 'CA', lat: 33.1581, lon: -117.3506, radiusKm: 14, maxCreates: 260 },
+
+        { id: 'phx_core', tier: 2, city: 'Phoenix', state: 'AZ', lat: 33.4484, lon: -112.0740, radiusKm: 18, maxCreates: 340 },
+        { id: 'phx_east_valley', tier: 2, city: 'Tempe/Mesa/Chandler', state: 'AZ', lat: 33.3635, lon: -111.9640, radiusKm: 16, maxCreates: 320 },
+
+        { id: 'sea_core', tier: 2, city: 'Seattle', state: 'WA', lat: 47.6062, lon: -122.3321, radiusKm: 12, maxCreates: 300 },
+        { id: 'sea_eastside', tier: 2, city: 'Bellevue/Redmond', state: 'WA', lat: 47.6101, lon: -122.2015, radiusKm: 12, maxCreates: 260 },
+
+        { id: 'atl_core', tier: 2, city: 'Atlanta', state: 'GA', lat: 33.7490, lon: -84.3880, radiusKm: 14, maxCreates: 320 },
+        { id: 'atl_north', tier: 2, city: 'Sandy Springs/Roswell', state: 'GA', lat: 33.9807, lon: -84.3513, radiusKm: 14, maxCreates: 260 },
+
+        { id: 'det_core', tier: 2, city: 'Detroit', state: 'MI', lat: 42.3314, lon: -83.0458, radiusKm: 14, maxCreates: 300 },
+        { id: 'det_oakland_county', tier: 2, city: 'Oakland County', state: 'MI', lat: 42.5869, lon: -83.4302, radiusKm: 14, maxCreates: 260 },
+
+        { id: 'msp_minneapolis', tier: 2, city: 'Minneapolis', state: 'MN', lat: 44.9778, lon: -93.2650, radiusKm: 12, maxCreates: 260 },
+        { id: 'msp_st_paul', tier: 2, city: 'St. Paul', state: 'MN', lat: 44.9537, lon: -93.0900, radiusKm: 12, maxCreates: 240 },
+
+        { id: 'denver_core', tier: 2, city: 'Denver', state: 'CO', lat: 39.7392, lon: -104.9903, radiusKm: 14, maxCreates: 300 },
+        { id: 'denver_south', tier: 2, city: 'DTC/Centennial', state: 'CO', lat: 39.5970, lon: -104.9010, radiusKm: 12, maxCreates: 220 },
+
+        { id: 'satx_core', tier: 2, city: 'San Antonio', state: 'TX', lat: 29.4241, lon: -98.4936, radiusKm: 16, maxCreates: 320 },
+        { id: 'aus_core', tier: 2, city: 'Austin', state: 'TX', lat: 30.2672, lon: -97.7431, radiusKm: 16, maxCreates: 320 },
+
+        { id: 'orl_core', tier: 2, city: 'Orlando', state: 'FL', lat: 28.5384, lon: -81.3789, radiusKm: 14, maxCreates: 300 },
+        { id: 'tpa_core', tier: 2, city: 'Tampa', state: 'FL', lat: 27.9506, lon: -82.4572, radiusKm: 14, maxCreates: 300 },
+        { id: 'stp_clearwater', tier: 2, city: 'St. Petersburg/Clearwater', state: 'FL', lat: 27.9738, lon: -82.7996, radiusKm: 12, maxCreates: 240 },
+
+        { id: 'clt_core', tier: 2, city: 'Charlotte', state: 'NC', lat: 35.2271, lon: -80.8431, radiusKm: 14, maxCreates: 300 },
+        { id: 'rdus_core', tier: 2, city: 'Raleigh/Durham', state: 'NC', lat: 35.7796, lon: -78.6382, radiusKm: 14, maxCreates: 300 },
+
+        { id: 'pdx_core', tier: 2, city: 'Portland', state: 'OR', lat: 45.5051, lon: -122.6750, radiusKm: 12, maxCreates: 280 },
+        { id: 'bal_core', tier: 2, city: 'Baltimore', state: 'MD', lat: 39.2904, lon: -76.6122, radiusKm: 12, maxCreates: 280 },
+
+        { id: 'bna_core', tier: 2, city: 'Nashville', state: 'TN', lat: 36.1627, lon: -86.7816, radiusKm: 12, maxCreates: 260 },
+        { id: 'las_core', tier: 2, city: 'Las Vegas', state: 'NV', lat: 36.1699, lon: -115.1398, radiusKm: 14, maxCreates: 280 },
+
+        // Tier 3 — 1–2 targets each
+        { id: 'col_core', tier: 3, city: 'Columbus', state: 'OH', lat: 39.9612, lon: -82.9988, radiusKm: 12, maxCreates: 260 },
+        { id: 'ind_core', tier: 3, city: 'Indianapolis', state: 'IN', lat: 39.7684, lon: -86.1581, radiusKm: 12, maxCreates: 260 },
+        { id: 'kc_core', tier: 3, city: 'Kansas City', state: 'MO', lat: 39.0997, lon: -94.5786, radiusKm: 14, maxCreates: 260 },
+        { id: 'stl_core', tier: 3, city: 'St. Louis', state: 'MO', lat: 38.6270, lon: -90.1994, radiusKm: 12, maxCreates: 240 },
+        { id: 'cle_core', tier: 3, city: 'Cleveland', state: 'OH', lat: 41.4993, lon: -81.6944, radiusKm: 12, maxCreates: 240 },
+        { id: 'cin_core', tier: 3, city: 'Cincinnati', state: 'OH', lat: 39.1031, lon: -84.5120, radiusKm: 12, maxCreates: 240 },
+        { id: 'pit_core', tier: 3, city: 'Pittsburgh', state: 'PA', lat: 40.4406, lon: -79.9959, radiusKm: 12, maxCreates: 240 },
+        { id: 'mke_core', tier: 3, city: 'Milwaukee', state: 'WI', lat: 43.0389, lon: -87.9065, radiusKm: 12, maxCreates: 240 },
+        { id: 'sac_core', tier: 3, city: 'Sacramento', state: 'CA', lat: 38.5816, lon: -121.4944, radiusKm: 14, maxCreates: 260 },
+        { id: 'slc_core', tier: 3, city: 'Salt Lake City', state: 'UT', lat: 40.7608, lon: -111.8910, radiusKm: 12, maxCreates: 240 },
+        { id: 'jax_core', tier: 3, city: 'Jacksonville', state: 'FL', lat: 30.3322, lon: -81.6557, radiusKm: 16, maxCreates: 280 },
+        { id: 'okc_core', tier: 3, city: 'Oklahoma City', state: 'OK', lat: 35.4676, lon: -97.5164, radiusKm: 14, maxCreates: 260 },
+        { id: 'msy_core', tier: 3, city: 'New Orleans', state: 'LA', lat: 29.9511, lon: -90.0715, radiusKm: 12, maxCreates: 240 },
+        { id: 'ric_core', tier: 3, city: 'Richmond', state: 'VA', lat: 37.5407, lon: -77.4360, radiusKm: 12, maxCreates: 220 },
+        { id: 'hfd_core', tier: 3, city: 'Hartford', state: 'CT', lat: 41.7658, lon: -72.6734, radiusKm: 12, maxCreates: 200 },
+        { id: 'pvd_core', tier: 3, city: 'Providence', state: 'RI', lat: 41.8240, lon: -71.4128, radiusKm: 12, maxCreates: 200 },
+        { id: 'abq_core', tier: 3, city: 'Albuquerque', state: 'NM', lat: 35.0844, lon: -106.6504, radiusKm: 14, maxCreates: 240 },
+        { id: 'tus_core', tier: 3, city: 'Tucson', state: 'AZ', lat: 32.2226, lon: -110.9747, radiusKm: 14, maxCreates: 240 },
+        { id: 'mem_core', tier: 3, city: 'Memphis', state: 'TN', lat: 35.1495, lon: -90.0490, radiusKm: 12, maxCreates: 240 },
+      ];
+
+      const selected = curated.filter(t => (
+        preset === 'all' || (preset === 'tier1' && t.tier === 1) || (preset === 'tier2' && t.tier === 2) || (preset === 'tier3' && t.tier === 3)
+      ));
+
+      const statusRef = db.collection('imports').doc('geoSimple');
+      const targetsColl = statusRef.collection('targets');
+      let added = 0, updated = 0, skipped = 0;
+      const nowIso = new Date().toISOString();
+
+      if (!dryRun) {
+        // Optionally enable scheduler right away
+        if (enableNow) {
+          await statusRef.set({ enabled: true, useWindow, nextIndex: 0, lastSeedAt: nowIso }, { merge: true });
+        }
+      }
+
+      for (const t of selected) {
+        const docRef = targetsColl.doc(t.id);
+        const snap = await docRef.get();
+        const payload = {
+          city: t.city,
+          state: canonState(t.state),
+          lat: Number(t.lat),
+          lon: Number(t.lon),
+          radiusKm: clampRadius(t.radiusKm),
+          maxCreates: clampCreates(t.maxCreates),
+          tier: t.tier,
+          seededAt: nowIso,
+        };
+        if (snap.exists) {
+          if (overwrite) {
+            if (!dryRun) await docRef.set(payload, { merge: true });
+            updated += 1;
+          } else {
+            skipped += 1;
+          }
+        } else {
+          if (!dryRun) await docRef.set(payload, { merge: false });
+          added += 1;
+        }
+      }
+
+      res.status(200).json({ ok: true, preset, totalCandidates: selected.length, added, updated, skipped, dryRun, enabled: enableNow });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
     }
