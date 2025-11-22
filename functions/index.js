@@ -103,300 +103,236 @@ exports.enforceSingleAdminOnUserWrite = functions.firestore
   });
 
 /**
- * HTTP: Import courts for a single city immediately (admin/debug tool).
- * Body: { city: string, state: string, lat?: number, lon?: number, radiusMeters?: number, maxCreates?: number, dryRun?: boolean }
- * Security: requires X-Run-Secret header matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ * Server-side: Fix City/State from Address (zero-API, resumable)
+ * Mirrors the client ParkBackfillService.fixCityFromAddress but runs on Cloud Functions.
+ * Writes heartbeat and totals to jobs/fix_city_from_address so Admin UI can track progress.
  */
-exports.runPlacesBackfillForCityHttp = functions
-  .runWith({ timeoutSeconds: 360, memory: '1GB', maxInstances: 1 })
+async function runFixCityFromAddressBatch(db, { pageSize = 1200, resume = true } = {}) {
+  let scanned = 0;
+  let updated = 0;
+  let skippedEmpty = 0;
+  let ambiguous = 0;
+
+  pageSize = Math.max(200, Math.min(1500, Number(pageSize) || 1200));
+
+  const ckptRef = db.collection('jobs').doc('fix_city_from_address');
+  let cursorId = null;
+  let totals = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0 };
+  if (resume) {
+    try {
+      const ck = await ckptRef.get();
+      if (ck.exists) {
+        const d = ck.data() || {};
+        cursorId = d.lastDocId || null;
+        totals.pages = Number(d.pages || 0);
+        totals.scanned = Number(d.scanned || 0);
+        totals.updated = Number(d.updated || 0);
+        totals.skippedEmpty = Number(d.skippedEmpty || 0);
+        totals.ambiguous = Number(d.ambiguous || 0);
+      }
+    } catch (_) {}
+  } else {
+    // Clear previous run totals
+    try {
+      await ckptRef.set({ status: 'in_progress', lastDocId: null, pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, lastHeartbeatAt: new Date().toISOString() }, { merge: true });
+    } catch (_) {}
+  }
+
+  let base = db.collection('parks').orderBy(admin.firestore.FieldPath.documentId());
+  if (cursorId) {
+    try {
+      const cur = await db.collection('parks').doc(cursorId).get();
+      if (cur.exists) base = base.startAfter(cur);
+    } catch (_) {}
+  }
+
+  const snap = await base.limit(pageSize).get();
+  if (snap.empty) {
+    // Nothing to scan; mark done
+    try {
+      await ckptRef.set({ status: 'done', completedAt: new Date().toISOString() }, { merge: true });
+    } catch (_) {}
+    return { pageScanned: 0, pageUpdated: 0, pageSkippedEmpty: 0, pageAmbiguous: 0, done: true, cursor: null, ...totals };
+  }
+
+  let batch = db.batch();
+  let writes = 0;
+  const commit = async () => { if (writes > 0) { await batch.commit(); batch = db.batch(); writes = 0; } };
+
+  const docs = snap.docs;
+  for (const doc of docs) {
+    scanned += 1;
+    const d = doc.data() || {};
+    const id = doc.id;
+    const addr = String(d.address || '').trim();
+    if (!addr || addr.toLowerCase() === 'address not specified') { skippedEmpty += 1; continue; }
+
+    const parsed = parseCityStateFromAddress(addr);
+    const parsedCity = String(parsed.city || '').trim();
+    const parsedState = String(parsed.state || '').trim();
+    if (!parsedCity || !parsedState) { ambiguous += 1; continue; }
+
+    const currentCity = String(d.city || '').trim();
+    const currentStateCanon = canonState(String(d.state || '').trim());
+    const needCity = !currentCity || currentCity.toLowerCase() !== parsedCity.toLowerCase();
+    const needState = !currentStateCanon || currentStateCanon !== parsedState;
+    if (!needCity && !needState) continue;
+
+    const update = {
+      city: titleCase(parsedCity),
+      state: parsedState,
+      updatedAt: new Date().toISOString(),
+    };
+    batch.update(db.collection('parks').doc(id), update);
+    writes += 1;
+    updated += 1;
+    if (writes >= 400) await commit();
+  }
+
+  await commit();
+  const newCursor = docs[docs.length - 1].id;
+  const isLast = docs.length < pageSize;
+
+  // Update cumulative totals in checkpoint
+  const nowIso = new Date().toISOString();
+  const newTotals = {
+    pages: totals.pages + 1,
+    scanned: totals.scanned + scanned,
+    updated: totals.updated + updated,
+    skippedEmpty: totals.skippedEmpty + skippedEmpty,
+    ambiguous: totals.ambiguous + ambiguous,
+  };
+  try {
+    await ckptRef.set({
+      status: isLast ? 'done' : 'in_progress',
+      lastDocId: isLast ? null : newCursor,
+      ...newTotals,
+      lastHeartbeatAt: nowIso,
+      completedAt: isLast ? nowIso : admin.firestore.FieldValue.delete(),
+    }, { merge: true });
+  } catch (_) {}
+
+  return { pageScanned: scanned, pageUpdated: updated, pageSkippedEmpty: skippedEmpty, pageAmbiguous: ambiguous, done: isLast, cursor: isLast ? null : newCursor, ...newTotals };
+}
+
+exports.runFixCityFromAddressOnce = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const callerUid = context.auth.uid;
+    const adminUid = await getAdminUid(db);
+    if (!adminUid || callerUid !== adminUid) {
+      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run this');
+    }
+    const pageSize = Math.max(200, Math.min(1500, Number(data && data.pageSize) || 1200));
+    const resume = (data && data.resume) !== false; // default true
+    try {
+      const res = await runFixCityFromAddressBatch(db, { pageSize, resume });
+      return { ok: true, ...res };
+    } catch (e) {
+      throw new functions.https.HttpsError('internal', e?.message || 'Unknown error');
+    }
+  });
+
+// HTTP wrapper for CI/admin (shared secret header like others)
+exports.runFixCityFromAddressOnceHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
       if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
       const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
       const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
       if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
-
       const db = admin.firestore();
-      const adminUid = await getAdminUid(db);
-      const city = String(req.body?.city || '').trim();
-      const state = String(req.body?.state || '').trim().toUpperCase();
-      const lat = req.body?.lat != null ? Number(req.body.lat) : undefined;
-      const lon = req.body?.lon != null ? Number(req.body.lon) : undefined;
-      const radiusMeters = Math.max(2000, Math.min(40000, Number(req.body?.radiusMeters) || 12000));
-      const maxCreates = Math.max(1, Math.min(400, Number(req.body?.maxCreates) || 200));
-      const dryRun = req.body?.dryRun === true;
-
-      if (!city || !STATE_ISO_MAP[state]) {
-        res.status(400).json({ ok: false, error: 'city and valid 2-letter state are required' });
-        return;
-      }
-
-      const out = await importPlacesForCity({ db, adminUid: adminUid || 'system', city, state, lat: isFinite(lat) ? lat : undefined, lon: isFinite(lon) ? lon : undefined, radiusMeters, maxCreates, dryRun });
-      res.status(200).json({ ok: true, city, state, dryRun, ...out });
+      const pageSize = Math.max(200, Math.min(1500, Number((req.body && req.body.pageSize) || 1200)));
+      const resume = (req.body && req.body.resume) !== false;
+      const out = await runFixCityFromAddressBatch(db, { pageSize, resume });
+      res.status(200).json({ ok: true, ...out });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
     }
   });
 
 /**
- * ========================
- * PARKS GEO-CODE QUEUE DRAINER
- * ========================
- * Scheduled worker that processes parks_geocode_queue at a safe rate,
- * updates the park's address/city/state, and enforces a daily cap.
- *
- * Collection: parks_geocode_queue
- *   - Fields: { parkId, lat, lng, priority, reason, createdAt(ISO), status: 'queued' | 'running' | 'done' | 'failed', attempts }
- *
- * Rate/Caps (override via env or functions config):
- *   GEOCODE_RATE_PER_MIN or geocode.rate_per_min (default 25)
- *   GEOCODE_DAILY_CAP or geocode.daily_cap (default 40000)
- *
- * Usage accounting: billing/geoapify/days/YYYY-MM-DD { calls }
+ * Owner-callable: Sweep Fix City/State across all parks in one session (looped)
+ * - Loops runFixCityFromAddressBatch() until done or nearing timeout
+ * - Returns cumulative totals and done flag
  */
-function dayKey() {
-  const d = new Date();
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-// Geoapify caps removed
-
-async function runGeocodeDrainBudget(db, { budgetThisRun, cap }) {
-  // Prefer priority then createdAt; if composite index missing, Firestore suggests one in logs
-  let q = db.collection('parks_geocode_queue')
-    .where('status', '==', 'queued')
-    .orderBy('priority', 'asc')
-    .orderBy('createdAt', 'asc')
-    .limit(budgetThisRun);
-  let snap;
-  try {
-    snap = await q.get();
-  } catch (e) {
-    // Fallback to createdAt only if composite index not available
-    console.warn('[geocodeDrain] fallback query (missing composite index?)', e.message || e);
-    try {
-      snap = await db.collection('parks_geocode_queue')
-        .where('status', '==', 'queued')
-        .orderBy('createdAt', 'asc')
-        .limit(budgetThisRun)
-        .get();
-    } catch (e2) {
-      // Last-resort fallback: drop ordering to avoid composite index requirement.
-      console.warn('[geocodeDrain] second fallback (createdAt index missing?), using unordered query', e2.message || e2);
-      snap = await db.collection('parks_geocode_queue')
-        .where('status', '==', 'queued')
-        .limit(budgetThisRun)
-        .get();
-    }
-  }
-  if (snap.empty) {
-    console.log('[geocodeDrain] no queued jobs');
-    return { processed: 0 };
-  }
-
-  let processed = 0;
-  for (const doc of snap.docs) {
-    if (processed >= budgetThisRun) break;
-    const ref = doc.ref;
-    const job = doc.data() || {};
-    const parkId = job.parkId;
-    const lat = Number(job.lat);
-    const lng = Number(job.lng);
-    if (!parkId || !isFinite(lat) || !isFinite(lng)) {
-      await ref.set({ status: 'failed', error: 'invalid job payload', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-      continue;
-    }
-
-    // Acquire a per-job lease to avoid double process across retries
-    let leased = false;
-    try {
-      await db.runTransaction(async (tx) => {
-        const s = await tx.get(ref);
-        const d = s.exists ? s.data() : {};
-        const until = d && d.leaseExpiresAt ? new Date(d.leaseExpiresAt).getTime() : 0;
-        if (until && until > Date.now()) return; // already leased
-        const end = new Date(Date.now() + 60 * 1000).toISOString();
-        tx.set(ref, { status: 'running', leaseOwner: 'drain', leaseExpiresAt: end, startedAt: new Date().toISOString(), attempts: (Number(d.attempts)||0) + 1 }, { merge: true });
-        leased = true;
-      });
-    } catch (e) {
-      leased = false;
-    }
-    if (!leased) continue;
-
-    // Guard: skip API call if park no longer needs geocode or was recently geocoded
-    try {
-      const parkSnap = await db.collection('parks').doc(parkId).get();
-      if (!parkSnap.exists) {
-        await ref.set({ status: 'failed', error: 'park missing', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-        continue;
-      }
-      const pd = parkSnap.data() || {};
-      // NEW: Only reverse geocode approved parks. Skip unapproved to avoid any client-triggered API burn.
-      if (!pd.approved) {
-        await ref.set({ status: 'done', note: 'skipped: not approved', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-        continue;
-      }
-      const needs = pd.needsGeocode === true;
-      const lastAt = pd.lastGeocodedAt ? new Date(pd.lastGeocodedAt).getTime() : 0;
-      const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
-      const recent = lastAt && (Date.now() - lastAt) < thirtyDaysMs;
-      const hasAddr = !!(pd.address && pd.city && pd.state);
-      if (!needs && (hasAddr || recent)) {
-        await ref.set({ status: 'done', note: 'skipped: already geocoded', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-        continue;
-      }
-    } catch (_) { /* proceed if check fails */ }
-
-    // Perform reverse geocode using Google with monthly cap
-    let rg = null;
-    const rem = await getGoogleRemainingCalls(db);
-    if (rem <= 0) {
-      await ref.set({ status: 'failed', error: 'budget cap reached', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-      continue;
-    }
-    try { rg = await fetchGoogleReverse(lat, lng); } catch (e) { rg = null; }
-    if (!rg) {
-      await ref.set({ status: 'failed', error: 'reverse geocode failed', finishedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-      continue;
-    }
-    processed += 1;
-    await consumeGoogleCalls(db, 1);
-
-    const addr = String(rg.address || '').trim();
-    const city = String(rg.city || '').trim();
-    const state = canonState(String(rg.state || '').trim());
-    const nowIso = new Date().toISOString();
-
-    // Update park doc minimally
-    try {
-      await db.collection('parks').doc(parkId).set({
-        address: addr || admin.firestore.FieldValue.delete(),
-        city: city || admin.firestore.FieldValue.delete(),
-        state: state || admin.firestore.FieldValue.delete(),
-        needsGeocode: false,
-        lastGeocodedAt: nowIso,
-        updatedAt: nowIso,
-      }, { merge: true });
-    } catch (e) {
-      console.warn('[geocodeDrain] failed to update park', parkId, e.message || e);
-    }
-
-    // Mark job done
-    try {
-      await ref.set({ status: 'done', finishedAt: nowIso }, { merge: true });
-    } catch (_) {}
-  }
-
-  return { processed };
-}
-
-exports.scheduledGeocodeQueueDrain = functions
-  .runWith({ timeoutSeconds: 300, memory: '512MB', maxInstances: 1 })
-  .pubsub.schedule('every 1 minutes').timeZone('Etc/UTC')
-  .onRun(async () => {
+exports.runFixCityFromAddressAll = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
     const db = admin.firestore();
-    if (!GOOGLE_KEY) { console.warn('[geocodeDrain] GOOGLE_KEY not configured; skipping run'); return null; }
-
-    // Configurable rate; default 1/min so search backfills can use most budget unless overridden
-    const ratePerMin = Number(getEnv('GEOCODE_RATE_PER_MIN', getEnv('geocode.rate_per_min', '1')));
-    const perMinute = isFinite(ratePerMin) && ratePerMin > 0 ? Math.min(100, Math.max(1, ratePerMin)) : 1;
-
-    try {
-      // Honor monthly remaining first
-      const remaining = await getGoogleRemainingCalls(db);
-      if (remaining <= 0) { console.log('[geocodeDrain] monthly cap reached; pausing'); return null; }
-      const budgetThisRun = Math.min(perMinute, remaining);
-      const { processed } = await runGeocodeDrainBudget(db, { budgetThisRun, cap: null });
-      console.log(`[geocodeDrain] processed=${processed} budget=${budgetThisRun} remaining~=${remaining - processed}`);
-      return null;
-    } catch (e) {
-      console.error('[geocodeDrain] error', e);
-      return null;
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
     }
+    const callerUid = context.auth.uid;
+    const adminUid = await getAdminUid(db);
+    if (!adminUid || callerUid !== adminUid) {
+      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run this');
+    }
+    let pageSize = Math.max(200, Math.min(1500, Number(data && data.pageSize) || 1200));
+    let resume = (data && data.resume) !== false;
+    const t0 = Date.now();
+    let agg = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0 };
+    let done = false;
+    do {
+      const out = await runFixCityFromAddressBatch(db, { pageSize, resume });
+      // The batch already updates checkpoint totals; also compute local aggregate
+      agg.pages = out.pages;
+      agg.scanned = out.scanned;
+      agg.updated = out.updated;
+      agg.skippedEmpty = out.skippedEmpty;
+      agg.ambiguous = out.ambiguous;
+      done = !!out.done;
+      resume = true; // continue from checkpoint
+      // Leave ~20s headroom to avoid hard timeout
+      if (!done && (Date.now() - t0) > 520000) break;
+    } while (!done);
+    return { ok: true, ...agg, done };
   });
 
-// HTTP runner for CI/GitHub Actions. Requires secret header and optional ?limit=
-exports.drainParksGeocodeQueueHttp = functions
-  .runWith({ timeoutSeconds: 300, memory: '512MB', maxInstances: 1 })
+/**
+ * HTTP: Sweep Fix City/State fully with shared secret, no terminal loops needed
+ */
+exports.runFixCityFromAddressAllHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
-      if (req.method !== 'POST') {
-        res.status(405).json({ ok: false, error: 'Method Not Allowed' });
-        return;
-      }
-      // Accept either RUNNER_SECRET/geocode.runner_secret or BACKFILL_RUN_SECRET/backfill.run_secret
-      const configured = getEnv('RUNNER_SECRET',
-        getEnv('geocode.runner_secret',
-          getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''))
-        )
-      );
-      const provided = String(req.headers['x-runner-secret'] || req.headers['x-run-secret'] || '').trim();
-      if (!configured || !provided || provided !== configured) {
-        res.status(401).json({ ok: false, error: 'Unauthorized' });
-        return;
-      }
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
       const db = admin.firestore();
-      // Honor monthly cap even for HTTP invocations
-      const remaining = await getGoogleRemainingCalls(db);
-      if (remaining <= 0) { res.status(200).json({ ok: true, processed: 0, note: 'monthly cap reached' }); return; }
-      const defaultRate = Number(getEnv('GEOCODE_RATE_PER_MIN', getEnv('geocode.rate_per_min', '25')));
-      const limitParam = Number(req.query.limit || req.body?.limit);
-      const requested = isFinite(limitParam) && limitParam > 0 ? Math.floor(limitParam) : (isFinite(defaultRate) && defaultRate > 0 ? defaultRate : 25);
-      const budgetThisRun = Math.min(remaining, Math.min(100, Math.max(1, requested)));
-      const { processed } = await runGeocodeDrainBudget(db, { budgetThisRun, cap: null });
-      res.status(200).json({ ok: true, processed, budget: budgetThisRun, remainingApprox: Math.max(0, remaining - processed) });
+      let pageSize = Math.max(200, Math.min(1500, Number((req.body && req.body.pageSize) || 1200)));
+      let resume = (req.body && req.body.resume) !== false;
+      const t0 = Date.now();
+      let agg = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0 };
+      let done = false;
+      do {
+        const out = await runFixCityFromAddressBatch(db, { pageSize, resume });
+        agg.pages = out.pages;
+        agg.scanned = out.scanned;
+        agg.updated = out.updated;
+        agg.skippedEmpty = out.skippedEmpty;
+        agg.ambiguous = out.ambiguous;
+        done = !!out.done;
+        resume = true;
+        if (!done && (Date.now() - t0) > 520000) break;
+      } while (!done);
+      res.status(200).json({ ok: true, ...agg, done });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
     }
   });
 
-/**
- * Enqueue a reverse-geocode job for a park and mark the park as needing geocode.
- */
-async function enqueueGeocodeJob(db, { parkId, lat, lng, reason = 'unspecified', priority = 5 }) {
-  const la = Number(lat);
-  const lo = Number(lng);
-  if (!isFinite(la) || !isFinite(lo)) return;
-  const nowIso = new Date().toISOString();
-  try {
-    await db.collection('parks').doc(parkId).set({
-      needsGeocode: true,
-      geocodeQueuedAt: nowIso,
-      updatedAt: nowIso,
-    }, { merge: true });
-  } catch (_) {}
-  try {
-    await db.collection('parks_geocode_queue').doc(parkId).set({
-      parkId,
-      lat: la,
-      lng: lo,
-      reason,
-      priority,
-      status: 'queued',
-      attempts: 0,
-      createdAt: nowIso,
-    }, { merge: true });
-  } catch (e) {
-    console.warn('enqueueGeocodeJob failed', parkId, e && e.message ? e.message : e);
-  }
-}
+// Removed: runPlacesBackfillForCityHttp (Google import) per request — no more Google importing
 
-// Queue on park create
-exports.enqueueGeocodeOnParkCreate = functions.firestore
-  .document('parks/{parkId}')
-  .onCreate(async (snap, context) => {
-    const db = admin.firestore();
-    const d = snap.data() || {};
-    const lat = Number(d.latitude);
-    const lng = Number(d.longitude);
-    if (!isFinite(lat) || !isFinite(lng)) return null;
-    await enqueueGeocodeJob(db, { parkId: snap.id, lat, lng, reason: 'park:create', priority: 4 });
-    return null;
-  });
+// Removed: geocoding queue, scheduler, and HTTP drainer — no reverse‑geocoding API calls
+
+// Removed: enqueueGeocodeOnParkCreate and helper — no auto geocode queueing
 
 // Queue on relevant park updates — DISABLED to avoid potential update loops and costs
 // exports.enqueueGeocodeOnParkUpdate = functions.firestore
@@ -418,6 +354,20 @@ exports.enqueueGeocodeOnParkCreate = functions.firestore
 //     await enqueueGeocodeJob(db, { parkId: change.after.id, lat: aLat, lng: aLng, reason, priority: coordsChanged ? 2 : 5 });
 //     return null;
 //   });
+
+// On update: refresh alias index when name/coords/approval change
+exports.indexParkAliasesOnUpdate = functions.firestore
+  .document('parks/{parkId}')
+  .onUpdate(async (change, context) => {
+    const db = admin.firestore();
+    try {
+      const after = change.after.data() || {};
+      await indexAliasesForPark(db, change.after.id, after);
+    } catch (e) {
+      console.warn('indexParkAliasesOnUpdate error', e && e.message ? e.message : e);
+    }
+    return null;
+  });
 
 /**
  * Callable: Claim importer ownership (sets config/app.adminUid) on first run.
@@ -662,6 +612,7 @@ async function consumeGoogleCalls(db, calls) {
 }
 const TEXT_TTL_DAYS = 14; // cache text search for 14 days
 const REV_TTL_DAYS = 30;  // cache reverse geocode for 30 days
+const DETAILS_TTL_DAYS = 30; // cache place details for 30 days (compliance)
 
 function ttlFromDays(days) {
   const d = new Date();
@@ -745,7 +696,13 @@ async function fetchGoogleTextSearch(text, bias) {
   });
   if (!res.ok) return [];
   const data = await res.json();
-  return standardizePlacesFromGoogleV1(data);
+  const raw = standardizePlacesFromGoogleV1(data);
+  // Attach alias hint (best-effort) so clients can link to canonical parks
+  try {
+    return await attachAliasesToPlaces(admin.firestore(), raw);
+  } catch (_) {
+    return raw;
+  }
 }
 
 async function fetchGoogleTextSearchPaged({ text, bias, pageAll = true, maxPages = 3, pageSize = 20 }) {
@@ -779,7 +736,10 @@ async function fetchGoogleTextSearchPaged({ text, bias, pageAll = true, maxPages
     });
     if (!res.ok) break;
     const data = await res.json();
-    const places = standardizePlacesFromGoogleV1(data);
+    let places = standardizePlacesFromGoogleV1(data);
+    try {
+      places = await attachAliasesToPlaces(admin.firestore(), places);
+    } catch (_) {}
     for (const p of places) {
       const id = p.id || `${p.displayName}_${(p.location?.latitude ?? 0)},${(p.location?.longitude ?? 0)}`;
       aggregated.set(id, p);
@@ -904,6 +864,40 @@ exports.pruneExpiredGeoCache = functions.pubsub
     }
   });
 
+/**
+ * Scheduled Function: Unapprove expired Google-sourced parks
+ * Any park with source=='places' and autoExpireAt < now will be hidden (approved=false)
+ * unless it has been claimed by a user (createdByUserId not 'system').
+ */
+exports.pruneExpiredGoogleParks = functions.pubsub
+  .schedule('every 24 hours')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const nowIso = new Date().toISOString();
+    try {
+      const snap = await db.collection('parks')
+        .where('source', '==', 'places')
+        .where('autoExpireAt', '<', nowIso)
+        .get();
+      if (snap.empty) return null;
+      const updates = [];
+      snap.forEach(doc => {
+        const d = doc.data() || {};
+        const creator = String(d.createdByUserId || '');
+        // Preserve user-created/claimed entries
+        if (creator && creator !== 'system') return;
+        updates.push(doc.ref.set({ approved: false, reviewStatus: 'expired_cache', expiredAt: nowIso, updatedAt: nowIso }, { merge: true }));
+      });
+      if (updates.length) await Promise.all(updates);
+      console.log(`Expired Google parks pruned: ${updates.length}`);
+      return null;
+    } catch (e) {
+      console.warn('pruneExpiredGoogleParks error', e && e.message ? e.message : e);
+      return null;
+    }
+  });
+
 // OSM callable removed — Google-only pipeline
 
 // Geoapify reverse removed
@@ -1011,7 +1005,28 @@ exports.geoPlaceDetails = functions.https.onCall(async (data, context) => {
       // Soft-fail: return a minimal stub so client can proceed without error
       return { id: placeId, displayName: 'Unknown', formattedAddress: '', location: null, provider: 'google' };
     }
-    await cacheSet(db, key, details, TEXT_TTL_DAYS);
+    // Attach alias link for details (best-effort)
+    try {
+      const dn = String(details.displayName || '');
+      const loc = details.location || {};
+      const la = Number(loc.latitude);
+      const lo = Number(loc.longitude);
+      if (dn && isFinite(la) && isFinite(lo)) {
+        const key3 = clusterKey(la, lo, 3);
+        for (const v of aliasVariantsFromName(dn)) {
+          const aid = `a:${v}:${key3}`;
+          const snap = await db.collection('parkAliases').doc(aid).get();
+          if (snap.exists) {
+            const target = snap.data() || {};
+            if (target.parkId) {
+              details = { ...details, aliasParkId: target.parkId, aliasMatch: true };
+              break;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    await cacheSet(db, key, details, DETAILS_TTL_DAYS);
     return details;
   } catch (e) {
     // Fail soft
@@ -1132,6 +1147,103 @@ function titleCase(input) {
 function clusterKey(lat, lng, decimals = 3) {
   const r = (v) => Number(v).toFixed(decimals);
   return `${r(lat)},${r(lng)}`;
+}
+
+/**
+ * ========================
+ * ALIAS LINKING (in-flight, small)
+ * ========================
+ * We create tiny alias indices for approved parks so that when Google Places
+ * returns slightly different names (e.g., "Rose Garden" vs "Rose Park"),
+ * we can link results to an existing canonical park to avoid duplicates.
+ *
+ * Collection: parkAliases
+ *   DocID: a:<aliasNameNorm>:<clusterKey_3dec>
+ *   Fields: { parkId, name, alias, lat, lon, createdAt, updatedAt }
+ */
+function normalizeAliasName(name) {
+  const s = String(name || '').toLowerCase();
+  return s
+    .replace(/[\u2014\u2013]/g, '-')
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/\b(basketball|tennis|pickleball|courts?|recreation|rec|center|complex|playground|ymca|school|university|college)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function aliasVariantsFromName(name) {
+  // Keep aliasing extremely conservative: only the normalized base name.
+  // No garden/park swaps or broad synonyms.
+  const base = normalizeAliasName(name);
+  return base ? [base] : [];
+}
+
+async function indexAliasesForPark(db, parkId, data) {
+  try {
+    if (!data || !data.approved) return; // only approved parks participate
+    const name = data.name || '';
+    const lat = Number(data.latitude);
+    const lon = Number(data.longitude);
+    if (!name || !isFinite(lat) || !isFinite(lon)) return;
+    const key3 = clusterKey(lat, lon, 3);
+    const variants = aliasVariantsFromName(name);
+    const nowIso = new Date().toISOString();
+    const writes = variants.slice(0, 6).map(v => {
+      const aliasId = `a:${v}:${key3}`;
+      return db.collection('parkAliases').doc(aliasId).set({
+        parkId: parkId,
+        name: String(name),
+        alias: v,
+        lat,
+        lon,
+        updatedAt: nowIso,
+        createdAt: data.createdAt || nowIso,
+      }, { merge: true });
+    });
+    await Promise.all(writes);
+  } catch (e) {
+    console.warn('indexAliasesForPark error', e && e.message ? e.message : e);
+  }
+}
+
+async function attachAliasesToPlaces(db, places) {
+  if (!Array.isArray(places) || places.length === 0) return places || [];
+  const ids = new Set();
+  for (const p of places.slice(0, 80)) {
+    const dn = p.displayName && p.displayName.text ? p.displayName.text : (p.displayName || '');
+    const loc = p.location || {};
+    const la = Number(loc.latitude);
+    const lo = Number(loc.longitude);
+    if (!dn || !isFinite(la) || !isFinite(lo)) continue;
+    const key3 = clusterKey(la, lo, 3);
+    for (const v of aliasVariantsFromName(dn)) {
+      ids.add(`a:${v}:${key3}`);
+    }
+  }
+  const lookups = Array.from(ids).map(id => db.collection('parkAliases').doc(id).get().then(s => ({ id, s })).catch(() => null));
+  const snaps = await Promise.all(lookups);
+  const mapAlias = new Map();
+  for (const rec of snaps) {
+    if (!rec || !rec.s || !rec.s.exists) continue;
+    const d = rec.s.data() || {};
+    if (d.parkId) mapAlias.set(rec.id, d.parkId);
+  }
+  return places.map(p => {
+    const dn = p.displayName && p.displayName.text ? p.displayName.text : (p.displayName || '');
+    const loc = p.location || {};
+    const la = Number(loc.latitude);
+    const lo = Number(loc.longitude);
+    if (!dn || !isFinite(la) || !isFinite(lo)) return p;
+    const key3 = clusterKey(la, lo, 3);
+    for (const v of aliasVariantsFromName(dn)) {
+      const aid = `a:${v}:${key3}`;
+      const parkId = mapAlias.get(aid);
+      if (parkId) {
+        return { ...p, aliasParkId: parkId, aliasMatch: true };
+      }
+    }
+    return p;
+  });
 }
 
 async function runParksBackfillBatch({ db, settings, ownerUid, startAfterId = null }) {
@@ -1483,17 +1595,7 @@ exports.notifyParkModerationUpdate = functions.firestore
         await sendNotificationsToUsers(db, [submitterId], title, body, data);
         console.log(`Approval notification sent to ${submitterId} for park ${change.after.id}`);
 
-        // Also enqueue reverse geocoding now that the park is approved, if needed.
-        try {
-          const lat = Number(after.latitude);
-          const lng = Number(after.longitude);
-          const missingAddr = !after.address || !after.city || !after.state || String(after.address).trim().toLowerCase() === 'address not specified';
-          if (isFinite(lat) && isFinite(lng) && missingAddr) {
-            await enqueueGeocodeJob(db, { parkId: change.after.id, lat, lng, reason: 'park:approved', priority: 3 });
-          }
-        } catch (e) {
-          console.warn('enqueue on approval failed', e && e.message ? e.message : e);
-        }
+    // Removed: auto enqueue reverse-geocoding on approval — avoid API usage
       } else if (afterStatus === 'denied' && beforeStatus !== 'denied') {
         const reason = after.reviewMessage || 'Not approved.';
         const title = 'Park denied ❌';
@@ -1645,206 +1747,441 @@ async function sendNotificationsToUsers(db, userIds, title, body, data) {
 
 /**
  * ========================
- * PLACES (Geoapify) CITY BACKFILL
+ * RETRO MERGE: OSM pin + Google sports graft (server-side)
  * ========================
- * Seed a backlog of cities per state, then a scheduler ingests courts around each city
- * for basketball/tennis/pickleball using Geoapify text search (server-side), auto-approved.
+ * Scans existing parks and merges missing sports from nearby Google-sourced
+ * parks into OSM-sourced parks. Never deletes or moves pins; only appends
+ * new courts and recomputes sportCategories. Idempotent.
+ *
+ * Control/status docs:
+ *   retroMerge/control { cursor?: string, enabled?: boolean, pageSize?: number }
+ *   retroMerge/status  { lastRunAt, lastSuccessAt, pages, scanned, updatedParks, courtsAdded, cursor, done }
  */
 
-// Standardize a place object into { id, name, address, lat, lon, provider }
-function normalizeStdPlace(p) {
-  if (!p) return null;
-  const loc = p.location || {};
-  const id = p.id || '';
-  const provider = p.provider || 'google';
-  const name = (p.displayName && p.displayName.text) || p.displayName || 'Unknown';
-  const address = p.formattedAddress || '';
-  const lat = Number(loc.latitude);
-  const lon = Number(loc.longitude);
-  if (!isFinite(lat) || !isFinite(lon)) return null;
-  return { id, name, address, lat, lon, provider };
+function normNameForMerge(name) {
+  const s = String(name || '').toLowerCase();
+  return s
+    .replace(/[\u2014\u2013]/g, '-')
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/\b(park|recreation|rec|center|courts?|basketball|tennis|pickleball)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-function buildPlaceDocId(provider, placeId) {
-  const prov = (provider || 'google').toLowerCase();
-  const pid = String(placeId || '').trim();
-  if (!pid) return null;
-  return `place:${prov}:${pid}`;
+function similarNameMerge(a, b) {
+  const na = normNameForMerge(a);
+  const nb = normNameForMerge(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  return na.includes(nb) || nb.includes(na);
 }
 
-async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radiusMeters = 16000, maxCreates = 400, dryRun = false }) {
+function haversineMiles(lat1, lon1, lat2, lon2) {
+  const R = 3958.7613; // Earth radius in miles
+  const toRad = (d) => d * Math.PI / 180.0;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.asin(Math.min(1, Math.sqrt(a)));
+  return R * c;
+}
+
+function isGooglePark(doc) {
+  const s = String((doc && doc.source) || '').toLowerCase();
+  const a = String((doc && doc.sourceAttribution) || '').toLowerCase();
+  return s === 'places' || s.includes('google') || a.includes('google');
+}
+
+function isOsmPark(doc) {
+  const s = String((doc && doc.source) || '').toLowerCase();
+  const a = String((doc && doc.sourceAttribution) || '').toLowerCase();
+  return s.includes('osm') || a.includes('openstreetmap');
+}
+
+function sportCategoryFromType(st) {
+  const s = String(st || '').toLowerCase();
+  if (s.includes('pickle')) return 'pickleball';
+  if (s.includes('tennis')) return 'tennis';
+  return 'basketball';
+}
+
+function recomputeSportCategories(courts) {
+  const set = new Set();
+  for (const c of (courts || [])) {
+    set.add(sportCategoryFromType(c && c.sportType));
+  }
+  return Array.from(set).sort();
+}
+
+function mergeCourtsIfAddsValue(existing, incoming) {
+  if (!existing || !incoming) return null;
+  const existingCourts = Array.isArray(existing.courts) ? existing.courts : [];
+  const incomingCourts = Array.isArray(incoming.courts) ? incoming.courts : [];
+  const existingSports = new Set(existingCourts.map(c => c && c.sportType));
+  const incomingSports = new Set(incomingCourts.map(c => c && c.sportType));
+  const missing = Array.from(incomingSports).filter(s => s && !existingSports.has(s));
+  if (missing.length === 0) return null;
+  let nextNumber = 0;
+  for (const c of existingCourts) {
+    if (c && Number(c.courtNumber) > nextNumber) nextNumber = Number(c.courtNumber);
+  }
+  const additions = [];
   const nowIso = new Date().toISOString();
-  const remainingGlobal = await getGoogleRemainingCalls(db);
-  if (remainingGlobal <= 0) return { created: 0, skippedExists: 0, totalConsidered: 0 };
-
-  const bias = (isFinite(lat) && isFinite(lon)) ? { lat, lng: lon, radius: Math.max(4000, Math.min(26000, Math.floor(radiusMeters))) } : null;
-  const aggregated = new Map(); // key=id -> { place, sports:Set }
-
-  const textSynonyms = {
-    basketball: [
-      'basketball court', 'basketball courts', 'outdoor basketball', 'public basketball court', 'basketball hoop', 'streetball court', 'playground basketball', 'basketball park'
-    ],
-    tennis: [
-      'tennis court', 'tennis courts', 'public tennis', 'tennis center', 'tennis centre', 'tennis complex', 'tennis club', 'community tennis'
-    ],
-    pickleball: [
-      'pickleball court', 'pickleball courts', 'public pickleball', 'pickleball center', 'pickleball complex', 'pickleball club', 'pickleball park', 'community pickleball'
-    ],
+  for (const s of missing) {
+    const src = incomingCourts.find(c => c && c.sportType === s) || {};
+    nextNumber += 1;
+    additions.push({
+      id: `c${nextNumber}`,
+      courtNumber: nextNumber,
+      playerCount: 0,
+      sportType: s,
+      type: src.type || (String(s).includes('tennis') ? 'tennisSingles' : (String(s).includes('pickle') ? 'pickleballSingles' : 'fullCourt')),
+      hasLighting: !!src.hasLighting,
+      isHalfCourt: !!src.isHalfCourt,
+      isIndoor: !!src.isIndoor,
+      surface: src.surface || null,
+      lastUpdated: nowIso,
+      condition: src.condition || 'good',
+      customName: src.customName || null,
+      conditionNotes: src.conditionNotes || null,
+      gotNextQueue: Array.isArray(src.gotNextQueue) ? src.gotNextQueue : [],
+      source: incoming.source || 'google_places',
+      sourceAttribution: incoming.sourceAttribution || 'Google Places',
+    });
+  }
+  if (!additions.length) return null;
+  const mergedCourts = existingCourts.concat(additions);
+  return {
+    ...existing,
+    courts: mergedCourts,
+    sportCategories: recomputeSportCategories(mergedCourts),
+    updatedAt: nowIso,
   };
-
-  const takeAll = (list, sport) => {
-    for (const raw of (list || [])) {
-      const m = normalizeStdPlace(raw);
-      if (!m) continue;
-      const key = buildPlaceDocId(m.provider, m.id) || `${m.name}_${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
-      const entry = aggregated.get(key) || { place: m, sports: new Set() };
-      entry.sports.add(sport);
-      if ((m.name || '').length > (entry.place.name || '').length) entry.place.name = m.name;
-      if ((m.address || '').length > (entry.place.address || '').length) entry.place.address = m.address;
-      aggregated.set(key, entry);
-      if (aggregated.size >= maxCreates) break;
-    }
-  };
-
-  // Helper to run a single Google paged query and account calls
-  async function runPagedQuery(text, pagesCap = 2, pageSize = 20) {
-    const rem = await getGoogleRemainingCalls(db);
-    if (rem <= 0) return [];
-    const allowedPages = Math.max(1, Math.min(pagesCap, rem));
-    try {
-      const out = await fetchGoogleTextSearchPaged({ text, bias, pageAll: true, maxPages: allowedPages, pageSize });
-      const results = out.places || [];
-      const pagesUsed = Math.min(allowedPages, Math.ceil((results.length || 1) / pageSize));
-      await consumeGoogleCalls(db, pagesUsed);
-      return results;
-    } catch (e) {
-      console.warn('Google paged query error', e);
-      return [];
-    }
-  }
-
-  const sports = ['basketball', 'tennis', 'pickleball'];
-  for (const sport of sports) {
-    if (aggregated.size >= maxCreates) break;
-    const base = sport + ' court';
-    const baseQuery = base + (city && state ? ` in ${city}, ${state}` : '');
-    const baseResults = await runPagedQuery(baseQuery, 2, 20);
-    takeAll(baseResults, sport);
-
-    // Smart synonym cascade: only if low new count so far
-    const preCount = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
-    if (preCount < Math.min(60, Math.floor(maxCreates / 2))) {
-      let perSportCalls = 0;
-      for (const syn of textSynonyms[sport]) {
-        if (aggregated.size >= maxCreates) break;
-        if (perSportCalls >= 4) break;
-        if (syn === base) continue;
-        const q = syn + (city && state ? ` in ${city}, ${state}` : '');
-        const res = await runPagedQuery(q, 1, 20);
-        takeAll(res, sport);
-        perSportCalls += 1;
-        const nowCount = Array.from(aggregated.values()).filter(e => e.sports.has(sport)).length;
-        if (nowCount >= Math.min(80, Math.floor(maxCreates * 0.7))) break;
-      }
-    }
-  }
-
-  let created = 0;
-  let skippedExists = 0;
-  for (const [key, entry] of aggregated.entries()) {
-    if (created >= maxCreates) break;
-    const m = entry.place;
-    const sportsSet = Array.from(entry.sports);
-    const docId = buildPlaceDocId(m.provider, m.id) || key;
-
-    // Dedupe by location index first
-    const locKey = `ll:${m.lat.toFixed(5)},${m.lon.toFixed(5)}`;
-    const locRef = db.collection('parkLocIndex').doc(locKey);
-    const locSnap = await locRef.get().catch(() => null);
-    if (locSnap && locSnap.exists) {
-      const target = locSnap.data() && locSnap.data().parkId;
-      if (target) {
-        try {
-          await db.collection('parks').doc(target).set({
-            altSources: admin.firestore.FieldValue.arrayUnion({ type: 'places', ref: `${m.provider}:${m.id}` }),
-            updatedAt: nowIso,
-          }, { merge: true });
-        } catch (_) {}
-        skippedExists += 1;
-        continue;
-      }
-    }
-
-    // Check direct id existence
-    const ref = db.collection('parks').doc(docId);
-    const exists = await ref.get();
-    if (exists.exists) { skippedExists += 1; continue; }
-
-    // Build courts from sports
-    const hasLighting = false;
-    const courts = [];
-    let seq = 0;
-    const mapSportType = (s) => s === 'tennis' ? 'tennisSingles' : (s === 'pickleball' ? 'pickleballSingles' : 'basketball');
-    const mapCourtType = (s) => s === 'tennis' ? 'tennisSingles' : (s === 'pickleball' ? 'pickleballSingles' : 'fullCourt');
-    for (const s of sportsSet) {
-      seq += 1;
-      courts.push({ id: `c${seq}`, courtNumber: seq, customName: null, playerCount: 0, sportType: mapSportType(s), type: mapCourtType(s), condition: 'good', hasLighting, isHalfCourt: false, isIndoor: false, surface: null, lastUpdated: nowIso, conditionNotes: null, gotNextQueue: [] });
-    }
-    if (courts.length === 0) {
-      courts.push({ id: 'c1', courtNumber: 1, customName: null, playerCount: 0, sportType: 'basketball', type: 'fullCourt', condition: 'good', hasLighting, isHalfCourt: false, isIndoor: false, surface: null, lastUpdated: nowIso, conditionNotes: null, gotNextQueue: [] });
-    }
-    const sportCategories = Array.from(new Set(courts.map(ct => ct.sportType.includes('pickle') ? 'pickleball' : (ct.sportType.includes('tennis') ? 'tennis' : 'basketball')))).sort();
-    let friendlyName = m.name && String(m.name).trim();
-    if (!friendlyName || /^(basketball|tennis|pickleball) court(s)?$/i.test(friendlyName) || /^(court|courts)\s*\d*$/i.test(friendlyName)) {
-      const primary = courts[0] && courts[0].sportType && (courts[0].sportType.includes('pickle') ? 'pickleball' : (courts[0].sportType.includes('tennis') ? 'tennis' : 'basketball'));
-      friendlyName = fallbackNameFromContext({ original: friendlyName, address: m.address || '', city, sport: primary });
-    }
-
-    if (dryRun) { created += 1; continue; }
-
-    await ref.set({
-      id: docId,
-      name: titleCase(friendlyName),
-      address: m.address || '',
-      city: city || '',
-      state: canonState(state || ''),
-      latitude: m.lat,
-      longitude: m.lon,
-      courts,
-      sportCategories,
-      photoUrls: [],
-      amenities: [],
-      averageRating: 0.0,
-      totalReviews: 0,
-      description: null,
-      approved: true,
-      reviewStatus: 'approved',
-      createdByUserId: adminUid || 'system',
-      createdByName: 'Google Places Import',
-      approvedByUserId: adminUid || 'system',
-      approvedAt: nowIso,
-      reviewedByUserId: adminUid || 'system',
-      reviewedAt: nowIso,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      source: 'places',
-      sourceId: `${m.provider}:${m.id}`,
-      sourceAttribution: 'Google Places',
-      needsGeocode: true,
-      geocodeQueuedAt: nowIso,
-    }, { merge: false });
-
-    try { await locRef.set({ parkId: docId, lat: m.lat, lon: m.lon, state: canonState(state || ''), registeredAt: nowIso }, { merge: false }); } catch (_) {}
-    try { await db.collection('parks_geocode_queue').doc(docId).set({ parkId: docId, lat: m.lat, lng: m.lon, reason: 'places:new', priority: 5, status: 'queued', attempts: 0, createdAt: nowIso }, { merge: true }); } catch (_) {}
-    created += 1;
-  }
-
-  if (aggregated.size === 0) {
-    console.log('[placesImport:google] zero results for', { city, state, lat, lon, radiusMeters });
-  }
-
-  return { created, skippedExists, totalConsidered: aggregated.size };
 }
+
+async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, startAfterId = null, dryRun = false } = {}) {
+  let base = db.collection('parks').orderBy(admin.firestore.FieldPath.documentId());
+  if (startAfterId) {
+    try {
+      const cur = await db.collection('parks').doc(startAfterId).get();
+      if (cur.exists) base = base.startAfter(cur);
+    } catch (_) {}
+  }
+  const snap = await base.limit(pageSize).get();
+  if (snap.empty) return { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, cursor: null, done: true };
+
+  const docs = snap.docs.map(d => ({ id: d.id, ...(d.data() || {}) }));
+  const round4 = (v) => Number(v).toFixed(4);
+  const bins = new Map();
+  for (const p of docs) {
+    const lat = Number(p.latitude);
+    const lon = Number(p.longitude);
+    if (!isFinite(lat) || !isFinite(lon)) continue;
+    const key = `${round4(lat)},${round4(lon)}`;
+    const arr = bins.get(key) || [];
+    arr.push(p);
+    bins.set(key, arr);
+  }
+
+  let updatedParks = 0, courtsAdded = 0, scanned = docs.length;
+  let writes = 0;
+  let batch = db.batch();
+  const commit = async () => { if (!dryRun && writes > 0) { await batch.commit(); batch = db.batch(); writes = 0; } };
+
+  for (const arr of bins.values()) {
+    const osmList = arr.filter(isOsmPark);
+    const googleList = arr.filter(isGooglePark);
+    if (!osmList.length || !googleList.length) continue;
+    for (const osm of osmList) {
+      let accumulator = { ...osm };
+      let changed = false;
+      for (const gp of googleList) {
+        if (!similarNameMerge(accumulator.name, gp.name)) continue;
+        const d = haversineMiles(Number(accumulator.latitude), Number(accumulator.longitude), Number(gp.latitude), Number(gp.longitude));
+        if (d > proximityMiles) continue;
+        const merged = mergeCourtsIfAddsValue(accumulator, gp);
+        if (merged) {
+          const before = Array.isArray(accumulator.courts) ? accumulator.courts.length : 0;
+          const after = Array.isArray(merged.courts) ? merged.courts.length : 0;
+          if (after > before) courtsAdded += (after - before);
+          accumulator = merged;
+          changed = true;
+        }
+      }
+      if (changed) {
+        updatedParks += 1;
+        const ref = db.collection('parks').doc(accumulator.id);
+        if (!dryRun) {
+          batch.update(ref, accumulator);
+          writes += 1;
+          if (writes >= 400) await commit();
+        }
+      }
+    }
+  }
+
+  await commit();
+  const cursor = docs[docs.length - 1].id;
+  const done = docs.length < pageSize;
+  return { pages: 1, scanned, updatedParks, courtsAdded, cursor, done };
+}
+
+exports.runRetroMergeOnce = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const callerUid = context.auth.uid;
+    const adminUid = await getAdminUid(db);
+    if (!adminUid || callerUid !== adminUid) {
+      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run retro merge');
+    }
+    const controlRef = db.collection('retroMerge').doc('control');
+    const statusRef = db.collection('retroMerge').doc('status');
+    const pageSize = Math.max(400, Math.min(1400, Number(data && data.pageSize) || 1000));
+    const dryRun = !!(data && data.dryRun);
+    try {
+      const ctrl = await controlRef.get().catch(() => null);
+      const cursor = ctrl && ctrl.exists ? (ctrl.data().cursor || null) : null;
+      const res = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...res, pageSize, dryRun }, { merge: true });
+      await controlRef.set({ cursor: res.done ? null : res.cursor, updatedAt: nowIso }, { merge: true });
+      return { ok: true, ...res, pageSize, dryRun };
+    } catch (e) {
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastErrorAt: nowIso, lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true }).catch(() => {});
+      throw new functions.https.HttpsError('internal', e?.message || 'Unknown error');
+    }
+  });
+
+// HTTP wrapper for CI (GridHub/GitHub). Requires X-Run-Secret header.
+exports.runRetroMergeOnceHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+      const db = admin.firestore();
+      const controlRef = db.collection('retroMerge').doc('control');
+      const statusRef = db.collection('retroMerge').doc('status');
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const pageSize = Math.max(400, Math.min(1400, Number(body.pageSize) || 1000));
+      const dryRun = body.dryRun === true;
+      const ctrlSnap = await controlRef.get().catch(() => null);
+      const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+      const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...resBatch, pageSize, dryRun }, { merge: true });
+      await controlRef.set({ cursor: resBatch.done ? null : resBatch.cursor, updatedAt: nowIso }, { merge: true });
+      res.status(200).json({ ok: true, ...resBatch, pageSize, dryRun });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * Owner-callable: Sweep Retro-merge across all parks in one session (looped)
+ */
+exports.runRetroMergeAll = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const callerUid = context.auth.uid;
+    const adminUid = await getAdminUid(db);
+    if (!adminUid || callerUid !== adminUid) {
+      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run retro merge');
+    }
+    const pageSize = Math.max(400, Math.min(1400, Number(data && data.pageSize) || 1000));
+    const dryRun = !!(data && data.dryRun);
+    const t0 = Date.now();
+    let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
+    let cursor = null;
+    let done = false;
+    do {
+      const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
+      cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+      const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
+      agg.pages += out.pages;
+      agg.scanned += out.scanned;
+      agg.updatedParks += out.updatedParks;
+      agg.courtsAdded += out.courtsAdded;
+      done = !!out.done;
+      // Check time headroom (~20s)
+      if (!done && (Date.now() - t0) > 520000) break;
+    } while (!done);
+    return { ok: true, ...agg, done, pageSize, dryRun };
+  });
+
+/**
+ * HTTP: Sweep Retro-merge fully with shared secret
+ */
+exports.runRetroMergeAllHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+      const db = admin.firestore();
+      const pageSize = Math.max(400, Math.min(1400, Number((req.body && req.body.pageSize) || 1000)));
+      const dryRun = (req.body && req.body.dryRun) === true;
+      const t0 = Date.now();
+      let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
+      let cursor = null;
+      let done = false;
+      do {
+        const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
+        cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+        const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
+        agg.pages += out.pages;
+        agg.scanned += out.scanned;
+        agg.updatedParks += out.updatedParks;
+        agg.courtsAdded += out.courtsAdded;
+        done = !!out.done;
+        if (!done && (Date.now() - t0) > 520000) break;
+      } while (!done);
+      res.status(200).json({ ok: true, ...agg, done, pageSize, dryRun });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * Owner-callable: Run both fix-city and retro-merge, sweeping each fully.
+ */
+exports.runOneTimeSweepAll = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const callerUid = context.auth.uid;
+    const adminUid = await getAdminUid(db);
+    if (!adminUid || callerUid !== adminUid) {
+      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run this');
+    }
+    const fixPageSize = Math.max(200, Math.min(1500, Number(data && data.fixPageSize) || 1200));
+    const retroPageSize = Math.max(400, Math.min(1400, Number(data && data.retroPageSize) || 1000));
+    const t0 = Date.now();
+    // Part 1: Fix city/state fully (loop until done or time limit)
+    let fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: false };
+    {
+      let resume = (data && data.resumeFix) !== false;
+      do {
+        const out = await runFixCityFromAddressBatch(db, { pageSize: fixPageSize, resume });
+        fix = { pages: out.pages, scanned: out.scanned, updated: out.updated, skippedEmpty: out.skippedEmpty, ambiguous: out.ambiguous, done: !!out.done };
+        resume = true;
+        if (!fix.done && (Date.now() - t0) > 480000) break; // leave time for retro
+      } while (!fix.done);
+    }
+    // Part 2: Retro-merge for remaining time
+    let retro = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, done: false };
+    {
+      let done = false;
+      do {
+        const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
+        const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+        const out = await runRetroMergeBatch(db, { pageSize: retroPageSize, startAfterId: cursor, dryRun: false });
+        retro.pages += out.pages;
+        retro.scanned += out.scanned;
+        retro.updatedParks += out.updatedParks;
+        retro.courtsAdded += out.courtsAdded;
+        done = !!out.done;
+        retro.done = done;
+        if (!done && (Date.now() - t0) > 520000) break;
+      } while (!retro.done);
+    }
+    return { ok: true, fix, retro };
+  });
+
+/**
+ * HTTP: Run both jobs fully with one request (shared secret)
+ */
+exports.runOneTimeSweepAllHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+      const db = admin.firestore();
+      const fixPageSize = Math.max(200, Math.min(1500, Number((req.body && req.body.fixPageSize) || 1200)));
+      const retroPageSize = Math.max(400, Math.min(1400, Number((req.body && req.body.retroPageSize) || 1000)));
+      const t0 = Date.now();
+      let fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: false };
+      // Fix City/State loop
+      {
+        let resume = (req.body && req.body.resumeFix) !== false;
+        do {
+          const out = await runFixCityFromAddressBatch(db, { pageSize: fixPageSize, resume });
+          fix = { pages: out.pages, scanned: out.scanned, updated: out.updated, skippedEmpty: out.skippedEmpty, ambiguous: out.ambiguous, done: !!out.done };
+          resume = true;
+          if (!fix.done && (Date.now() - t0) > 480000) break;
+        } while (!fix.done);
+      }
+      // Retro-merge loop
+      let retro = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, done: false };
+      {
+        let done = false;
+        do {
+          const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
+          const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+          const out = await runRetroMergeBatch(db, { pageSize: retroPageSize, startAfterId: cursor, dryRun: false });
+          retro.pages += out.pages;
+          retro.scanned += out.scanned;
+          retro.updatedParks += out.updatedParks;
+          retro.courtsAdded += out.courtsAdded;
+          done = !!out.done;
+          retro.done = done;
+          if (!done && (Date.now() - t0) > 520000) break;
+        } while (!retro.done);
+      }
+      res.status(200).json({ ok: true, fix, retro });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+// Optional scheduler: disabled by default unless retroMerge/control.enabled == true
+exports.scheduledRetroMerge = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub.schedule('every 10 minutes').timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const controlRef = db.collection('retroMerge').doc('control');
+    const statusRef = db.collection('retroMerge').doc('status');
+    try {
+      const ctrl = await controlRef.get().catch(() => null);
+      const cfg = ctrl && ctrl.exists ? (ctrl.data() || {}) : {};
+      const enabled = cfg.enabled === true;
+      if (!enabled) { await statusRef.set({ lastRunAt: new Date().toISOString(), note: 'skipped: disabled' }, { merge: true }); return null; }
+      const pageSize = Math.max(400, Math.min(1400, Number(cfg.pageSize) || 1000));
+      const cursor = cfg.cursor || null;
+      const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun: false });
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...resBatch, pageSize }, { merge: true });
+      await controlRef.set({ cursor: resBatch.done ? null : resBatch.cursor, updatedAt: nowIso }, { merge: true });
+      return null;
+    } catch (e) {
+      try { await statusRef.set({ lastRunAt: new Date().toISOString(), lastErrorAt: new Date().toISOString(), lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true }); } catch (_) {}
+      return null;
+    }
+  });
+
+/**
+// Removed: all Google Places import/backfill helpers and endpoints — no more imports
 
 // importPlacesForCitySimple removed — Google-only pipeline
 
@@ -1928,99 +2265,14 @@ async function importPlacesForCity({ db, adminUid, city, state, lat, lon, radius
  * Runs every 6 hours. Writes to stats/states/<state> and stats/states/<state>/cities/<city>
  */
 // Google-Places-only scheduler: iterate imports/googlePlaces/targets
-exports.scheduledGooglePlacesBackfill = functions
-  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
-  .pubsub
-  .schedule('every 10 minutes')
-  .timeZone('Etc/UTC')
-  .onRun(async () => {
-    const db = admin.firestore();
-    if (!GOOGLE_KEY) { console.warn('[googleBackfill] GOOGLE_KEY not configured'); return null; }
-    const statusRef = db.collection('imports').doc('googlePlaces');
-    const targetsColl = statusRef.collection('targets');
-    const nowIso = new Date().toISOString();
-    try {
-      const cfgSnap = await statusRef.get().catch(() => null);
-      const cfg = cfgSnap && cfgSnap.exists ? (cfgSnap.data() || {}) : {};
-      const enabled = cfg.enabled === true;
-      if (!enabled) { await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: disabled' }, { merge: true }); return null; }
-      const useWindow = cfg.useWindow !== false;
-      const citiesPerRun = Math.max(1, Math.min(5, Number(cfg.citiesPerRun) || 1));
-      if (useWindow) {
-        const allowed = await isWithinNightlyWindowUtc(db);
-        if (!allowed) { await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: outside window' }, { merge: true }); return null; }
-      }
-      let remaining = await getGoogleRemainingCalls(db);
-      if (remaining <= 0) { await statusRef.set({ lastRunAt: nowIso, lastNote: 'skipped: monthly cap reached' }, { merge: true }); return null; }
-
-      const tSnap = await targetsColl.get();
-      if (tSnap.empty) { await statusRef.set({ lastRunAt: nowIso, lastNote: 'no targets' }, { merge: true }); return null; }
-      const targets = tSnap.docs.map(d => ({ id: d.id, ...(d.data() || {}) }));
-      const stateOrderIdx = (s) => {
-        const i = WEST_TO_EAST_STATE_ORDER.indexOf(String(s || '').toUpperCase());
-        return i >= 0 ? i : 999;
-      };
-      targets.sort((a, b) => (stateOrderIdx(a.state) - stateOrderIdx(b.state)) || String(a.city || '').localeCompare(String(b.city || '')));
-      let nextIndex = Math.max(0, Math.min(targets.length - 1, Number(cfg.nextIndex) || 0));
-
-      const adminUid = await getAdminUid(db);
-      let processed = 0;
-      for (let i = 0; i < citiesPerRun && remaining > 0; i++) {
-        const target = targets[nextIndex];
-        nextIndex = (nextIndex + 1) % targets.length;
-        if (!target) break;
-        const city = String(target.city || '').trim();
-        const state = String(target.state || '').trim();
-        const lat = Number(target.lat);
-        const lon = Number(target.lon);
-        const radiusMeters = Math.max(2000, Math.min(40000, Math.round((Number(target.radiusKm) || 10) * 1000)));
-        const maxCreates = Math.max(1, Math.min(400, Number(target.maxCreates) || 200));
-        const resImp = await importPlacesForCity({ db, adminUid: adminUid || 'system', city, state, lat: isFinite(lat) ? lat : undefined, lon: isFinite(lon) ? lon : undefined, radiusMeters, maxCreates, dryRun: false });
-        processed += 1;
-        remaining = await getGoogleRemainingCalls(db);
-        await statusRef.set({ lastRunAt: nowIso, lastRunCity: city, lastRunState: canonState(state || ''), lastCreated: resImp.created, lastTotalConsidered: resImp.totalConsidered }, { merge: true });
-        try { await statusRef.collection('logs').doc(`${nowIso.replace(/[:.]/g, '-')}_${city}_${state}`.slice(0,120)).set({ ts: nowIso, ok: true, target, result: resImp }); } catch (_) {}
-      }
-      await statusRef.set({ nextIndex }, { merge: true });
-      return null;
-    } catch (e) {
-      try { await statusRef.set({ lastRunAt: nowIso, lastErrorAt: nowIso, lastError: (e && e.message) ? String(e.message).slice(0, 300) : String(e).slice(0, 300) }, { merge: true }); } catch (_) {}
-      return null;
-    }
-  });
+// Removed: scheduledGooglePlacesBackfill — no more city imports
 
 /**
  * HTTP: Run a one-off Google Places import for a single city/target.
  * Security: requires X-Run-Secret matching BACKFILL_RUN_SECRET/backfill.run_secret.
  * Body: { city, state, lat?, lon?, radiusKm?, maxCreates?, dryRun? }
  */
-exports.runGooglePlacesImportForCityHttp = functions
-  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
-  .https.onRequest(async (req, res) => {
-    try {
-      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
-      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
-      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
-      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
-
-      const db = admin.firestore();
-      const adminUid = await getAdminUid(db);
-      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
-      const city = String(body.city || '').trim();
-      const state = String(body.state || '').trim().toUpperCase();
-      const lat = isFinite(Number(body.lat)) ? Number(body.lat) : undefined;
-      const lon = isFinite(Number(body.lon)) ? Number(body.lon) : undefined;
-      const radiusKm = Math.max(2, Math.min(40, Number(body.radiusKm) || 10));
-      const maxCreates = Math.max(1, Math.min(400, Number(body.maxCreates) || 200));
-      const dryRun = body.dryRun === true;
-      if (!city && (!lat || !lon)) { res.status(400).json({ ok: false, error: 'Provide either city+state or lat+lon' }); return; }
-
-      const result = await importPlacesForCity({ db, adminUid: adminUid || 'system', city, state, lat, lon, radiusMeters: Math.round(radiusKm * 1000), maxCreates, dryRun });
-      res.status(200).json({ ok: true, result });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
-    }
-  });
+// Removed: runGooglePlacesImportForCityHttp — no more ad-hoc imports
 
 exports.scheduledBuildStateCityIndex = functions.pubsub
   .schedule('every 6 hours')
@@ -2094,206 +2346,7 @@ exports.scheduledBuildStateCityIndex = functions.pubsub
     return null;
   });
 
-/**
- * ========================
- * GOOGLE PLACES — WEST→EAST CURSOR (seedless/minimal)
- * ========================
- * Processes exactly ONE city per tick (default: every 1 minute), moving West→East
- * through the US. It requires no backlog. It discovers city names from
- * stats/states/<state>/cities (built by scheduledBuildStateCityIndex). If a state has
- * no entries yet, it falls back to the state capital name only (seedless fallback).
- *
- * Firestore control doc (imports/googlePlaces/cursor):
- *  { enabled?: boolean, paused?: boolean, stateIndex?: number, cityIndex?: number,
- *    radiusKm?: number, maxCreates?: number, oneCityPerTick?: boolean,
- *    nextState?: string, lastRunAt?: string, lastNote?: string }
- *
- * Defaults:
- *  - enabled=false (explicit opt-in)
- *  - oneCityPerTick=true (safe, ~1 city/min)
- *  - radiusKm=12, maxCreates=200
- *
- * Hard guardrails:
- *  - Honors 90k/month Google cap via getGoogleRemainingCalls
- *  - If remaining == 0 → skips run
- *
- * You can also trigger a single step via HTTPS for review/testing
- * (see runGoogleWestToEastCursorHttp below).
- */
-
-const STATE_CAPITALS = {
-  AL: 'Montgomery', AK: 'Juneau', AZ: 'Phoenix', AR: 'Little Rock', CA: 'Sacramento',
-  CO: 'Denver', CT: 'Hartford', DE: 'Dover', DC: 'Washington', FL: 'Tallahassee',
-  GA: 'Atlanta', HI: 'Honolulu', ID: 'Boise', IL: 'Springfield', IN: 'Indianapolis',
-  IA: 'Des Moines', KS: 'Topeka', KY: 'Frankfort', LA: 'Baton Rouge', ME: 'Augusta',
-  MD: 'Annapolis', MA: 'Boston', MI: 'Lansing', MN: 'St. Paul', MS: 'Jackson',
-  MO: 'Jefferson City', MT: 'Helena', NE: 'Lincoln', NV: 'Carson City', NH: 'Concord',
-  NJ: 'Trenton', NM: 'Santa Fe', NY: 'Albany', NC: 'Raleigh', ND: 'Bismarck',
-  OH: 'Columbus', OK: 'Oklahoma City', OR: 'Salem', PA: 'Harrisburg', RI: 'Providence',
-  SC: 'Columbia', SD: 'Pierre', TN: 'Nashville', TX: 'Austin', UT: 'Salt Lake City',
-  VT: 'Montpelier', VA: 'Richmond', WA: 'Olympia', WV: 'Charleston', WI: 'Madison', WY: 'Cheyenne'
-};
-
-async function readCityListForState(db, state) {
-  // Prefer dynamic city list from diagnostics index; fallback to capital
-  const names = [];
-  try {
-    const stateRef = db.collection('stats').doc('states').collection('states').doc(state);
-    // orderBy('count','desc') requires index; if missing, fall back to un-ordered
-    let snap;
-    try {
-      snap = await stateRef.collection('cities').orderBy('count', 'desc').limit(50).get();
-    } catch (_) {
-      snap = await stateRef.collection('cities').limit(50).get();
-    }
-    snap.forEach(d => { const c = d.id || (d.data()?.city); if (c) names.push(String(c)); });
-  } catch (_) {}
-  if (!names.length) {
-    const cap = STATE_CAPITALS[state];
-    if (cap) names.push(cap);
-  }
-  return Array.from(new Set(names));
-}
-
-async function stepGoogleWestToEastCursor(db, { dryRun = false } = {}) {
-  const statusRef = db.collection('imports').doc('googlePlaces');
-  const cursorRef = statusRef.collection('config').doc('cursor');
-  const nowIso = new Date().toISOString();
-  const cfgSnap = await cursorRef.get().catch(() => null);
-  const cfg = cfgSnap && cfgSnap.exists ? (cfgSnap.data() || {}) : {};
-
-  const enabled = cfg.enabled === true;
-  const paused = cfg.paused === true;
-  const radiusKm = Math.max(2, Math.min(40, Number(cfg.radiusKm) || 12));
-  const maxCreates = Math.max(1, Math.min(400, Number(cfg.maxCreates) || 200));
-  const oneCityPerTick = cfg.oneCityPerTick !== false; // default true
-  let stateIndex = Math.max(0, Math.min(WEST_TO_EAST_STATE_ORDER.length - 1, Number(cfg.stateIndex) || 0));
-  let cityIndex = Math.max(0, Number(cfg.cityIndex) || 0);
-
-  if (!enabled) {
-    await statusRef.set({ lastRunAt: nowIso, lastNote: 'cursor skipped: disabled' }, { merge: true });
-    return { skipped: true, reason: 'disabled' };
-  }
-  if (paused) {
-    await statusRef.set({ lastRunAt: nowIso, lastNote: 'cursor skipped: paused' }, { merge: true });
-    return { skipped: true, reason: 'paused' };
-  }
-
-  const remaining = await getGoogleRemainingCalls(db);
-  if (remaining <= 0) {
-    await statusRef.set({ lastRunAt: nowIso, lastNote: 'cursor skipped: monthly cap reached' }, { merge: true });
-    return { skipped: true, reason: 'cap' };
-  }
-
-  let attempts = 0;
-  let chosen = null;
-  let lastState = null;
-  while (attempts < WEST_TO_EAST_STATE_ORDER.length) {
-    const state = WEST_TO_EAST_STATE_ORDER[stateIndex];
-    const cities = await readCityListForState(db, state);
-    if (!cities.length) {
-      // advance to next state
-      stateIndex = (stateIndex + 1) % WEST_TO_EAST_STATE_ORDER.length;
-      cityIndex = 0;
-      attempts += 1;
-      continue;
-    }
-    if (cityIndex >= cities.length) {
-      stateIndex = (stateIndex + 1) % WEST_TO_EAST_STATE_ORDER.length;
-      cityIndex = 0;
-      attempts += 1;
-      continue;
-    }
-    chosen = { city: String(cities[cityIndex]).trim(), state };
-    lastState = state;
-    break;
-  }
-
-  if (!chosen) {
-    await statusRef.set({ lastRunAt: nowIso, lastNote: 'cursor found no cities' }, { merge: true });
-    return { skipped: true, reason: 'no-cities' };
-  }
-
-  const adminUid = await getAdminUid(db);
-  const result = dryRun
-    ? { created: 0, skippedExists: 0, totalConsidered: 0 }
-    : await importPlacesForCity({
-        db,
-        adminUid: adminUid || 'system',
-        city: chosen.city,
-        state: chosen.state,
-        radiusMeters: Math.round(radiusKm * 1000),
-        maxCreates,
-        dryRun: false,
-      });
-
-  // Advance cursor to next city (or state) for the next tick
-  cityIndex += 1;
-  await cursorRef.set({
-    enabled: true,
-    paused: false,
-    stateIndex,
-    cityIndex,
-    radiusKm,
-    maxCreates,
-    oneCityPerTick,
-    nextState: WEST_TO_EAST_STATE_ORDER[stateIndex],
-    lastRunAt: nowIso,
-    lastCity: chosen.city,
-    lastState: chosen.state,
-    lastCreated: result.created,
-    lastTotalConsidered: result.totalConsidered,
-  }, { merge: true });
-
-  await statusRef.set({
-    lastRunAt: nowIso,
-    lastRunCity: chosen.city,
-    lastRunState: chosen.state,
-    lastCreated: result.created,
-    lastTotalConsidered: result.totalConsidered,
-    cursorStateIndex: stateIndex,
-    cursorCityIndex: cityIndex,
-  }, { merge: true });
-
-  return { ok: true, chosen, result };
-}
-
-exports.scheduledGoogleWestToEastCursor = functions
-  .runWith({ timeoutSeconds: 300, memory: '512MB', maxInstances: 1 })
-  .pubsub
-  .schedule('every 1 minutes')
-  .timeZone('Etc/UTC')
-  .onRun(async () => {
-    const db = admin.firestore();
-    if (!GOOGLE_KEY) { console.warn('[westToEastCursor] GOOGLE_KEY not configured'); return null; }
-    try {
-      const out = await stepGoogleWestToEastCursor(db, { dryRun: false });
-      console.log('[westToEastCursor] step', JSON.stringify(out).slice(0, 400));
-      return null;
-    } catch (e) {
-      console.error('[westToEastCursor] error', e && e.message ? e.message : e);
-      return null;
-    }
-  });
-
-// HTTP: run a single cursor step on demand for review/testing
-// Security: X-Run-Secret must match BACKFILL_RUN_SECRET/backfill.run_secret
-exports.runGoogleWestToEastCursorHttp = functions
-  .runWith({ timeoutSeconds: 300, memory: '512MB', maxInstances: 1 })
-  .https.onRequest(async (req, res) => {
-    try {
-      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
-      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
-      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
-      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
-      const db = admin.firestore();
-      const dryRun = req.query.dryRun === 'true' || (req.body && req.body.dryRun === true);
-      const out = await stepGoogleWestToEastCursor(db, { dryRun });
-      res.status(200).json({ ok: true, dryRun, ...out });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
-    }
-  });
+// Removed: Google West→East cursor (scheduler and HTTP) — no automated Google imports
 
 /**
  * Cloud Function: Send push notifications when a user checks into a court
