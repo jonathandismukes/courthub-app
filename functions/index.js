@@ -1996,17 +1996,47 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
   const roundN = (v) => Number(v).toFixed(DECIMALS);
   const keyOf = (lat, lon) => `${roundN(lat)},${roundN(lon)}`;
 
-  // Build bins for GOOGLE parks only to keep candidate sets small
+  // Build bins for GOOGLE parks. To avoid cross-page misses, pull a small
+  // latitude window around this page and include Google docs from that window.
   const googleBins = new Map();
-  for (const p of docs) {
-    const lat = Number(p.latitude);
-    const lon = Number(p.longitude);
-    if (!isFinite(lat) || !isFinite(lon)) continue;
-    if (!isGooglePark(p)) continue;
-    const key = keyOf(lat, lon);
-    const arr = googleBins.get(key) || [];
-    arr.push(p);
-    googleBins.set(key, arr);
+  {
+    let minLat = Infinity, maxLat = -Infinity;
+    for (const p of docs) {
+      const la = Number(p.latitude);
+      if (!isFinite(la)) continue;
+      if (la < minLat) minLat = la;
+      if (la > maxLat) maxLat = la;
+    }
+    // Guard in case of bad data
+    if (!isFinite(minLat) || !isFinite(maxLat)) {
+      minLat = -90; maxLat = 90;
+    }
+    // Convert miles to degrees latitude (~69 miles per degree). Add safety margin.
+    const latPad = Math.max(0.002, (Number(proximityMiles) || 0.12) / 69 * 2.0);
+    const low = minLat - latPad;
+    const high = maxLat + latPad;
+
+    // Window query by latitude only (no composite index required). We filter
+    // to Google in-memory and then bin by coarse key.
+    const winSnap = await db
+      .collection('parks')
+      .orderBy('latitude')
+      .where('latitude', '>=', low)
+      .where('latitude', '<=', high)
+      .select(...neededFields)
+      .get();
+
+    for (const d of winSnap.docs) {
+      const p = { id: d.id, ...(d.data() || {}) };
+      const lat = Number(p.latitude);
+      const lon = Number(p.longitude);
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      if (!isGooglePark(p)) continue;
+      const key = keyOf(lat, lon);
+      const arr = googleBins.get(key) || [];
+      arr.push(p);
+      googleBins.set(key, arr);
+    }
   }
 
   function neighborKeys(lat, lon) {
@@ -2029,11 +2059,14 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
   // Track per‑Google doc locality correction so we only write once per id
   const googleLocalityFix = new Map(); // id -> { city, state }
 
-  // Iterate OSM parks and attempt merges against candidate Google parks
-  for (const osm of docs) {
-    if (!isOsmPark(osm)) continue;
-    const la = Number(osm.latitude);
-    const lo = Number(osm.longitude);
+  // Iterate non-Google parks (OSM, community, municipal, etc.) and attempt merges
+  // against candidate Google parks. Previously we restricted to OSM only, which
+  // caused 0 updates when records weren’t tagged as OSM. Broadening to "any non‑Google"
+  // preserves the intent (never merge into Google pins) while fixing missed targets.
+  for (const target of docs) {
+    if (isGooglePark(target)) continue;
+    const la = Number(target.latitude);
+    const lo = Number(target.longitude);
     if (!isFinite(la) || !isFinite(lo)) continue;
 
     const candidateLists = neighborKeys(la, lo).map(k => googleBins.get(k) || []);
@@ -2041,11 +2074,11 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
     if (!candidates.length) continue;
 
     // Work on a local copy of courts for incremental merges from multiple candidates
-    let localCourts = Array.isArray(osm.courts) ? osm.courts : [];
+    let localCourts = Array.isArray(target.courts) ? target.courts : [];
     let pendingUpdate = null;
     for (const gp of candidates) {
       // Quick filters
-      if (!similarNameMerge(osm.name, gp.name)) continue;
+      if (!similarNameMerge(target.name, gp.name)) continue;
       const d = haversineMiles(la, lo, Number(gp.latitude), Number(gp.longitude));
       if (d > proximityMiles) continue;
 
@@ -2064,8 +2097,8 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
       //  2) If OSM locality is empty, try parsing Google address and use that.
       //  3) Only write if it actually changes city or state.
       try {
-        const osmCity = String(osm.city || '').trim();
-        const osmState = canonState(String(osm.state || '').trim());
+        const osmCity = String(target.city || '').trim();
+        const osmState = canonState(String(target.state || '').trim());
         const gCity = String(gp.city || '').trim();
         const gState = canonState(String(gp.state || '').trim());
         let targetCity = gCity;
@@ -2087,7 +2120,7 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
 
     if (pendingUpdate) {
       updatedParks += 1;
-      const ref = db.collection('parks').doc(osm.id);
+      const ref = db.collection('parks').doc(target.id);
       if (!dryRun) {
         batch.update(ref, pendingUpdate);
         writes += 1;
@@ -2128,15 +2161,16 @@ exports.runRetroMergeOnce = functions
     const controlRef = db.collection('retroMerge').doc('control');
     const statusRef = db.collection('retroMerge').doc('status');
     const pageSize = Math.max(400, Math.min(3000, Number(data && data.pageSize) || 1200));
+    const proximityMiles = Math.max(0.03, Math.min(1.0, Number(data && data.proximityMiles) || 0.12));
     const dryRun = !!(data && data.dryRun);
     try {
       const ctrl = await controlRef.get().catch(() => null);
       const cursor = ctrl && ctrl.exists ? (ctrl.data().cursor || null) : null;
-      const res = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
+      const res = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
       const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...res, pageSize, dryRun }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...res, pageSize, proximityMiles, dryRun }, { merge: true });
       await controlRef.set({ cursor: res.done ? null : res.cursor, updatedAt: nowIso }, { merge: true });
-      return { ok: true, ...res, pageSize, dryRun };
+      return { ok: true, ...res, pageSize, proximityMiles, dryRun };
     } catch (e) {
       const nowIso = new Date().toISOString();
       await statusRef.set({ lastRunAt: nowIso, lastErrorAt: nowIso, lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true }).catch(() => {});
@@ -2158,14 +2192,15 @@ exports.runRetroMergeOnceHttp = functions
       const statusRef = db.collection('retroMerge').doc('status');
       const body = (typeof req.body === 'object' && req.body) ? req.body : {};
       const pageSize = Math.max(400, Math.min(3000, Number(body.pageSize) || 1200));
+      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(body.proximityMiles) || 0.12));
       const dryRun = body.dryRun === true;
       const ctrlSnap = await controlRef.get().catch(() => null);
       const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
-      const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
+      const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
       const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...resBatch, pageSize, dryRun }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...resBatch, pageSize, proximityMiles, dryRun }, { merge: true });
       await controlRef.set({ cursor: resBatch.done ? null : resBatch.cursor, updatedAt: nowIso }, { merge: true });
-      res.status(200).json({ ok: true, ...resBatch, pageSize, dryRun });
+      res.status(200).json({ ok: true, ...resBatch, pageSize, proximityMiles, dryRun });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
     }
@@ -2189,6 +2224,7 @@ exports.runRetroMergeAll = functions
     const controlRef = db.collection('retroMerge').doc('control');
     const statusRef = db.collection('retroMerge').doc('status');
     const pageSize = Math.max(400, Math.min(3000, Number(data && data.pageSize) || 1200));
+    const proximityMiles = Math.max(0.03, Math.min(1.0, Number(data && data.proximityMiles) || 0.12));
     const dryRun = !!(data && data.dryRun);
     // Match scheduler defaults exactly: 480,000ms window and effectively unlimited pages
     const maxMillisPerRun = Math.max(60_000, Math.min(520_000, Number(data && data.maxMillisPerRun) || 480_000));
@@ -2200,7 +2236,7 @@ exports.runRetroMergeAll = functions
     do {
       const ctrlSnap = await controlRef.get().catch(() => null);
       cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
-      const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
+      const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
       agg.pages += out.pages;
       agg.scanned += out.scanned;
       agg.updatedParks += out.updatedParks;
@@ -2209,7 +2245,7 @@ exports.runRetroMergeAll = functions
       // advance cursor and persist progress so UI can observe mid-run updates
       cursor = out.done ? null : out.cursor;
       const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, dryRun, note: 'running' }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, note: 'running' }, { merge: true });
       await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
       if (done) break;
       // Check time/page budgets
@@ -2217,9 +2253,9 @@ exports.runRetroMergeAll = functions
       if (agg.pages >= maxPagesPerRun) break;
     } while (true);
     const nowIso = new Date().toISOString();
-    await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
+    await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
     await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true }).catch(() => {});
-    return { ok: true, ...agg, done, pageSize, dryRun };
+    return { ok: true, ...agg, done, pageSize, proximityMiles, dryRun };
   });
 
 /**
@@ -2237,6 +2273,7 @@ exports.runRetroMergeAllHttp = functions
       const controlRef = db.collection('retroMerge').doc('control');
       const statusRef = db.collection('retroMerge').doc('status');
       const pageSize = Math.max(400, Math.min(3000, Number((req.body && req.body.pageSize) || 1200)));
+      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(req.body && req.body.proximityMiles) || 0.12));
       const dryRun = (req.body && req.body.dryRun) === true;
       // Match scheduler defaults exactly
       const maxMillisPerRun = Math.max(60_000, Math.min(520_000, Number(req.body && req.body.maxMillisPerRun) || 480_000));
@@ -2248,7 +2285,7 @@ exports.runRetroMergeAllHttp = functions
       do {
         const ctrlSnap = await controlRef.get().catch(() => null);
         cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
-        const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
+        const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
         agg.pages += out.pages;
         agg.scanned += out.scanned;
         agg.updatedParks += out.updatedParks;
@@ -2257,16 +2294,16 @@ exports.runRetroMergeAllHttp = functions
         // advance/persist
         cursor = out.done ? null : out.cursor;
         const nowIso = new Date().toISOString();
-        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, dryRun, note: 'running' }, { merge: true });
+        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, note: 'running' }, { merge: true });
         await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
         if (done) break;
         if ((Date.now() - t0) > maxMillisPerRun) break;
         if (agg.pages >= maxPagesPerRun) break;
       } while (true);
       const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
       await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true }).catch(() => {});
-      res.status(200).json({ ok: true, ...agg, done, pageSize, dryRun });
+      res.status(200).json({ ok: true, ...agg, done, pageSize, proximityMiles, dryRun });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
     }
@@ -2454,6 +2491,7 @@ exports.scheduledRetroMerge = functions
 
       // Multi-page loop per tick (faster): honor optional caps from control
       const pageSize = Math.max(400, Math.min(3000, Number(cfg.pageSize) || 1200));
+      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(cfg.proximityMiles) || 0.12));
       const budgetMs = Math.max(60_000, Math.min(520_000, Number(cfg.maxMillisPerRun) || 480_000));
       const maxPages = Math.max(1, Math.min(10_000, Number(cfg.maxPagesPerRun) || 999_999));
 
@@ -2462,14 +2500,14 @@ exports.scheduledRetroMerge = functions
       let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
       let done = false;
       do {
-        const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun: false });
+        const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun: false, proximityMiles });
         agg.pages += resBatch.pages;
         agg.scanned += resBatch.scanned;
         agg.updatedParks += resBatch.updatedParks;
         agg.courtsAdded += resBatch.courtsAdded;
         cursor = resBatch.done ? null : resBatch.cursor;
         const nowIso = new Date().toISOString();
-        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, note: 'running' }, { merge: true });
+        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, note: 'running' }, { merge: true });
         await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
         done = !!resBatch.done;
         if (done) break;
@@ -2478,7 +2516,7 @@ exports.scheduledRetroMerge = functions
       } while (true);
 
       const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, done, note: done ? 'pass complete' : `paused (<${Math.round((budgetMs - (Date.now() - t0)) / 1000)}s left)` }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, done, note: done ? 'pass complete' : `paused (<${Math.round((budgetMs - (Date.now() - t0)) / 1000)}s left)` }, { merge: true });
       await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true });
 
       // Auto-disable when fully done to avoid unnecessary reads/costs
