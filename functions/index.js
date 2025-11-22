@@ -1865,7 +1865,9 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
   const neededFields = ['name', 'latitude', 'longitude', 'courts', 'source', 'sourceAttribution'];
   let base = db
     .collection('parks')
-    .orderBy(admin.firestore.FieldPath.documentId())
+    // Order by latitude so OSM and Google docs intermix in pages.
+    // Using only a single-field order avoids the need for composite indexes.
+    .orderBy('latitude')
     .select(...neededFields);
   if (startAfterId) {
     try {
@@ -1877,16 +1879,38 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
   if (snap.empty) return { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, cursor: null, done: true };
 
   const docs = snap.docs.map(d => ({ id: d.id, ...(d.data() || {}) }));
-  const round4 = (v) => Number(v).toFixed(4);
-  const bins = new Map();
+
+  // Use coarser geo-bins (3 decimals ~ 110m) and include neighbor bins to
+  // catch pairs that fall on bin boundaries. We still enforce haversine distance
+  // and a relaxed name match to avoid false merges.
+  const DECIMALS = 3;
+  const STEP = 1 / Math.pow(10, DECIMALS); // 0.001 for 3 decimals
+  const roundN = (v) => Number(v).toFixed(DECIMALS);
+  const keyOf = (lat, lon) => `${roundN(lat)},${roundN(lon)}`;
+
+  // Build bins for GOOGLE parks only to keep candidate sets small
+  const googleBins = new Map();
   for (const p of docs) {
     const lat = Number(p.latitude);
     const lon = Number(p.longitude);
     if (!isFinite(lat) || !isFinite(lon)) continue;
-    const key = `${round4(lat)},${round4(lon)}`;
-    const arr = bins.get(key) || [];
+    if (!isGooglePark(p)) continue;
+    const key = keyOf(lat, lon);
+    const arr = googleBins.get(key) || [];
     arr.push(p);
-    bins.set(key, arr);
+    googleBins.set(key, arr);
+  }
+
+  function neighborKeys(lat, lon) {
+    const latR = Number(roundN(lat));
+    const lonR = Number(roundN(lon));
+    const keys = [];
+    for (let dLat of [-STEP, 0, STEP]) {
+      for (let dLon of [-STEP, 0, STEP]) {
+        keys.push(keyOf(latR + dLat, lonR + dLon));
+      }
+    }
+    return keys;
   }
 
   let updatedParks = 0, courtsAdded = 0, scanned = docs.length;
@@ -1894,35 +1918,43 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
   let batch = db.batch();
   const commit = async () => { if (!dryRun && writes > 0) { await batch.commit(); batch = db.batch(); writes = 0; } };
 
-  for (const arr of bins.values()) {
-    const osmList = arr.filter(isOsmPark);
-    const googleList = arr.filter(isGooglePark);
-    if (!osmList.length || !googleList.length) continue;
-    for (const osm of osmList) {
-      // Work on a local copy of the minimal fields
-      let localCourts = Array.isArray(osm.courts) ? osm.courts : [];
-      let pendingUpdate = null; // { courts, sportCategories, updatedAt }
-      for (const gp of googleList) {
-        if (!similarNameMerge(osm.name, gp.name)) continue;
-        const d = haversineMiles(Number(osm.latitude), Number(osm.longitude), Number(gp.latitude), Number(gp.longitude));
-        if (d > proximityMiles) continue;
-        const merged = mergeCourtsIfAddsValue({ courts: localCourts }, gp);
-        if (merged) {
-          const before = Array.isArray(localCourts) ? localCourts.length : 0;
-          const after = Array.isArray(merged.courts) ? merged.courts.length : 0;
-          if (after > before) courtsAdded += (after - before);
-          localCourts = merged.courts;
-          pendingUpdate = merged; // keep only changed subset
-        }
+  // Iterate OSM parks and attempt merges against candidate Google parks
+  for (const osm of docs) {
+    if (!isOsmPark(osm)) continue;
+    const la = Number(osm.latitude);
+    const lo = Number(osm.longitude);
+    if (!isFinite(la) || !isFinite(lo)) continue;
+
+    const candidateLists = neighborKeys(la, lo).map(k => googleBins.get(k) || []);
+    const candidates = [].concat(...candidateLists);
+    if (!candidates.length) continue;
+
+    // Work on a local copy of courts for incremental merges from multiple candidates
+    let localCourts = Array.isArray(osm.courts) ? osm.courts : [];
+    let pendingUpdate = null;
+    for (const gp of candidates) {
+      // Quick filters
+      if (!similarNameMerge(osm.name, gp.name)) continue;
+      const d = haversineMiles(la, lo, Number(gp.latitude), Number(gp.longitude));
+      if (d > proximityMiles) continue;
+
+      const merged = mergeCourtsIfAddsValue({ courts: localCourts }, gp);
+      if (merged) {
+        const before = Array.isArray(localCourts) ? localCourts.length : 0;
+        const after = Array.isArray(merged.courts) ? merged.courts.length : 0;
+        if (after > before) courtsAdded += (after - before);
+        localCourts = merged.courts;
+        pendingUpdate = merged;
       }
-      if (pendingUpdate) {
-        updatedParks += 1;
-        const ref = db.collection('parks').doc(osm.id);
-        if (!dryRun) {
-          batch.update(ref, pendingUpdate);
-          writes += 1;
-          if (writes >= 400) await commit();
-        }
+    }
+
+    if (pendingUpdate) {
+      updatedParks += 1;
+      const ref = db.collection('parks').doc(osm.id);
+      if (!dryRun) {
+        batch.update(ref, pendingUpdate);
+        writes += 1;
+        if (writes >= 400) await commit();
       }
     }
   }
