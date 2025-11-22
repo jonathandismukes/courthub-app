@@ -2064,14 +2064,19 @@ exports.runRetroMergeAll = functions
     if (!adminUid || callerUid !== adminUid) {
       throw new functions.https.HttpsError('permission-denied', 'Only the owner can run retro merge');
     }
+    const controlRef = db.collection('retroMerge').doc('control');
+    const statusRef = db.collection('retroMerge').doc('status');
     const pageSize = Math.max(400, Math.min(3000, Number(data && data.pageSize) || 1200));
     const dryRun = !!(data && data.dryRun);
+    // Match scheduler defaults exactly: 480,000ms window and effectively unlimited pages
+    const maxMillisPerRun = Math.max(60_000, Math.min(520_000, Number(data && data.maxMillisPerRun) || 480_000));
+    const maxPagesPerRun = Math.max(1, Math.min(10000, Number(data && data.maxPagesPerRun) || 999_999));
     const t0 = Date.now();
     let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
     let cursor = null;
     let done = false;
     do {
-      const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
+      const ctrlSnap = await controlRef.get().catch(() => null);
       cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
       const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
       agg.pages += out.pages;
@@ -2079,9 +2084,19 @@ exports.runRetroMergeAll = functions
       agg.updatedParks += out.updatedParks;
       agg.courtsAdded += out.courtsAdded;
       done = !!out.done;
-      // Check time headroom (~20s)
-      if (!done && (Date.now() - t0) > 520000) break;
-    } while (!done);
+      // advance cursor and persist progress so UI can observe mid-run updates
+      cursor = out.done ? null : out.cursor;
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, dryRun, note: 'running' }, { merge: true });
+      await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
+      if (done) break;
+      // Check time/page budgets
+      if ((Date.now() - t0) > maxMillisPerRun) break;
+      if (agg.pages >= maxPagesPerRun) break;
+    } while (true);
+    const nowIso = new Date().toISOString();
+    await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
+    await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true }).catch(() => {});
     return { ok: true, ...agg, done, pageSize, dryRun };
   });
 
@@ -2097,14 +2112,19 @@ exports.runRetroMergeAllHttp = functions
       const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
       if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
       const db = admin.firestore();
+      const controlRef = db.collection('retroMerge').doc('control');
+      const statusRef = db.collection('retroMerge').doc('status');
       const pageSize = Math.max(400, Math.min(3000, Number((req.body && req.body.pageSize) || 1200)));
       const dryRun = (req.body && req.body.dryRun) === true;
+      // Match scheduler defaults exactly
+      const maxMillisPerRun = Math.max(60_000, Math.min(520_000, Number(req.body && req.body.maxMillisPerRun) || 480_000));
+      const maxPagesPerRun = Math.max(1, Math.min(10000, Number(req.body && req.body.maxPagesPerRun) || 999_999));
       const t0 = Date.now();
       let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
       let cursor = null;
       let done = false;
       do {
-        const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
+        const ctrlSnap = await controlRef.get().catch(() => null);
         cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
         const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun });
         agg.pages += out.pages;
@@ -2112,8 +2132,18 @@ exports.runRetroMergeAllHttp = functions
         agg.updatedParks += out.updatedParks;
         agg.courtsAdded += out.courtsAdded;
         done = !!out.done;
-        if (!done && (Date.now() - t0) > 520000) break;
-      } while (!done);
+        // advance/persist
+        cursor = out.done ? null : out.cursor;
+        const nowIso = new Date().toISOString();
+        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, dryRun, note: 'running' }, { merge: true });
+        await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
+        if (done) break;
+        if ((Date.now() - t0) > maxMillisPerRun) break;
+        if (agg.pages >= maxPagesPerRun) break;
+      } while (true);
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
+      await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true }).catch(() => {});
       res.status(200).json({ ok: true, ...agg, done, pageSize, dryRun });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
