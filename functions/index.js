@@ -1107,18 +1107,35 @@ function fallbackNameFromContext({ original, address, city, sport }) {
 }
 
 function parseCityStateFromAddress(address) {
-  const parts = String(address || '').split(',').map((s) => s.trim());
+  const parts = String(address || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => !!s);
+
   let city = '';
   let state = '';
+
+  // Helper: should we ignore this token as a city candidate?
+  const isBadCityToken = (seg) => {
+    const s = String(seg || '').trim();
+    if (!s) return true;
+    const low = s.toLowerCase();
+    if (low === 'usa' || low === 'united states') return true;
+    if (low.endsWith(' county')) return true;
+    // ZIP or ZIP+4 or tokens like "CA 94501"
+    if (/^\d{5}(-\d{4})?$/.test(s)) return true;
+    if (/^[A-Za-z]{2}\s*\d{5}(-\d{4})?$/.test(s)) return true;
+    return false;
+  };
+
+  // 1) Try to locate a 2-letter state token; otherwise fall back to full name
+  let stateIndex = -1;
   for (let i = 0; i < parts.length; i++) {
     const m = parts[i].match(/\b([A-Za-z]{2})\b/);
-    if (m) {
-      const code = m[1];
-      if (isTwoLetterState(code)) {
-        state = code.toUpperCase();
-        if (i > 0 && !city) city = parts[i - 1];
-        break;
-      }
+    if (m && isTwoLetterState(m[1])) {
+      state = m[1].toUpperCase();
+      stateIndex = i;
+      break;
     }
   }
   if (!state) {
@@ -1126,11 +1143,20 @@ function parseCityStateFromAddress(address) {
       const code = NAME_TO_CODE[parts[i].toLowerCase()];
       if (code) {
         state = code;
-        if (i > 0 && !city) city = parts[i - 1];
+        stateIndex = i;
         break;
       }
     }
   }
+
+  // 2) Choose the nearest good token before the state as the city
+  if (stateIndex > 0) {
+    for (let j = stateIndex - 1; j >= 0; j--) {
+      if (!isBadCityToken(parts[j])) { city = parts[j]; break; }
+    }
+  }
+
+  // Final cleanup: title case city-like tokens such as "oakland" -> "Oakland"
   return { city: (city || '').trim(), state: canonState(state) };
 }
 
