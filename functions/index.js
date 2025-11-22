@@ -1861,7 +1861,12 @@ function mergeCourtsIfAddsValue(existing, incoming) {
 }
 
 async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, startAfterId = null, dryRun = false } = {}) {
-  let base = db.collection('parks').orderBy(admin.firestore.FieldPath.documentId());
+  // Read only the fields we actually need to cut payload and speed up scans
+  const neededFields = ['name', 'latitude', 'longitude', 'courts', 'source', 'sourceAttribution'];
+  let base = db
+    .collection('parks')
+    .orderBy(admin.firestore.FieldPath.documentId())
+    .select(...neededFields);
   if (startAfterId) {
     try {
       const cur = await db.collection('parks').doc(startAfterId).get();
@@ -1894,26 +1899,27 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
     const googleList = arr.filter(isGooglePark);
     if (!osmList.length || !googleList.length) continue;
     for (const osm of osmList) {
-      let accumulator = { ...osm };
-      let changed = false;
+      // Work on a local copy of the minimal fields
+      let localCourts = Array.isArray(osm.courts) ? osm.courts : [];
+      let pendingUpdate = null; // { courts, sportCategories, updatedAt }
       for (const gp of googleList) {
-        if (!similarNameMerge(accumulator.name, gp.name)) continue;
-        const d = haversineMiles(Number(accumulator.latitude), Number(accumulator.longitude), Number(gp.latitude), Number(gp.longitude));
+        if (!similarNameMerge(osm.name, gp.name)) continue;
+        const d = haversineMiles(Number(osm.latitude), Number(osm.longitude), Number(gp.latitude), Number(gp.longitude));
         if (d > proximityMiles) continue;
-        const merged = mergeCourtsIfAddsValue(accumulator, gp);
+        const merged = mergeCourtsIfAddsValue({ courts: localCourts }, gp);
         if (merged) {
-          const before = Array.isArray(accumulator.courts) ? accumulator.courts.length : 0;
+          const before = Array.isArray(localCourts) ? localCourts.length : 0;
           const after = Array.isArray(merged.courts) ? merged.courts.length : 0;
           if (after > before) courtsAdded += (after - before);
-          accumulator = merged;
-          changed = true;
+          localCourts = merged.courts;
+          pendingUpdate = merged; // keep only changed subset
         }
       }
-      if (changed) {
+      if (pendingUpdate) {
         updatedParks += 1;
-        const ref = db.collection('parks').doc(accumulator.id);
+        const ref = db.collection('parks').doc(osm.id);
         if (!dryRun) {
-          batch.update(ref, accumulator);
+          batch.update(ref, pendingUpdate);
           writes += 1;
           if (writes >= 400) await commit();
         }
@@ -1941,7 +1947,7 @@ exports.runRetroMergeOnce = functions
     }
     const controlRef = db.collection('retroMerge').doc('control');
     const statusRef = db.collection('retroMerge').doc('status');
-    const pageSize = Math.max(400, Math.min(1400, Number(data && data.pageSize) || 1000));
+    const pageSize = Math.max(400, Math.min(3000, Number(data && data.pageSize) || 1200));
     const dryRun = !!(data && data.dryRun);
     try {
       const ctrl = await controlRef.get().catch(() => null);
@@ -1971,7 +1977,7 @@ exports.runRetroMergeOnceHttp = functions
       const controlRef = db.collection('retroMerge').doc('control');
       const statusRef = db.collection('retroMerge').doc('status');
       const body = (typeof req.body === 'object' && req.body) ? req.body : {};
-      const pageSize = Math.max(400, Math.min(1400, Number(body.pageSize) || 1000));
+      const pageSize = Math.max(400, Math.min(3000, Number(body.pageSize) || 1200));
       const dryRun = body.dryRun === true;
       const ctrlSnap = await controlRef.get().catch(() => null);
       const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
@@ -2000,7 +2006,7 @@ exports.runRetroMergeAll = functions
     if (!adminUid || callerUid !== adminUid) {
       throw new functions.https.HttpsError('permission-denied', 'Only the owner can run retro merge');
     }
-    const pageSize = Math.max(400, Math.min(1400, Number(data && data.pageSize) || 1000));
+    const pageSize = Math.max(400, Math.min(3000, Number(data && data.pageSize) || 1200));
     const dryRun = !!(data && data.dryRun);
     const t0 = Date.now();
     let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
@@ -2033,7 +2039,7 @@ exports.runRetroMergeAllHttp = functions
       const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
       if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
       const db = admin.firestore();
-      const pageSize = Math.max(400, Math.min(1400, Number((req.body && req.body.pageSize) || 1000)));
+      const pageSize = Math.max(400, Math.min(3000, Number((req.body && req.body.pageSize) || 1200)));
       const dryRun = (req.body && req.body.dryRun) === true;
       const t0 = Date.now();
       let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
@@ -2075,7 +2081,7 @@ exports.runOneTimeSweepAll = functions
     if (!adminUid || callerUid !== adminUid) {
       throw new functions.https.HttpsError('permission-denied', 'Only the owner can run this');
     }
-    const retroPageSize = Math.max(400, Math.min(1400, Number(data && data.retroPageSize) || 1000));
+    const retroPageSize = Math.max(400, Math.min(3000, Number(data && data.retroPageSize) || 1200));
     const t0 = Date.now();
     // Part 1: Fix City/State intentionally omitted from this sweep (completed previously)
     const fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: true, note: 'omitted_from_sweep' };
@@ -2112,7 +2118,7 @@ exports.runOneTimeSweepAllHttp = functions
       const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
       if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
       const db = admin.firestore();
-      const retroPageSize = Math.max(400, Math.min(1400, Number((req.body && req.body.retroPageSize) || 1000)));
+      const retroPageSize = Math.max(400, Math.min(3000, Number((req.body && req.body.retroPageSize) || 1200)));
       const t0 = Date.now();
       // Fix City/State intentionally omitted from this sweep (completed previously)
       const fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: true, note: 'omitted_from_sweep' };
@@ -2167,15 +2173,37 @@ exports.scheduledRetroMerge = functions
         return null;
       }
 
-      const pageSize = Math.max(400, Math.min(1400, Number(cfg.pageSize) || 1000));
-      const cursor = cfg.cursor || null;
-      const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun: false });
+      // Multi-page loop per tick (faster): honor optional caps from control
+      const pageSize = Math.max(400, Math.min(3000, Number(cfg.pageSize) || 1200));
+      const budgetMs = Math.max(60_000, Math.min(520_000, Number(cfg.maxMillisPerRun) || 480_000));
+      const maxPages = Math.max(1, Math.min(10_000, Number(cfg.maxPagesPerRun) || 999_999));
+
+      const t0 = Date.now();
+      let cursor = cfg.cursor || null;
+      let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
+      let done = false;
+      do {
+        const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun: false });
+        agg.pages += resBatch.pages;
+        agg.scanned += resBatch.scanned;
+        agg.updatedParks += resBatch.updatedParks;
+        agg.courtsAdded += resBatch.courtsAdded;
+        cursor = resBatch.done ? null : resBatch.cursor;
+        const nowIso = new Date().toISOString();
+        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, note: 'running' }, { merge: true });
+        await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
+        done = !!resBatch.done;
+        if (done) break;
+        if ((Date.now() - t0) > budgetMs) break;
+        if (agg.pages >= maxPages) break;
+      } while (true);
+
       const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...resBatch, pageSize }, { merge: true });
-      await controlRef.set({ cursor: resBatch.done ? null : resBatch.cursor, updatedAt: nowIso }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, done, note: done ? 'pass complete' : `paused (<${Math.round((budgetMs - (Date.now() - t0)) / 1000)}s left)` }, { merge: true });
+      await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true });
 
       // Auto-disable when fully done to avoid unnecessary reads/costs
-      if (resBatch.done) {
+      if (done) {
         await controlRef.set({ enabled: false, done: true, updatedAt: nowIso }, { merge: true });
         await statusRef.set({ done: true }, { merge: true });
       }
