@@ -343,6 +343,72 @@ exports.runFixCityFromAddressAllHttp = functions
     }
   });
 
+/**
+ * Scheduled: Fix City/State from Address (zero-API, resumable)
+ * - Runs every 2 minutes when jobs/fix_city_from_address.enabled == true
+ * - Loops pages for ~8 minutes per tick (or until maxMillisPerRun/maxPagesPerRun)
+ * - Persists cursor + totals in jobs/fix_city_from_address so Admin can observe
+ * - Auto-disables when complete to avoid unnecessary reads
+ */
+exports.scheduledFixCityFromAddress = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub.schedule('every 2 minutes').timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const ckptRef = db.collection('jobs').doc('fix_city_from_address');
+    try {
+      const snap = await ckptRef.get().catch(() => null);
+      const cfg = snap && snap.exists ? (snap.data() || {}) : {};
+      const enabled = cfg.enabled === true;
+      if (!enabled) {
+        await ckptRef.set({ lastHeartbeatAt: new Date().toISOString(), note: 'skipped: disabled' }, { merge: true });
+        return null;
+      }
+
+      // Optional cooldown to avoid thrashing (defaults to 2 minutes)
+      const minIntervalMinutes = Math.max(1, Math.min(10, Number(cfg.minIntervalMinutes) || 2));
+      const lastBeat = cfg.lastHeartbeatAt ? new Date(cfg.lastHeartbeatAt) : null;
+      if (lastBeat && (Date.now() - lastBeat.getTime()) < minIntervalMinutes * 60 * 1000) {
+        await ckptRef.set({ lastHeartbeatAt: new Date().toISOString(), note: `skipped: cooldown ${minIntervalMinutes}m` }, { merge: true });
+        return null;
+      }
+
+      // Runtime controls
+      const pageSize = Math.max(200, Math.min(1500, Number(cfg.pageSize) || 1200));
+      const budgetMs = Math.max(60_000, Math.min(520_000, Number(cfg.maxMillisPerRun) || 480_000));
+      const maxPages = Math.max(1, Math.min(10_000, Number(cfg.maxPagesPerRun) || 999_999));
+
+      const t0 = Date.now();
+      let done = false;
+      let pages = 0;
+      do {
+        const out = await runFixCityFromAddressBatch(db, { pageSize, resume: true });
+        pages += 1;
+        // runFixCityFromAddressBatch already updates checkpoint totals and status
+        // Add a live heartbeat for UIs and cooldown logic
+        await ckptRef.set({ lastHeartbeatAt: new Date().toISOString() }, { merge: true });
+        done = !!out.done;
+        if (done) break;
+        if ((Date.now() - t0) > budgetMs) break;
+        if (pages >= maxPages) break;
+      } while (true);
+
+      const nowIso = new Date().toISOString();
+      if (done) {
+        // Mark complete and auto-disable
+        await ckptRef.set({ status: 'done', completedAt: nowIso, enabled: false, note: 'pass complete' }, { merge: true });
+      } else {
+        await ckptRef.set({ lastHeartbeatAt: nowIso, note: 'paused: time window reached' }, { merge: true });
+      }
+      return null;
+    } catch (e) {
+      try {
+        await ckptRef.set({ lastHeartbeatAt: new Date().toISOString(), lastErrorAt: new Date().toISOString(), lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true });
+      } catch (_) {}
+      return null;
+    }
+  });
+
 // Removed: runPlacesBackfillForCityHttp (Google import) per request — no more Google importing
 
 // Removed: geocoding queue, scheduler, and HTTP drainer — no reverse‑geocoding API calls
