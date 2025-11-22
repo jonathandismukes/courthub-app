@@ -38,6 +38,21 @@ let cachedAt = 0;
 const ADMIN_CACHE_MS = 5 * 60 * 1000; // 5 minutes
 
 /**
+ * Returns true if the uid is the configured owner (config/app.adminUid)
+ * OR the user has isAdmin==true in users/{uid}. Falls back soft on errors.
+ */
+async function isOwnerOrAdmin(db, uid) {
+  try {
+    const owner = await getAdminUid(db);
+    if (owner && uid === owner) return true;
+    const snap = await db.collection('users').doc(uid).get();
+    return !!(snap.exists && snap.data() && snap.data().isAdmin === true);
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
  * Reads the single admin UID from Firestore config.
  * Place a document at config/app with a field adminUid: "<owner uid>".
  */
@@ -223,9 +238,9 @@ exports.runFixCityFromAddressOnce = functions
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
     }
     const callerUid = context.auth.uid;
-    const adminUid = await getAdminUid(db);
-    if (!adminUid || callerUid !== adminUid) {
-      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run this');
+    const allowed = await isOwnerOrAdmin(db, callerUid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run this');
     }
     const pageSize = Math.max(200, Math.min(1500, Number(data && data.pageSize) || 1200));
     const resume = (data && data.resume) !== false; // default true
@@ -269,9 +284,9 @@ exports.runFixCityFromAddressAll = functions
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
     }
     const callerUid = context.auth.uid;
-    const adminUid = await getAdminUid(db);
-    if (!adminUid || callerUid !== adminUid) {
-      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run this');
+    const allowed = await isOwnerOrAdmin(db, callerUid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run this');
     }
     let pageSize = Math.max(200, Math.min(1500, Number(data && data.pageSize) || 1200));
     let resume = (data && data.resume) !== false;
@@ -1434,9 +1449,9 @@ exports.runParksBackfillOnce = functions
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
     }
     const callerUid = context.auth.uid;
-    const adminUid = await getAdminUid(db);
-    if (!adminUid || callerUid !== adminUid) {
-      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run backfill');
+    const allowed = await isOwnerOrAdmin(db, callerUid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run backfill');
     }
 
     const settings = {
@@ -1999,9 +2014,9 @@ exports.runRetroMergeOnce = functions
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
     }
     const callerUid = context.auth.uid;
-    const adminUid = await getAdminUid(db);
-    if (!adminUid || callerUid !== adminUid) {
-      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run retro merge');
+    const allowed = await isOwnerOrAdmin(db, callerUid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run retro merge');
     }
     const controlRef = db.collection('retroMerge').doc('control');
     const statusRef = db.collection('retroMerge').doc('status');
@@ -2060,9 +2075,9 @@ exports.runRetroMergeAll = functions
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
     }
     const callerUid = context.auth.uid;
-    const adminUid = await getAdminUid(db);
-    if (!adminUid || callerUid !== adminUid) {
-      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run retro merge');
+    const allowed = await isOwnerOrAdmin(db, callerUid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run retro merge');
     }
     const controlRef = db.collection('retroMerge').doc('control');
     const statusRef = db.collection('retroMerge').doc('status');
@@ -2165,9 +2180,9 @@ exports.runOneTimeSweepAll = functions
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
     }
     const callerUid = context.auth.uid;
-    const adminUid = await getAdminUid(db);
-    if (!adminUid || callerUid !== adminUid) {
-      throw new functions.https.HttpsError('permission-denied', 'Only the owner can run this');
+    const allowed = await isOwnerOrAdmin(db, callerUid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run this');
     }
     const retroPageSize = Math.max(400, Math.min(3000, Number(data && data.retroPageSize) || 1200));
     const t0 = Date.now();
@@ -2191,6 +2206,75 @@ exports.runOneTimeSweepAll = functions
       } while (!retro.done);
     }
     return { ok: true, fix, retro };
+  });
+
+/**
+ * Admin/owner callable: reset Fix City/State checkpoint (server-side write)
+ */
+exports.resetFixCityFromAddressCheckpoint = functions
+  .runWith({ timeoutSeconds: 60, memory: '256MB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const allowed = await isOwnerOrAdmin(db, context.auth.uid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can reset');
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      await db.collection('jobs').doc('fix_city_from_address').set({
+        status: 'idle',
+        lastDocId: admin.firestore.FieldValue.delete(),
+        pages: 0,
+        scanned: 0,
+        updated: 0,
+        skippedEmpty: 0,
+        ambiguous: 0,
+        lastHeartbeatAt: nowIso,
+      }, { merge: true });
+      return { ok: true };
+    } catch (e) {
+      throw new functions.https.HttpsError('internal', e?.message || 'Reset failed');
+    }
+  });
+
+/**
+ * Admin/owner callable: reset Retro-merge checkpoint (server-side write)
+ * Resets both the server control/status docs and the legacy jobs doc used by the client-side runner.
+ */
+exports.resetRetroMergeCheckpoint = functions
+  .runWith({ timeoutSeconds: 60, memory: '256MB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const allowed = await isOwnerOrAdmin(db, context.auth.uid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can reset');
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      const controlRef = db.collection('retroMerge').doc('control');
+      const statusRef = db.collection('retroMerge').doc('status');
+      await controlRef.set({ cursor: null, updatedAt: nowIso }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, note: 'checkpoint reset', cursor: null, pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 }, { merge: true });
+      // Also reset legacy client checkpoint
+      await db.collection('jobs').doc('retro_merge').set({
+        status: 'idle',
+        lastDocId: admin.firestore.FieldValue.delete(),
+        pages: 0,
+        scanned: 0,
+        updatedParks: 0,
+        courtsAdded: 0,
+        lastHeartbeatAt: nowIso,
+      }, { merge: true });
+      return { ok: true };
+    } catch (e) {
+      throw new functions.https.HttpsError('internal', e?.message || 'Reset failed');
+    }
   });
 
 /**
