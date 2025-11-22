@@ -2057,7 +2057,11 @@ exports.runRetroMergeAllHttp = functions
   });
 
 /**
- * Owner-callable: Run both fix-city and retro-merge, sweeping each fully.
+ * Owner-callable: Retro-merge sweep only (Fix City/State removed from sweep)
+ * Notes:
+ * - Previously this endpoint ran both Fix City/State and Retro-merge.
+ * - Per owner request, Fix City/State has completed and is no longer part of the one-time sweep.
+ * - We keep the shape of the response with a no-op "fix" block for UI compatibility.
  */
 exports.runOneTimeSweepAll = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
@@ -2071,20 +2075,10 @@ exports.runOneTimeSweepAll = functions
     if (!adminUid || callerUid !== adminUid) {
       throw new functions.https.HttpsError('permission-denied', 'Only the owner can run this');
     }
-    const fixPageSize = Math.max(200, Math.min(1500, Number(data && data.fixPageSize) || 1200));
     const retroPageSize = Math.max(400, Math.min(1400, Number(data && data.retroPageSize) || 1000));
     const t0 = Date.now();
-    // Part 1: Fix city/state fully (loop until done or time limit)
-    let fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: false };
-    {
-      let resume = (data && data.resumeFix) !== false;
-      do {
-        const out = await runFixCityFromAddressBatch(db, { pageSize: fixPageSize, resume });
-        fix = { pages: out.pages, scanned: out.scanned, updated: out.updated, skippedEmpty: out.skippedEmpty, ambiguous: out.ambiguous, done: !!out.done };
-        resume = true;
-        if (!fix.done && (Date.now() - t0) > 480000) break; // leave time for retro
-      } while (!fix.done);
-    }
+    // Part 1: Fix City/State intentionally omitted from this sweep (completed previously)
+    const fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: true, note: 'omitted_from_sweep' };
     // Part 2: Retro-merge for remaining time
     let retro = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, done: false };
     {
@@ -2106,7 +2100,8 @@ exports.runOneTimeSweepAll = functions
   });
 
 /**
- * HTTP: Run both jobs fully with one request (shared secret)
+ * HTTP: Run Retro-merge sweep only with one request (shared secret)
+ * Fix City/State has been removed from this combined endpoint.
  */
 exports.runOneTimeSweepAllHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
@@ -2117,20 +2112,10 @@ exports.runOneTimeSweepAllHttp = functions
       const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
       if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
       const db = admin.firestore();
-      const fixPageSize = Math.max(200, Math.min(1500, Number((req.body && req.body.fixPageSize) || 1200)));
       const retroPageSize = Math.max(400, Math.min(1400, Number((req.body && req.body.retroPageSize) || 1000)));
       const t0 = Date.now();
-      let fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: false };
-      // Fix City/State loop
-      {
-        let resume = (req.body && req.body.resumeFix) !== false;
-        do {
-          const out = await runFixCityFromAddressBatch(db, { pageSize: fixPageSize, resume });
-          fix = { pages: out.pages, scanned: out.scanned, updated: out.updated, skippedEmpty: out.skippedEmpty, ambiguous: out.ambiguous, done: !!out.done };
-          resume = true;
-          if (!fix.done && (Date.now() - t0) > 480000) break;
-        } while (!fix.done);
-      }
+      // Fix City/State intentionally omitted from this sweep (completed previously)
+      const fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: true, note: 'omitted_from_sweep' };
       // Retro-merge loop
       let retro = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, done: false };
       {
@@ -2155,9 +2140,10 @@ exports.runOneTimeSweepAllHttp = functions
   });
 
 // Optional scheduler: disabled by default unless retroMerge/control.enabled == true
+// Now runs every 2 minutes with a soft cooldown and auto-disables when done
 exports.scheduledRetroMerge = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
-  .pubsub.schedule('every 10 minutes').timeZone('Etc/UTC')
+  .pubsub.schedule('every 2 minutes').timeZone('Etc/UTC')
   .onRun(async () => {
     const db = admin.firestore();
     const controlRef = db.collection('retroMerge').doc('control');
@@ -2166,16 +2152,38 @@ exports.scheduledRetroMerge = functions
       const ctrl = await controlRef.get().catch(() => null);
       const cfg = ctrl && ctrl.exists ? (ctrl.data() || {}) : {};
       const enabled = cfg.enabled === true;
-      if (!enabled) { await statusRef.set({ lastRunAt: new Date().toISOString(), note: 'skipped: disabled' }, { merge: true }); return null; }
+      if (!enabled) {
+        await statusRef.set({ lastRunAt: new Date().toISOString(), note: 'skipped: disabled' }, { merge: true });
+        return null;
+      }
+
+      // Optional cooldown to avoid thrashing if schedule is very frequent
+      const statusSnap = await statusRef.get().catch(() => null);
+      const status = statusSnap && statusSnap.exists ? (statusSnap.data() || {}) : {};
+      const lastSuccessAt = status.lastSuccessAt ? new Date(status.lastSuccessAt) : null;
+      const minIntervalMinutes = Math.max(1, Math.min(10, Number(cfg.minIntervalMinutes) || 2));
+      if (lastSuccessAt && (Date.now() - lastSuccessAt.getTime()) < minIntervalMinutes * 60 * 1000) {
+        await statusRef.set({ lastRunAt: new Date().toISOString(), note: `skipped: cooldown ${minIntervalMinutes}m` }, { merge: true });
+        return null;
+      }
+
       const pageSize = Math.max(400, Math.min(1400, Number(cfg.pageSize) || 1000));
       const cursor = cfg.cursor || null;
       const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun: false });
       const nowIso = new Date().toISOString();
       await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...resBatch, pageSize }, { merge: true });
       await controlRef.set({ cursor: resBatch.done ? null : resBatch.cursor, updatedAt: nowIso }, { merge: true });
+
+      // Auto-disable when fully done to avoid unnecessary reads/costs
+      if (resBatch.done) {
+        await controlRef.set({ enabled: false, done: true, updatedAt: nowIso }, { merge: true });
+        await statusRef.set({ done: true }, { merge: true });
+      }
       return null;
     } catch (e) {
-      try { await statusRef.set({ lastRunAt: new Date().toISOString(), lastErrorAt: new Date().toISOString(), lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true }); } catch (_) {}
+      try {
+        await statusRef.set({ lastRunAt: new Date().toISOString(), lastErrorAt: new Date().toISOString(), lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true });
+      } catch (_) {}
       return null;
     }
   });
