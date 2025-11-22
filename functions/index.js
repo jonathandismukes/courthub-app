@@ -1969,7 +1969,8 @@ function mergeCourtsIfAddsValue(existing, incoming) {
 
 async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, startAfterId = null, dryRun = false } = {}) {
   // Read only the fields we actually need to cut payload and speed up scans
-  const neededFields = ['name', 'latitude', 'longitude', 'courts', 'source', 'sourceAttribution'];
+  // Include locality fields so we can fix cross‑city mismatches (e.g., Oakland vs Alameda)
+  const neededFields = ['name', 'latitude', 'longitude', 'courts', 'source', 'sourceAttribution', 'city', 'state', 'address'];
   let base = db
     .collection('parks')
     // Order by latitude so OSM and Google docs intermix in pages.
@@ -2025,6 +2026,9 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
   let batch = db.batch();
   const commit = async () => { if (!dryRun && writes > 0) { await batch.commit(); batch = db.batch(); writes = 0; } };
 
+  // Track per‑Google doc locality correction so we only write once per id
+  const googleLocalityFix = new Map(); // id -> { city, state }
+
   // Iterate OSM parks and attempt merges against candidate Google parks
   for (const osm of docs) {
     if (!isOsmPark(osm)) continue;
@@ -2053,6 +2057,32 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
         localCourts = merged.courts;
         pendingUpdate = merged;
       }
+
+      // New: If Google park's city/state disagree with the matched OSM park, align it.
+      // Priority rules:
+      //  1) Prefer OSM locality when non‑empty (we trust OSM pins for locality).
+      //  2) If OSM locality is empty, try parsing Google address and use that.
+      //  3) Only write if it actually changes city or state.
+      try {
+        const osmCity = String(osm.city || '').trim();
+        const osmState = canonState(String(osm.state || '').trim());
+        const gCity = String(gp.city || '').trim();
+        const gState = canonState(String(gp.state || '').trim());
+        let targetCity = gCity;
+        let targetState = gState;
+        if (osmCity && osmState) {
+          targetCity = titleCase(osmCity);
+          targetState = osmState;
+        } else if ((gp && gp.address)) {
+          const parsed = parseCityStateFromAddress(String(gp.address || ''));
+          if ((parsed.city || '').trim()) targetCity = titleCase(parsed.city);
+          if ((parsed.state || '').trim()) targetState = canonState(parsed.state);
+        }
+        if ((targetCity && targetCity !== gCity) || (targetState && targetState !== gState)) {
+          // Defer write; last wins if we see the same Google id multiple times in this loop
+          googleLocalityFix.set(gp.id, { city: targetCity || gCity, state: targetState || gState });
+        }
+      } catch (_) { /* ignore locality alignment errors */ }
     }
 
     if (pendingUpdate) {
@@ -2063,6 +2093,17 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
         writes += 1;
         if (writes >= 400) await commit();
       }
+    }
+  }
+
+  // Apply deferred Google locality updates (safe, small writes)
+  if (!dryRun && googleLocalityFix.size > 0) {
+    for (const [gid, loc] of googleLocalityFix.entries()) {
+      try {
+        batch.update(db.collection('parks').doc(gid), { city: loc.city, state: loc.state, updatedAt: new Date().toISOString() });
+        writes += 1;
+        if (writes >= 400) await commit();
+      } catch (_) {}
     }
   }
 
