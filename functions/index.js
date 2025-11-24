@@ -1,5 +1,7 @@
-import functions from 'firebase-functions';
 import admin from 'firebase-admin';
+import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { onObjectFinalized } from 'firebase-functions/v2/storage';
+import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { google } from 'googleapis';
 import fetch from 'node-fetch';
 import sharp from 'sharp';
@@ -100,11 +102,12 @@ async function verifyApplePurchase({ receiptData }) {
   return { valid: hasInapp, kind: 'inapp', data: inapps[0] || null };
 }
 
-export const iapVerify = functions.region(region).https.onCall(async (data, context) => {
-  if (!context.auth) {
-    throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
+export const iapVerify = onCall({ region }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Must be signed in');
   }
-  const uid = context.auth.uid;
+  const uid = request.auth.uid;
+  const data = request.data || {};
   const platform = String(data.platform || '');
   const productId = String(data.productId || '');
   const ver = data.verificationData || {};
@@ -149,13 +152,14 @@ export const iapVerify = functions.region(region).https.onCall(async (data, cont
     return { valid: true, planTier: 'premium', premiumUntil: premiumUntil || null };
   } catch (e) {
     console.error('iapVerify failed', e);
-    throw new functions.https.HttpsError('internal', String(e?.message || e));
+    throw new HttpsError('internal', String(e?.message || e));
   }
 });
 
 // Storage onFinalize: generate medium thumbnail and set Cache-Control headers
-export const onImageFinalize = functions.region(region).storage.object().onFinalize(async (object) => {
+export const onImageFinalize = onObjectFinalized({ region }, async (event) => {
   try {
+    const object = event.data || {};
     const contentType = object.contentType || '';
     const name = object.name || '';
     const bucketName = object.bucket || STORAGE_BUCKET;
@@ -213,7 +217,7 @@ export const onImageFinalize = functions.region(region).storage.object().onFinal
 });
 
 // Daily TTL cleanup: delete old images per policy
-export const pruneOldImages = functions.region(region).pubsub.schedule('every 24 hours').onRun(async () => {
+export const pruneOldImages = onSchedule({ schedule: 'every 24 hours', region }, async (event) => {
   const bucket = admin.storage().bucket();
   const now = Date.now();
 
