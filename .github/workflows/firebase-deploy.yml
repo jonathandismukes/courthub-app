@@ -151,15 +151,7 @@ jobs:
           echo "Setting functions config for maps.google_server_key"
           firebase --project ${{ env.TARGET_PROJECT }} functions:config:set maps.google_server_key="$MAPS_GOOGLE_SERVER_KEY"
 
-      # Use Secret Manager instead of project env vars to provide APPLE_SHARED_SECRET
-      - name: Set Secret Manager secret (APPLE_SHARED_SECRET)
-        if: ${{ env.APPLE_SHARED_SECRET != '' }}
-        continue-on-error: true
-        working-directory: ${{ env.FIREBASE_DIR }}
-        run: |
-          echo "Updating Secret Manager secret APPLE_SHARED_SECRET (masked)"
-          # Pipe the value to avoid interactive prompt; --force to overwrite existing versions safely
-          echo "$APPLE_SHARED_SECRET" | firebase --project ${{ env.TARGET_PROJECT }} functions:secrets:set APPLE_SHARED_SECRET --force
+      # Removed CI-side Secret Manager update to avoid 403; secret is managed manually
 
       - name: Deploy Cloud Functions
         working-directory: ${{ env.FIREBASE_DIR }}
