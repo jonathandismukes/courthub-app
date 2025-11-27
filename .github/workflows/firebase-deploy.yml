@@ -25,6 +25,8 @@ jobs:
       TARGET_PROJECT: courthub-app
       GEOAPIFY_KEY: ${{ secrets.GEOAPIFY_KEY }}
       MAPS_GOOGLE_SERVER_KEY: ${{ secrets.MAPS_GOOGLE_SERVER_KEY }}
+      # Injected from GitHub Secrets; used at runtime by Cloud Functions via functions:env
+      APPLE_SHARED_SECRET: ${{ secrets.APPLE_SHARED_SECRET }}
     steps:
       - name: WORKFLOW SIGNATURE
         run: |
@@ -148,6 +150,15 @@ jobs:
         run: |
           echo "Setting functions config for maps.google_server_key"
           firebase --project ${{ env.TARGET_PROJECT }} functions:config:set maps.google_server_key="$MAPS_GOOGLE_SERVER_KEY"
+
+      # Minimal addition ONLY to inject the Apple shared secret as a runtime environment variable
+      - name: Set Firebase functions runtime env (APPLE_SHARED_SECRET)
+        if: ${{ env.APPLE_SHARED_SECRET != '' }}
+        continue-on-error: true
+        working-directory: ${{ env.FIREBASE_DIR }}
+        run: |
+          echo "Setting functions runtime env var APPLE_SHARED_SECRET (masked)"
+          firebase --project ${{ env.TARGET_PROJECT }} functions:env:set APPLE_SHARED_SECRET="$APPLE_SHARED_SECRET"
 
       - name: Deploy Cloud Functions
         working-directory: ${{ env.FIREBASE_DIR }}
