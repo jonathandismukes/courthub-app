@@ -1,4 +1,8 @@
 import functions from 'firebase-functions/v1';
+// Use v2 only for the few functions that need Gen 2 compatibility with CPU settings
+import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { onObjectFinalized } from 'firebase-functions/v2/storage';
+import { onSchedule } from 'firebase-functions/v2/scheduler';
 import admin from 'firebase-admin';
 import crypto from 'node:crypto';
 import https from 'node:https';
@@ -3524,77 +3528,74 @@ async function verifyAppleReceipt({ receiptData, password, useSandbox }) {
  * - Stores purchase payloads for later verification and audit
  * - Does NOT perform full Apple/Google verification in this version
  */
-export const iapVerify = functions.region(REGION)
-  // Gen1-compatible runWith: avoid Gen2-only options like `secrets`
-  .runWith({ timeoutSeconds: 30, memory: '256MB' })
-  .https.onCall(async (data, context) => {
-    if (!context.auth) {
-      throw new functions.https.HttpsError('unauthenticated', 'Sign in required');
+export const iapVerify = onCall({ region: REGION, timeoutSeconds: 30, memory: '256MiB' }, async (request) => {
+  const { data, auth } = request;
+  if (!auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required');
+  }
+  try {
+    const db = admin.firestore();
+    const {
+      platform, // 'ios' | 'android'
+      productId,
+      purchaseToken,
+      orderId,
+      signature,
+      receipt,
+      appVersion,
+      device,
+    } = data || {};
+
+    if (!platform || !productId) {
+      throw new HttpsError('invalid-argument', 'platform and productId are required');
     }
+
+    // Optional advanced verification
+    let verification = null;
     try {
-      const db = admin.firestore();
-      const {
-        platform, // 'ios' | 'android'
-        productId,
-        purchaseToken,
-        orderId,
-        signature,
-        receipt,
-        appVersion,
-        device,
-      } = data || {};
-
-      if (!platform || !productId) {
-        throw new functions.https.HttpsError('invalid-argument', 'platform and productId are required');
+      if (platform === 'android' && purchaseToken && productId) {
+        const isSub = /sub/i.test(productId) || /monthly|year|week/i.test(productId);
+        verification = await verifyAndroidPurchase({ packageName: data?.packageName || ANDROID_PACKAGE, productId, purchaseToken, isSubscription: isSub });
+      } else if (platform === 'ios' && (receipt || data?.receiptData)) {
+        verification = await verifyAppleReceipt({ receiptData: receipt || data?.receiptData, password: process.env.APPLE_SHARED_SECRET, useSandbox: !!data?.sandbox });
       }
-
-      // Optional advanced verification
-      let verification = null;
-      try {
-        if (platform === 'android' && purchaseToken && productId) {
-          const isSub = /sub/i.test(productId) || /monthly|year|week/i.test(productId);
-          verification = await verifyAndroidPurchase({ packageName: data?.packageName || ANDROID_PACKAGE, productId, purchaseToken, isSubscription: isSub });
-        } else if (platform === 'ios' && (receipt || data?.receiptData)) {
-          verification = await verifyAppleReceipt({ receiptData: receipt || data?.receiptData, password: process.env.APPLE_SHARED_SECRET, useSandbox: !!data?.sandbox });
-        }
-      } catch (ve) {
-        console.warn('iapVerify advanced verification failed', ve);
-      }
-
-      const nowIso = new Date().toISOString();
-      const doc = {
-        uid: context.auth.uid,
-        createdAt: nowIso,
-        platform: String(platform),
-        productId: String(productId),
-        orderId: orderId ? String(orderId) : null,
-        purchaseToken: purchaseToken ? String(purchaseToken) : null,
-        signature: signature ? String(signature) : null,
-        // limit to avoid giant writes
-        receipt: receipt ? String(receipt).slice(0, 4000) : null,
-        status: verification?.ok ? (verification.active ? 'verified_active' : 'verified_inactive') : 'recorded',
-        verification: verification || null,
-        appVersion: appVersion || null,
-        device: device || null,
-      };
-      await db.collection('iapReceipts').add(doc);
-      return { ok: true, status: doc.status, verification };
-    } catch (e) {
-      console.error('iapVerify error', e);
-      throw new functions.https.HttpsError('internal', e?.message || 'Unhandled error');
+    } catch (ve) {
+      console.warn('iapVerify advanced verification failed', ve);
     }
-  });
+
+    const nowIso = new Date().toISOString();
+    const doc = {
+      uid: auth.uid,
+      createdAt: nowIso,
+      platform: String(platform),
+      productId: String(productId),
+      orderId: orderId ? String(orderId) : null,
+      purchaseToken: purchaseToken ? String(purchaseToken) : null,
+      signature: signature ? String(signature) : null,
+      // limit to avoid giant writes
+      receipt: receipt ? String(receipt).slice(0, 4000) : null,
+      status: verification?.ok ? (verification.active ? 'verified_active' : 'verified_inactive') : 'recorded',
+      verification: verification || null,
+      appVersion: appVersion || null,
+      device: device || null,
+    };
+    await db.collection('iapReceipts').add(doc);
+    return { ok: true, status: doc.status, verification };
+  } catch (e) {
+    console.error('iapVerify error', e);
+    throw new HttpsError('internal', e?.message || 'Unhandled error');
+  }
+});
 
 /**
  * Storage Trigger: Generate medium thumbnail on new image upload
  * - Skips non-images and already-generated thumbnails
  * - Writes to thumbnails/medium-<filename>.jpg with long cache headers
  */
-export const onImageFinalize = functions.region(REGION)
-  .runWith({ timeoutSeconds: 120, memory: '1GB' })
-  .storage.bucket(DEFAULT_BUCKET).object()
-  .onFinalize(async (object) => {
+export const onImageFinalize = onObjectFinalized({ region: REGION, bucket: DEFAULT_BUCKET, timeoutSeconds: 120, memory: '1GiB' },
+  async (event) => {
     try {
+      const object = event.data || {};
       const contentType = object.contentType || '';
       if (!contentType.startsWith('image/')) return null;
       const filePath = object.name || '';
@@ -3638,41 +3639,40 @@ export const onImageFinalize = functions.region(REGION)
       console.error('onImageFinalize error', e);
       return null;
     }
-  });
+  }
+);
 
 /**
  * Scheduled: Prune thumbnails older than 30 days (limits to ~400 deletions/run)
  */
-export const pruneOldImages = functions.region(REGION).pubsub
-  .schedule('every 24 hours')
-  .timeZone('Etc/UTC')
-  .onRun(async () => {
-    const bucket = admin.storage().bucket();
-    let totalDeleted = 0;
-    try {
-      for (const cfg of PREFIX_TTLS) {
-        const prefix = cfg.prefix;
-        const cutoff = Date.now() - (cfg.days * 24 * 60 * 60 * 1000);
-        const [files] = await bucket.getFiles({ prefix });
-        let deleted = 0;
-        for (const f of files) {
-          if (deleted >= 400) break; // per-prefix safety cap
-          try {
-            const [meta] = await f.getMetadata();
-            const t = new Date(meta.timeCreated || meta.updated || 0).getTime();
-            if (t && t < cutoff) {
-              await f.delete();
-              deleted += 1;
-              totalDeleted += 1;
-            }
-          } catch (_) {}
-        }
-        console.log(`pruneOldImages: prefix=${prefix} deleted=${deleted}`);
+export const pruneOldImages = onSchedule({ region: REGION, schedule: 'every 24 hours', timeZone: 'Etc/UTC' }, async (event) => {
+  const bucket = admin.storage().bucket();
+  let totalDeleted = 0;
+  try {
+    for (const cfg of PREFIX_TTLS) {
+      const prefix = cfg.prefix;
+      const cutoff = Date.now() - (cfg.days * 24 * 60 * 60 * 1000);
+      const [files] = await bucket.getFiles({ prefix });
+      let deleted = 0;
+      for (const f of files) {
+        if (deleted >= 400) break; // per-prefix safety cap
+        try {
+          const [meta] = await f.getMetadata();
+          const t = new Date(meta.timeCreated || meta.updated || 0).getTime();
+          if (t && t < cutoff) {
+            await f.delete();
+            deleted += 1;
+            totalDeleted += 1;
+          }
+        } catch (_) {}
       }
-      console.log(`pruneOldImages: totalDeleted=${totalDeleted}`);
-      return null;
-    } catch (e) {
-      console.warn('pruneOldImages error', e);
-      return null;
+      console.log(`pruneOldImages: prefix=${prefix} deleted=${deleted}`);
     }
-  });
+    console.log(`pruneOldImages: totalDeleted=${totalDeleted}`);
+    return null;
+  } catch (e) {
+    console.warn('pruneOldImages error', e);
+    return null;
+  }
+});
+
