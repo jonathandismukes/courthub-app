@@ -3525,7 +3525,8 @@ async function verifyAppleReceipt({ receiptData, password, useSandbox }) {
  * - Does NOT perform full Apple/Google verification in this version
  */
 export const iapVerify = functions.region(REGION)
-  .runWith({ timeoutSeconds: 30, memory: '256MB', secrets: ['APPLE_SHARED_SECRET'] })
+  // Gen1-compatible runWith: avoid Gen2-only options like `secrets`
+  .runWith({ timeoutSeconds: 30, memory: '256MB' })
   .https.onCall(async (data, context) => {
     if (!context.auth) {
       throw new functions.https.HttpsError('unauthenticated', 'Sign in required');
@@ -3675,4 +3676,3 @@ export const pruneOldImages = functions.region(REGION).pubsub
       return null;
     }
   });
-
