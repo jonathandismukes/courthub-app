@@ -1,5 +1,13 @@
-const functions = require('firebase-functions');
-const admin = require('firebase-admin');
+import functions from 'firebase-functions';
+import admin from 'firebase-admin';
+import crypto from 'node:crypto';
+import https from 'node:https';
+import { URL } from 'node:url';
+import zlib from 'node:zlib';
+import fetch from 'node-fetch';
+import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 
 admin.initializeApp();
 
@@ -88,7 +96,7 @@ async function getAdminUid(db) {
  * Firestore trigger: enforce that only the configured admin UID can have isAdmin == true.
  * If any other user is written with isAdmin true, it will be reverted to false.
  */
-exports.enforceSingleAdminOnUserWrite = functions.firestore
+export const enforceSingleAdminOnUserWrite = functions.firestore
   .document('users/{userId}')
   .onWrite(async (change, context) => {
     const db = admin.firestore();
@@ -236,7 +244,7 @@ async function runFixCityFromAddressBatch(db, { pageSize = 1200, resume = true }
   return { pageScanned: scanned, pageUpdated: updated, pageSkippedEmpty: skippedEmpty, pageAmbiguous: ambiguous, done: isLast, cursor: isLast ? null : newCursor, ...newTotals };
 }
 
-exports.runFixCityFromAddressOnce = functions
+export const runFixCityFromAddressOnce = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -259,7 +267,7 @@ exports.runFixCityFromAddressOnce = functions
   });
 
 // HTTP wrapper for CI/admin (shared secret header like others)
-exports.runFixCityFromAddressOnceHttp = functions
+export const runFixCityFromAddressOnceHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -282,7 +290,7 @@ exports.runFixCityFromAddressOnceHttp = functions
  * - Loops runFixCityFromAddressBatch() until done or nearing timeout
  * - Returns cumulative totals and done flag
  */
-exports.runFixCityFromAddressAll = functions
+export const runFixCityFromAddressAll = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -318,7 +326,7 @@ exports.runFixCityFromAddressAll = functions
 /**
  * HTTP: Sweep Fix City/State fully with shared secret, no terminal loops needed
  */
-exports.runFixCityFromAddressAllHttp = functions
+export const runFixCityFromAddressAllHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -356,7 +364,7 @@ exports.runFixCityFromAddressAllHttp = functions
  * - Persists cursor + totals in jobs/fix_city_from_address so Admin can observe
  * - Auto-disables when complete to avoid unnecessary reads
  */
-exports.scheduledFixCityFromAddress = functions
+export const scheduledFixCityFromAddress = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
   .pubsub.schedule('every 2 minutes').timeZone('Etc/UTC')
   .onRun(async () => {
@@ -422,7 +430,7 @@ exports.scheduledFixCityFromAddress = functions
  *   mark the photo as featured: true.
  * - Admin-pinned photos are considered already featured and are not part of this cap.
  */
-exports.onParkPhotoUpdate = functions.firestore
+export const onParkPhotoUpdate = functions.firestore
   .document('parks/{parkId}/photos/{photoId}')
   .onUpdate(async (change, context) => {
     try {
@@ -481,7 +489,7 @@ exports.onParkPhotoUpdate = functions.firestore
 //   });
 
 // On update: refresh alias index when name/coords/approval change
-exports.indexParkAliasesOnUpdate = functions.firestore
+export const indexParkAliasesOnUpdate = functions.firestore
   .document('parks/{parkId}')
   .onUpdate(async (change, context) => {
     const db = admin.firestore();
@@ -507,7 +515,7 @@ exports.indexParkAliasesOnUpdate = functions.firestore
  * Touch queueTouchedAt whenever any court.gotNextQueue changes
  * to allow schedulers to only scan recently active parks.
  */
-exports.touchQueueTimestampOnParkUpdate = functions.firestore
+export const touchQueueTimestampOnParkUpdate = functions.firestore
   .document('parks/{parkId}')
   .onUpdate(async (change, context) => {
     const before = change.before.data() || {};
@@ -543,7 +551,7 @@ exports.touchQueueTimestampOnParkUpdate = functions.firestore
  * - If adminUid is set, only the current owner can change it to a new UID
  *   by passing { newOwnerUid }.
  */
-exports.claimImporterOwner = functions.https.onCall(async (data, context) => {
+export const claimImporterOwner = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
   }
@@ -607,11 +615,6 @@ exports.claimImporterOwner = functions.https.onCall(async (data, context) => {
  * - TTL enforced via expiresAt; expired entries are not returned
  * - No long-term caching of Google proprietary fields beyond minimal essentials
  */
-
-const crypto = require('crypto');
-const https = require('https');
-const { URL } = require('url');
-const zlib = require('zlib');
 
 /**
  * Minimal HTTPS helper to avoid relying on global fetch in Node runtimes.
@@ -922,7 +925,7 @@ async function fetchGoogleTextSearchPaged({ text, bias, pageAll = true, maxPages
   return { places: Array.from(aggregated.values()), nextPageToken };
 }
 
-exports.geoTextSearch = functions.https.onCall(async (data, context) => {
+export const geoTextSearch = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
   try {
     const text = (data && data.text ? String(data.text) : '').trim();
@@ -962,7 +965,7 @@ exports.geoTextSearch = functions.https.onCall(async (data, context) => {
 });
 
 // Versioned server-first text search with optional pagination and aggregation
-exports.geoTextSearchV2 = functions.https.onCall(async (data, context) => {
+export const geoTextSearchV2 = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
   try {
     const text = (data && data.text ? String(data.text) : '').trim();
@@ -1009,7 +1012,7 @@ exports.geoTextSearchV2 = functions.https.onCall(async (data, context) => {
 /**
  * Scheduled Function: prune expired geo cache docs
  */
-exports.pruneExpiredGeoCache = functions.pubsub
+export const pruneExpiredGeoCache = functions.pubsub
   .schedule('every 24 hours')
   .timeZone('Etc/UTC')
   .onRun(async (context) => {
@@ -1037,7 +1040,7 @@ exports.pruneExpiredGeoCache = functions.pubsub
  * Any park with source=='places' and autoExpireAt < now will be hidden (approved=false)
  * unless it has been claimed by a user (createdByUserId not 'system').
  */
-exports.pruneExpiredGoogleParks = functions.pubsub
+export const pruneExpiredGoogleParks = functions.pubsub
   .schedule('every 24 hours')
   .timeZone('Etc/UTC')
   .onRun(async () => {
@@ -1174,7 +1177,7 @@ exports.pruneExpiredGoogleParks = functions.pubsub
   }
 
   // Callable: run one batch
-  exports.extendGoogleParkExpiryOnce = functions
+  export const extendGoogleParkExpiryOnce = functions
     .runWith({ timeoutSeconds: 540, memory: '1GB' })
     .https.onCall(async (data, context) => {
       const db = admin.firestore();
@@ -1199,7 +1202,7 @@ exports.pruneExpiredGoogleParks = functions.pubsub
     });
 
   // Callable: loop until done (within time budget)
-  exports.extendGoogleParkExpiryAll = functions
+  export const extendGoogleParkExpiryAll = functions
     .runWith({ timeoutSeconds: 540, memory: '1GB' })
     .https.onCall(async (data, context) => {
       const db = admin.firestore();
@@ -1230,7 +1233,7 @@ exports.pruneExpiredGoogleParks = functions.pubsub
     });
 
   // HTTP wrapper (shared secret) for CI/admin automation
-  exports.extendGoogleParkExpiryAllHttp = functions
+  export const extendGoogleParkExpiryAllHttp = functions
     .runWith({ timeoutSeconds: 540, memory: '1GB' })
     .https.onRequest(async (req, res) => {
       try {
@@ -1289,7 +1292,7 @@ async function fetchGoogleReverse(lat, lng) {
   return { address: address || first.formatted_address || '', city: city || '', state: stateShort || '' };
 }
 
-exports.geoReverseGeocode = functions.https.onCall(async (data, context) => {
+export const geoReverseGeocode = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
   try {
     const lat = Number(data && data.lat);
@@ -1349,7 +1352,7 @@ async function fetchGooglePlaceDetails(placeId) {
   };
 }
 
-exports.geoPlaceDetails = functions.https.onCall(async (data, context) => {
+export const geoPlaceDetails = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
   try {
     const placeId = (data && data.placeId ? String(data.placeId) : '').trim();
@@ -1813,7 +1816,7 @@ async function runParksBackfillBatch({ db, settings, ownerUid, startAfterId = nu
  *
  * Triggers: onUpdate for parks collection
  */
-exports.notifyParkModerationUpdate = functions.firestore
+export const notifyParkModerationUpdate = functions.firestore
   .document('parks/{parkId}')
   .onUpdate(async (change, context) => {
     const before = change.before.data() || {};
@@ -1859,7 +1862,7 @@ exports.notifyParkModerationUpdate = functions.firestore
  * Callable function: strips admin from everyone except the configured owner.
  * Requires the caller to be authenticated as the owner (adminUid).
  */
-exports.stripNonOwnerAdmins = functions.https.onCall(async (data, context) => {
+export const stripNonOwnerAdmins = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
   }
@@ -2291,7 +2294,7 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
   return { pages: 1, scanned, updatedParks, courtsAdded, cursor, done };
 }
 
-exports.runRetroMergeOnce = functions
+export const runRetroMergeOnce = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2324,7 +2327,7 @@ exports.runRetroMergeOnce = functions
   });
 
 // HTTP wrapper for CI (GridHub/GitHub). Requires X-Run-Secret header.
-exports.runRetroMergeOnceHttp = functions
+export const runRetroMergeOnceHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -2354,7 +2357,7 @@ exports.runRetroMergeOnceHttp = functions
 /**
  * Owner-callable: Sweep Retro-merge across all parks in one session (looped)
  */
-exports.runRetroMergeAll = functions
+export const runRetroMergeAll = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2406,7 +2409,7 @@ exports.runRetroMergeAll = functions
 /**
  * HTTP: Sweep Retro-merge fully with shared secret
  */
-exports.runRetroMergeAllHttp = functions
+export const runRetroMergeAllHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -2461,7 +2464,7 @@ exports.runRetroMergeAllHttp = functions
  * - Per owner request, Fix City/State has completed and is no longer part of the one-time sweep.
  * - We keep the shape of the response with a no-op "fix" block for UI compatibility.
  */
-exports.runOneTimeSweepAll = functions
+export const runOneTimeSweepAll = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2500,7 +2503,7 @@ exports.runOneTimeSweepAll = functions
 /**
  * Admin/owner callable: reset Fix City/State checkpoint (server-side write)
  */
-exports.resetFixCityFromAddressCheckpoint = functions
+export const resetFixCityFromAddressCheckpoint = functions
   .runWith({ timeoutSeconds: 60, memory: '256MB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2533,7 +2536,7 @@ exports.resetFixCityFromAddressCheckpoint = functions
  * Admin/owner callable: reset Retro-merge checkpoint (server-side write)
  * Resets both the server control/status docs and the legacy jobs doc used by the client-side runner.
  */
-exports.resetRetroMergeCheckpoint = functions
+export const resetRetroMergeCheckpoint = functions
   .runWith({ timeoutSeconds: 60, memory: '256MB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2570,7 +2573,7 @@ exports.resetRetroMergeCheckpoint = functions
  * HTTP: Run Retro-merge sweep only with one request (shared secret)
  * Fix City/State has been removed from this combined endpoint.
  */
-exports.runOneTimeSweepAllHttp = functions
+export const runOneTimeSweepAllHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -2608,7 +2611,7 @@ exports.runOneTimeSweepAllHttp = functions
 
 // Optional scheduler: disabled by default unless retroMerge/control.enabled == true
 // Now runs every 2 minutes with a soft cooldown and auto-disables when done
-exports.scheduledRetroMerge = functions
+export const scheduledRetroMerge = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
   .pubsub.schedule('every 2 minutes').timeZone('Etc/UTC')
   .onRun(async () => {
@@ -2772,7 +2775,7 @@ exports.scheduledRetroMerge = functions
  */
 // Removed: runGooglePlacesImportForCityHttp — no more ad-hoc imports
 
-exports.scheduledBuildStateCityIndex = functions.pubsub
+export const scheduledBuildStateCityIndex = functions.pubsub
   .schedule('every 6 hours')
   .timeZone('Etc/UTC')
   .onRun(async () => {
@@ -2857,7 +2860,7 @@ exports.scheduledBuildStateCityIndex = functions.pubsub
  * 4. Send FCM notification with click action to open the park
  * 5. Clean up invalid/expired tokens
  */
-exports.sendCheckinNotification = functions.firestore
+export const sendCheckinNotification = functions.firestore
   .document('checkins/{checkinId}')
   .onCreate(async (snapshot, context) => {
     const checkin = snapshot.data();
@@ -2952,7 +2955,7 @@ exports.sendCheckinNotification = functions.firestore
  * 
  * Triggers: onCreate for notifications collection (type: friend_request)
  */
-exports.sendFriendRequestNotification = functions.firestore
+export const sendFriendRequestNotification = functions.firestore
   .document('notifications/{notificationId}')
   .onCreate(async (snapshot, context) => {
     const notification = snapshot.data();
@@ -2985,7 +2988,7 @@ exports.sendFriendRequestNotification = functions.firestore
  *
  * Runs periodically and removes any queue players with no activity for > 60 minutes.
  */
-exports.pruneStaleQueueEntries = functions.pubsub
+export const pruneStaleQueueEntries = functions.pubsub
   .schedule('every 15 minutes')
   .timeZone('Etc/UTC')
   .onRun(async (context) => {
@@ -3055,7 +3058,7 @@ exports.pruneStaleQueueEntries = functions.pubsub
  * 
  * Triggers: onCreate for notifications collection (type: game_invite or now_playing)
  */
-exports.sendGameNotification = functions.firestore
+export const sendGameNotification = functions.firestore
   .document('notifications/{notificationId}')
   .onCreate(async (snapshot, context) => {
     const notification = snapshot.data();
@@ -3129,7 +3132,7 @@ exports.sendGameNotification = functions.firestore
  * 2. Query active check-ins for that court
  * 3. Update the park document with the current player count
  */
-exports.updateCourtPlayerCountOnCheckIn = functions.firestore
+export const updateCourtPlayerCountOnCheckIn = functions.firestore
   .document('checkins/{checkinId}')
   .onCreate(async (snapshot, context) => {
     const checkin = snapshot.data();
@@ -3199,7 +3202,7 @@ exports.updateCourtPlayerCountOnCheckIn = functions.firestore
  * 2. Query active check-ins for that court
  * 3. Update the park document with the current player count
  */
-exports.updateCourtPlayerCountOnCheckOut = functions.firestore
+export const updateCourtPlayerCountOnCheckOut = functions.firestore
   .document('checkins/{checkinId}')
   .onUpdate(async (change, context) => {
     const before = change.before.data();
@@ -3274,7 +3277,7 @@ exports.updateCourtPlayerCountOnCheckOut = functions.firestore
  * 1. Query active check-ins for that court
  * 2. Update the park document with the current player count
  */
-exports.updateCourtPlayerCountOnDelete = functions.firestore
+export const updateCourtPlayerCountOnDelete = functions.firestore
   .document('checkins/{checkinId}')
   .onDelete(async (snapshot, context) => {
     const checkin = snapshot.data();
@@ -3347,7 +3350,7 @@ exports.updateCourtPlayerCountOnDelete = functions.firestore
  * - Chooses a primary (prefer user-submitted over OSM; then oldest)
  * - Marks other docs as duplicates and links their source to primary.altSources
  */
-exports.scheduledDedupeParks = functions.pubsub
+export const scheduledDedupeParks = functions.pubsub
   .schedule('every 12 hours')
   .timeZone('Etc/UTC')
   .onRun(async () => {
@@ -3431,19 +3434,10 @@ const PREFIX_TTLS = [
   { prefix: THUMB_PREFIX, days: TTL_DEFAULT_DAYS },
 ];
 
-// Lazy fetch for CommonJS with node-fetch@3 (ESM-only)
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-
-// Google Play advanced verification using googleapis
-let googleApi;
-try { googleApi = require('googleapis'); } catch (_) { googleApi = null; }
-
+// Google Play advanced verification using googleapis (dynamic import)
 async function verifyAndroidPurchase({ packageName, productId, purchaseToken, isSubscription }) {
-  if (!googleApi) {
-    return { ok: false, reason: 'googleapis_not_available' };
-  }
   try {
-    const { google } = googleApi;
+    const { google } = await import('googleapis');
     const auth = await google.auth.getClient({ scopes: ['https://www.googleapis.com/auth/androidpublisher'] });
     const androidpublisher = google.androidpublisher({ version: 'v3', auth });
     const pkg = packageName || ANDROID_PACKAGE;
@@ -3530,7 +3524,7 @@ async function verifyAppleReceipt({ receiptData, password, useSandbox }) {
  * - Stores purchase payloads for later verification and audit
  * - Does NOT perform full Apple/Google verification in this version
  */
-exports.iapVerify = functions.region(REGION)
+export const iapVerify = functions.region(REGION)
   .runWith({ timeoutSeconds: 30, memory: '256MB', secrets: ['APPLE_SHARED_SECRET'] })
   .https.onCall(async (data, context) => {
     if (!context.auth) {
@@ -3595,7 +3589,7 @@ exports.iapVerify = functions.region(REGION)
  * - Skips non-images and already-generated thumbnails
  * - Writes to thumbnails/medium-<filename>.jpg with long cache headers
  */
-exports.onImageFinalize = functions.region(REGION)
+export const onImageFinalize = functions.region(REGION)
   .runWith({ timeoutSeconds: 120, memory: '1GB' })
   .storage.bucket(DEFAULT_BUCKET).object()
   .onFinalize(async (object) => {
@@ -3608,9 +3602,6 @@ exports.onImageFinalize = functions.region(REGION)
       // if (!IMAGE_PREFIXES.some(p => filePath.startsWith(p))) return null;
 
       const bucket = admin.storage().bucket(object.bucket);
-      const path = require('path');
-      const fs = require('fs');
-      const os = require('os');
       const fileName = path.basename(filePath);
       const destPath = `${THUMB_PREFIX}medium-${fileName}.jpg`;
 
@@ -3623,8 +3614,8 @@ exports.onImageFinalize = functions.region(REGION)
 
       await bucket.file(filePath).download({ destination: tmpSrc });
 
-      // Lazy require sharp to avoid cold start overhead in unrelated functions
-      const sharp = require('sharp');
+      // Lazy import sharp to avoid cold start overhead in unrelated functions
+      const sharp = (await import('sharp')).default;
       await sharp(tmpSrc)
         .rotate()
         .resize({ width: 1280, withoutEnlargement: true })
@@ -3651,7 +3642,7 @@ exports.onImageFinalize = functions.region(REGION)
 /**
  * Scheduled: Prune thumbnails older than 30 days (limits to ~400 deletions/run)
  */
-exports.pruneOldImages = functions.region(REGION).pubsub
+export const pruneOldImages = functions.region(REGION).pubsub
   .schedule('every 24 hours')
   .timeZone('Etc/UTC')
   .onRun(async () => {
@@ -3684,3 +3675,4 @@ exports.pruneOldImages = functions.region(REGION).pubsub
       return null;
     }
   });
+
