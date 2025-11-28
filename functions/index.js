@@ -1,4 +1,4 @@
-import * as functions from 'firebase-functions';
+import functions from 'firebase-functions/v1';
 import admin from 'firebase-admin';
 import crypto from 'node:crypto';
 import https from 'node:https';
