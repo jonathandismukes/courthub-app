@@ -1,25 +1,39 @@
-import functions from 'firebase-functions/v1';
-// Use v2 only for the few functions that need Gen 2 compatibility with CPU settings
-import { onCall, HttpsError } from 'firebase-functions/v2/https';
-import { onObjectFinalized } from 'firebase-functions/v2/storage';
-import { onSchedule } from 'firebase-functions/v2/scheduler';
-import admin from 'firebase-admin';
-import crypto from 'node:crypto';
-import https from 'node:https';
-import { URL } from 'node:url';
-import zlib from 'node:zlib';
-import fetch from 'node-fetch';
-import path from 'node:path';
-import fs from 'node:fs';
-import os from 'node:os';
+// CommonJS style to match your known-good deployment (index.backup.js)
+// No ESM imports; no v2-only APIs; mirrors your successful patterns.
+const functions = require('firebase-functions');
+// Bring in v2 builders for the few functions that need them (matches index.backup.js structure)
+const { onCall, HttpsError } = require('firebase-functions/v2/https');
+const { onObjectFinalized } = require('firebase-functions/v2/storage');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
+const admin = require('firebase-admin');
+const crypto = require('crypto');
+const https = require('https');
+const { URL } = require('url');
+const zlib = require('zlib');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const sharp = require('sharp');
+const { google } = require('googleapis');
 
 admin.initializeApp();
 
-// Explicitly set the default Cloud Storage bucket for triggers that need validation.
-// Note: Firebase Storage's download domain is *.firebasestorage.app, but the actual
-// bucket resource name remains <project-id>.appspot.com. Using the bucket resource
-// name avoids Eventarc validation errors.
+// Explicit default bucket (avoids Eventarc region validation issues)
 const DEFAULT_BUCKET = 'courthub-app.appspot.com';
+
+// Image pipeline settings (env/config overrides)
+const THUMB_MAX_DIM = Math.max(320, Math.min(4096, Number(process.env.THUMB_MAX_DIM || 1280)));
+const THUMB_QUALITY = Math.max(40, Math.min(92, Number(process.env.THUMB_QUALITY || 80)));
+const THUMB_PREFIX = String(process.env.THUMB_PREFIX || 'thumbnails/');
+const THUMB_MEDIUM_PREFIX = String(process.env.THUMB_MEDIUM_PREFIX || 'thumbnails/');
+
+// TTLs (match backup: only prune thumbnails by default)
+const TTL_DEFAULT_DAYS = 30; // generic assets + thumbnails
+const TTL_ATTACHMENTS_DAYS = 14; // reserved for future, do not prune attachments by default
+// Only prune thumbnails by default. We do NOT touch user attachments.
+const PREFIX_TTLS = [
+  { prefix: THUMB_PREFIX, days: TTL_DEFAULT_DAYS },
+];
 
 // West→East processing order across US states (used by schedulers)
 const WEST_TO_EAST_STATE_ORDER = [
@@ -100,7 +114,7 @@ async function getAdminUid(db) {
  * Firestore trigger: enforce that only the configured admin UID can have isAdmin == true.
  * If any other user is written with isAdmin true, it will be reverted to false.
  */
-export const enforceSingleAdminOnUserWrite = functions.firestore
+exports.enforceSingleAdminOnUserWrite = functions.firestore
   .document('users/{userId}')
   .onWrite(async (change, context) => {
     const db = admin.firestore();
@@ -248,7 +262,7 @@ async function runFixCityFromAddressBatch(db, { pageSize = 1200, resume = true }
   return { pageScanned: scanned, pageUpdated: updated, pageSkippedEmpty: skippedEmpty, pageAmbiguous: ambiguous, done: isLast, cursor: isLast ? null : newCursor, ...newTotals };
 }
 
-export const runFixCityFromAddressOnce = functions
+exports.runFixCityFromAddressOnce = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -271,7 +285,7 @@ export const runFixCityFromAddressOnce = functions
   });
 
 // HTTP wrapper for CI/admin (shared secret header like others)
-export const runFixCityFromAddressOnceHttp = functions
+exports.runFixCityFromAddressOnceHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -294,7 +308,7 @@ export const runFixCityFromAddressOnceHttp = functions
  * - Loops runFixCityFromAddressBatch() until done or nearing timeout
  * - Returns cumulative totals and done flag
  */
-export const runFixCityFromAddressAll = functions
+exports.runFixCityFromAddressAll = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -330,7 +344,7 @@ export const runFixCityFromAddressAll = functions
 /**
  * HTTP: Sweep Fix City/State fully with shared secret, no terminal loops needed
  */
-export const runFixCityFromAddressAllHttp = functions
+exports.runFixCityFromAddressAllHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -368,7 +382,7 @@ export const runFixCityFromAddressAllHttp = functions
  * - Persists cursor + totals in jobs/fix_city_from_address so Admin can observe
  * - Auto-disables when complete to avoid unnecessary reads
  */
-export const scheduledFixCityFromAddress = functions
+exports.scheduledFixCityFromAddress = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
   .pubsub.schedule('every 2 minutes').timeZone('Etc/UTC')
   .onRun(async () => {
@@ -434,7 +448,7 @@ export const scheduledFixCityFromAddress = functions
  *   mark the photo as featured: true.
  * - Admin-pinned photos are considered already featured and are not part of this cap.
  */
-export const onParkPhotoUpdate = functions.firestore
+exports.onParkPhotoUpdate = functions.firestore
   .document('parks/{parkId}/photos/{photoId}')
   .onUpdate(async (change, context) => {
     try {
@@ -493,7 +507,7 @@ export const onParkPhotoUpdate = functions.firestore
 //   });
 
 // On update: refresh alias index when name/coords/approval change
-export const indexParkAliasesOnUpdate = functions.firestore
+exports.indexParkAliasesOnUpdate = functions.firestore
   .document('parks/{parkId}')
   .onUpdate(async (change, context) => {
     const db = admin.firestore();
@@ -519,7 +533,7 @@ export const indexParkAliasesOnUpdate = functions.firestore
  * Touch queueTouchedAt whenever any court.gotNextQueue changes
  * to allow schedulers to only scan recently active parks.
  */
-export const touchQueueTimestampOnParkUpdate = functions.firestore
+exports.touchQueueTimestampOnParkUpdate = functions.firestore
   .document('parks/{parkId}')
   .onUpdate(async (change, context) => {
     const before = change.before.data() || {};
@@ -555,7 +569,7 @@ export const touchQueueTimestampOnParkUpdate = functions.firestore
  * - If adminUid is set, only the current owner can change it to a new UID
  *   by passing { newOwnerUid }.
  */
-export const claimImporterOwner = functions.https.onCall(async (data, context) => {
+exports.claimImporterOwner = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
   }
@@ -786,8 +800,9 @@ async function consumeGoogleCalls(db, calls) {
   }
 }
 const TEXT_TTL_DAYS = 14; // cache text search for 14 days
-const REV_TTL_DAYS = 120;  // cache reverse geocode for 120 days
-const DETAILS_TTL_DAYS = 120; // cache place details for 120 days
+// Match backup TTLs so previously cached windows remain valid
+const REV_TTL_DAYS = 120;   // reverse geocode cache 120 days
+const DETAILS_TTL_DAYS = 120; // place details cache 120 days
 
 function ttlFromDays(days) {
   const d = new Date();
@@ -929,7 +944,7 @@ async function fetchGoogleTextSearchPaged({ text, bias, pageAll = true, maxPages
   return { places: Array.from(aggregated.values()), nextPageToken };
 }
 
-export const geoTextSearch = functions.https.onCall(async (data, context) => {
+exports.geoTextSearch = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
   try {
     const text = (data && data.text ? String(data.text) : '').trim();
@@ -969,7 +984,7 @@ export const geoTextSearch = functions.https.onCall(async (data, context) => {
 });
 
 // Versioned server-first text search with optional pagination and aggregation
-export const geoTextSearchV2 = functions.https.onCall(async (data, context) => {
+exports.geoTextSearchV2 = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
   try {
     const text = (data && data.text ? String(data.text) : '').trim();
@@ -1016,7 +1031,7 @@ export const geoTextSearchV2 = functions.https.onCall(async (data, context) => {
 /**
  * Scheduled Function: prune expired geo cache docs
  */
-export const pruneExpiredGeoCache = functions.pubsub
+exports.pruneExpiredGeoCache = functions.pubsub
   .schedule('every 24 hours')
   .timeZone('Etc/UTC')
   .onRun(async (context) => {
@@ -1044,7 +1059,7 @@ export const pruneExpiredGeoCache = functions.pubsub
  * Any park with source=='places' and autoExpireAt < now will be hidden (approved=false)
  * unless it has been claimed by a user (createdByUserId not 'system').
  */
-export const pruneExpiredGoogleParks = functions.pubsub
+exports.pruneExpiredGoogleParks = functions.pubsub
   .schedule('every 24 hours')
   .timeZone('Etc/UTC')
   .onRun(async () => {
@@ -1181,7 +1196,7 @@ export const pruneExpiredGoogleParks = functions.pubsub
   }
 
   // Callable: run one batch
-  export const extendGoogleParkExpiryOnce = functions
+  exports.extendGoogleParkExpiryOnce = functions
     .runWith({ timeoutSeconds: 540, memory: '1GB' })
     .https.onCall(async (data, context) => {
       const db = admin.firestore();
@@ -1206,7 +1221,7 @@ export const pruneExpiredGoogleParks = functions.pubsub
     });
 
   // Callable: loop until done (within time budget)
-  export const extendGoogleParkExpiryAll = functions
+  exports.extendGoogleParkExpiryAll = functions
     .runWith({ timeoutSeconds: 540, memory: '1GB' })
     .https.onCall(async (data, context) => {
       const db = admin.firestore();
@@ -1237,7 +1252,7 @@ export const pruneExpiredGoogleParks = functions.pubsub
     });
 
   // HTTP wrapper (shared secret) for CI/admin automation
-  export const extendGoogleParkExpiryAllHttp = functions
+  exports.extendGoogleParkExpiryAllHttp = functions
     .runWith({ timeoutSeconds: 540, memory: '1GB' })
     .https.onRequest(async (req, res) => {
       try {
@@ -1296,7 +1311,7 @@ async function fetchGoogleReverse(lat, lng) {
   return { address: address || first.formatted_address || '', city: city || '', state: stateShort || '' };
 }
 
-export const geoReverseGeocode = functions.https.onCall(async (data, context) => {
+exports.geoReverseGeocode = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
   try {
     const lat = Number(data && data.lat);
@@ -1356,7 +1371,7 @@ async function fetchGooglePlaceDetails(placeId) {
   };
 }
 
-export const geoPlaceDetails = functions.https.onCall(async (data, context) => {
+exports.geoPlaceDetails = functions.https.onCall(async (data, context) => {
   const db = admin.firestore();
   try {
     const placeId = (data && data.placeId ? String(data.placeId) : '').trim();
@@ -1820,7 +1835,7 @@ async function runParksBackfillBatch({ db, settings, ownerUid, startAfterId = nu
  *
  * Triggers: onUpdate for parks collection
  */
-export const notifyParkModerationUpdate = functions.firestore
+exports.notifyParkModerationUpdate = functions.firestore
   .document('parks/{parkId}')
   .onUpdate(async (change, context) => {
     const before = change.before.data() || {};
@@ -1866,7 +1881,7 @@ export const notifyParkModerationUpdate = functions.firestore
  * Callable function: strips admin from everyone except the configured owner.
  * Requires the caller to be authenticated as the owner (adminUid).
  */
-export const stripNonOwnerAdmins = functions.https.onCall(async (data, context) => {
+exports.stripNonOwnerAdmins = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
   }
@@ -2298,7 +2313,7 @@ async function runRetroMergeBatch(db, { pageSize = 1000, proximityMiles = 0.12, 
   return { pages: 1, scanned, updatedParks, courtsAdded, cursor, done };
 }
 
-export const runRetroMergeOnce = functions
+exports.runRetroMergeOnce = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2331,7 +2346,7 @@ export const runRetroMergeOnce = functions
   });
 
 // HTTP wrapper for CI (GridHub/GitHub). Requires X-Run-Secret header.
-export const runRetroMergeOnceHttp = functions
+exports.runRetroMergeOnceHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -2361,7 +2376,7 @@ export const runRetroMergeOnceHttp = functions
 /**
  * Owner-callable: Sweep Retro-merge across all parks in one session (looped)
  */
-export const runRetroMergeAll = functions
+exports.runRetroMergeAll = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2413,7 +2428,7 @@ export const runRetroMergeAll = functions
 /**
  * HTTP: Sweep Retro-merge fully with shared secret
  */
-export const runRetroMergeAllHttp = functions
+exports.runRetroMergeAllHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -2468,7 +2483,7 @@ export const runRetroMergeAllHttp = functions
  * - Per owner request, Fix City/State has completed and is no longer part of the one-time sweep.
  * - We keep the shape of the response with a no-op "fix" block for UI compatibility.
  */
-export const runOneTimeSweepAll = functions
+exports.runOneTimeSweepAll = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2507,7 +2522,7 @@ export const runOneTimeSweepAll = functions
 /**
  * Admin/owner callable: reset Fix City/State checkpoint (server-side write)
  */
-export const resetFixCityFromAddressCheckpoint = functions
+exports.resetFixCityFromAddressCheckpoint = functions
   .runWith({ timeoutSeconds: 60, memory: '256MB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2540,7 +2555,7 @@ export const resetFixCityFromAddressCheckpoint = functions
  * Admin/owner callable: reset Retro-merge checkpoint (server-side write)
  * Resets both the server control/status docs and the legacy jobs doc used by the client-side runner.
  */
-export const resetRetroMergeCheckpoint = functions
+exports.resetRetroMergeCheckpoint = functions
   .runWith({ timeoutSeconds: 60, memory: '256MB' })
   .https.onCall(async (data, context) => {
     const db = admin.firestore();
@@ -2577,7 +2592,7 @@ export const resetRetroMergeCheckpoint = functions
  * HTTP: Run Retro-merge sweep only with one request (shared secret)
  * Fix City/State has been removed from this combined endpoint.
  */
-export const runOneTimeSweepAllHttp = functions
+exports.runOneTimeSweepAllHttp = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB' })
   .https.onRequest(async (req, res) => {
     try {
@@ -2615,7 +2630,7 @@ export const runOneTimeSweepAllHttp = functions
 
 // Optional scheduler: disabled by default unless retroMerge/control.enabled == true
 // Now runs every 2 minutes with a soft cooldown and auto-disables when done
-export const scheduledRetroMerge = functions
+exports.scheduledRetroMerge = functions
   .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
   .pubsub.schedule('every 2 minutes').timeZone('Etc/UTC')
   .onRun(async () => {
@@ -2779,7 +2794,7 @@ export const scheduledRetroMerge = functions
  */
 // Removed: runGooglePlacesImportForCityHttp — no more ad-hoc imports
 
-export const scheduledBuildStateCityIndex = functions.pubsub
+exports.scheduledBuildStateCityIndex = functions.pubsub
   .schedule('every 6 hours')
   .timeZone('Etc/UTC')
   .onRun(async () => {
@@ -2864,7 +2879,7 @@ export const scheduledBuildStateCityIndex = functions.pubsub
  * 4. Send FCM notification with click action to open the park
  * 5. Clean up invalid/expired tokens
  */
-export const sendCheckinNotification = functions.firestore
+exports.sendCheckinNotification = functions.firestore
   .document('checkins/{checkinId}')
   .onCreate(async (snapshot, context) => {
     const checkin = snapshot.data();
@@ -2959,7 +2974,7 @@ export const sendCheckinNotification = functions.firestore
  * 
  * Triggers: onCreate for notifications collection (type: friend_request)
  */
-export const sendFriendRequestNotification = functions.firestore
+exports.sendFriendRequestNotification = functions.firestore
   .document('notifications/{notificationId}')
   .onCreate(async (snapshot, context) => {
     const notification = snapshot.data();
@@ -2992,7 +3007,7 @@ export const sendFriendRequestNotification = functions.firestore
  *
  * Runs periodically and removes any queue players with no activity for > 60 minutes.
  */
-export const pruneStaleQueueEntries = functions.pubsub
+exports.pruneStaleQueueEntries = functions.pubsub
   .schedule('every 15 minutes')
   .timeZone('Etc/UTC')
   .onRun(async (context) => {
@@ -3062,7 +3077,7 @@ export const pruneStaleQueueEntries = functions.pubsub
  * 
  * Triggers: onCreate for notifications collection (type: game_invite or now_playing)
  */
-export const sendGameNotification = functions.firestore
+exports.sendGameNotification = functions.firestore
   .document('notifications/{notificationId}')
   .onCreate(async (snapshot, context) => {
     const notification = snapshot.data();
@@ -3136,7 +3151,7 @@ export const sendGameNotification = functions.firestore
  * 2. Query active check-ins for that court
  * 3. Update the park document with the current player count
  */
-export const updateCourtPlayerCountOnCheckIn = functions.firestore
+exports.updateCourtPlayerCountOnCheckIn = functions.firestore
   .document('checkins/{checkinId}')
   .onCreate(async (snapshot, context) => {
     const checkin = snapshot.data();
@@ -3206,7 +3221,7 @@ export const updateCourtPlayerCountOnCheckIn = functions.firestore
  * 2. Query active check-ins for that court
  * 3. Update the park document with the current player count
  */
-export const updateCourtPlayerCountOnCheckOut = functions.firestore
+exports.updateCourtPlayerCountOnCheckOut = functions.firestore
   .document('checkins/{checkinId}')
   .onUpdate(async (change, context) => {
     const before = change.before.data();
@@ -3281,7 +3296,7 @@ export const updateCourtPlayerCountOnCheckOut = functions.firestore
  * 1. Query active check-ins for that court
  * 2. Update the park document with the current player count
  */
-export const updateCourtPlayerCountOnDelete = functions.firestore
+exports.updateCourtPlayerCountOnDelete = functions.firestore
   .document('checkins/{checkinId}')
   .onDelete(async (snapshot, context) => {
     const checkin = snapshot.data();
@@ -3354,7 +3369,7 @@ export const updateCourtPlayerCountOnDelete = functions.firestore
  * - Chooses a primary (prefer user-submitted over OSM; then oldest)
  * - Marks other docs as duplicates and links their source to primary.altSources
  */
-export const scheduledDedupeParks = functions.pubsub
+exports.scheduledDedupeParks = functions.pubsub
   .schedule('every 12 hours')
   .timeZone('Etc/UTC')
   .onRun(async () => {
@@ -3419,29 +3434,15 @@ export const scheduledDedupeParks = functions.pubsub
     }
   });
 
-// -------------------- Appended New Functions (monolithic merge) --------------------
-// Note: admin.initializeApp() already called at top of file. Do NOT re-initialize.
-
+// -------------------- IAP + Image pipeline (kept, CommonJS) --------------------
 // Region and IAP/image pipeline constants (env-driven; safe defaults)
 const REGION = process.env.FUNCTIONS_REGION || 'us-central1';
 const ANDROID_PACKAGE = process.env.ANDROID_PACKAGE || process.env.ANDROID_PACKAGE_NAME || null;
 const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || null;
 
-// Image pipeline constants and TTLs
-const THUMB_PREFIX = 'thumbnails/';
-// Adjust these prefixes as needed to match your storage layout
-const IMAGE_PREFIXES = ['uploads/', 'attachments/', 'images/'];
-const TTL_DEFAULT_DAYS = 30; // generic assets + thumbnails
-const TTL_ATTACHMENTS_DAYS = 14; // shorter retention for attachments
-// Only prune thumbnails by default. We do NOT touch user attachments.
-const PREFIX_TTLS = [
-  { prefix: THUMB_PREFIX, days: TTL_DEFAULT_DAYS },
-];
-
-// Google Play advanced verification using googleapis (dynamic import)
+// Google Play advanced verification using googleapis
 async function verifyAndroidPurchase({ packageName, productId, purchaseToken, isSubscription }) {
   try {
-    const { google } = await import('googleapis');
     const auth = await google.auth.getClient({ scopes: ['https://www.googleapis.com/auth/androidpublisher'] });
     const androidpublisher = google.androidpublisher({ version: 'v3', auth });
     const pkg = packageName || ANDROID_PACKAGE;
@@ -3492,13 +3493,13 @@ async function verifyAndroidPurchase({ packageName, productId, purchaseToken, is
   }
 }
 
-// Apple advanced receipt verification
+// Apple advanced receipt verification (uses httpRequest to avoid ESM-only fetch)
 async function verifyAppleReceipt({ receiptData, password, useSandbox }) {
   const endpoint = useSandbox ? 'https://sandbox.itunes.apple.com/verifyReceipt' : 'https://buy.itunes.apple.com/verifyReceipt';
   if (!receiptData) return { ok: false, reason: 'missing_receipt' };
   const body = { 'receipt-data': receiptData, password: password || process.env.APPLE_SHARED_SECRET, 'exclude-old-transactions': true };
   try {
-    const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const res = await httpRequest('POST', endpoint, { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const json = await res.json();
     if (json?.status === 21007 && !useSandbox) {
       // Retry in sandbox automatically
@@ -3525,10 +3526,9 @@ async function verifyAppleReceipt({ receiptData, password, useSandbox }) {
 
 /**
  * Callable: Record IAP payloads (server-side receipt log)
- * - Stores purchase payloads for later verification and audit
- * - Does NOT perform full Apple/Google verification in this version
+ * - Stores purchase payloads and performs optional verification
  */
-export const iapVerify = onCall({ region: REGION, timeoutSeconds: 30, memory: '256MiB' }, async (request) => {
+exports.iapVerify = onCall({ region: process.env.FUNCTIONS_REGION || 'us-central1', timeoutSeconds: 30, memory: '256MiB' }, async (request) => {
   const { data, auth } = request;
   if (!auth) {
     throw new HttpsError('unauthenticated', 'Sign in required');
@@ -3544,6 +3544,9 @@ export const iapVerify = onCall({ region: REGION, timeoutSeconds: 30, memory: '2
       receipt,
       appVersion,
       device,
+      packageName,
+      sandbox,
+      receiptData,
     } = data || {};
 
     if (!platform || !productId) {
@@ -3555,9 +3558,9 @@ export const iapVerify = onCall({ region: REGION, timeoutSeconds: 30, memory: '2
     try {
       if (platform === 'android' && purchaseToken && productId) {
         const isSub = /sub/i.test(productId) || /monthly|year|week/i.test(productId);
-        verification = await verifyAndroidPurchase({ packageName: data?.packageName || ANDROID_PACKAGE, productId, purchaseToken, isSubscription: isSub });
-      } else if (platform === 'ios' && (receipt || data?.receiptData)) {
-        verification = await verifyAppleReceipt({ receiptData: receipt || data?.receiptData, password: process.env.APPLE_SHARED_SECRET, useSandbox: !!data?.sandbox });
+        verification = await verifyAndroidPurchase({ packageName: packageName || ANDROID_PACKAGE, productId, purchaseToken, isSubscription: isSub });
+      } else if (platform === 'ios' && (receipt || receiptData)) {
+        verification = await verifyAppleReceipt({ receiptData: receipt || receiptData, password: APPLE_SHARED_SECRET, useSandbox: !!sandbox });
       }
     } catch (ve) {
       console.warn('iapVerify advanced verification failed', ve);
@@ -3572,9 +3575,8 @@ export const iapVerify = onCall({ region: REGION, timeoutSeconds: 30, memory: '2
       orderId: orderId ? String(orderId) : null,
       purchaseToken: purchaseToken ? String(purchaseToken) : null,
       signature: signature ? String(signature) : null,
-      // limit to avoid giant writes
       receipt: receipt ? String(receipt).slice(0, 4000) : null,
-      status: verification?.ok ? (verification.active ? 'verified_active' : 'verified_inactive') : 'recorded',
+      status: verification && verification.ok ? (verification.active ? 'verified_active' : 'verified_inactive') : 'recorded',
       verification: verification || null,
       appVersion: appVersion || null,
       device: device || null,
@@ -3592,48 +3594,48 @@ export const iapVerify = onCall({ region: REGION, timeoutSeconds: 30, memory: '2
  * - Skips non-images and already-generated thumbnails
  * - Writes to thumbnails/medium-<filename>.jpg with long cache headers
  */
-export const onImageFinalize = onObjectFinalized({ region: REGION, bucket: DEFAULT_BUCKET, timeoutSeconds: 120, memory: '1GiB' },
+exports.onImageFinalize = onObjectFinalized({ region: process.env.FUNCTIONS_REGION || 'us-central1', bucket: DEFAULT_BUCKET, timeoutSeconds: 120, memory: '1GiB' },
   async (event) => {
     try {
       const object = event.data || {};
       const contentType = object.contentType || '';
-      if (!contentType.startsWith('image/')) return null;
       const filePath = object.name || '';
-      if (!filePath || filePath.includes('/thumbnails/')) return null;
-      // If you want to restrict which folders get thumbnails, uncomment the next line
-      // if (!IMAGE_PREFIXES.some(p => filePath.startsWith(p))) return null;
+      const metadata = object.metadata || {};
+      if (!filePath) return null;
+      // Skip non-images
+      if (!contentType.startsWith('image/')) return null;
+      // Skip thumbnails or generated assets to avoid loops
+      if (filePath.startsWith(THUMB_PREFIX) || metadata.generated === 'true' || filePath.includes('/thumbnails/')) return null;
 
       const bucket = admin.storage().bucket(object.bucket);
-      const fileName = path.basename(filePath);
-      const destPath = `${THUMB_PREFIX}medium-${fileName}.jpg`;
+      const tmpIn = path.join(os.tmpdir(), path.basename(filePath));
+      const base = path.basename(filePath).replace(/\.[^./]+$/, '');
+      const outName = `${THUMB_MEDIUM_PREFIX}medium-${base}.jpg`;
+      const tmpOut = path.join(os.tmpdir(), `medium-${base}.jpg`);
 
-      // Idempotency: if exists, skip
-      const [exists] = await bucket.file(destPath).exists();
-      if (exists) return null;
+      // Download original
+      await bucket.file(filePath).download({ destination: tmpIn });
 
-      const tmpSrc = path.join(os.tmpdir(), `src-${Date.now()}-${fileName}`);
-      const tmpDst = path.join(os.tmpdir(), `dst-${Date.now()}-${fileName}.jpg`);
+      // Transform with sharp
+      await sharp(tmpIn)
+        .rotate() // auto-orient using EXIF
+        .resize({ width: THUMB_MAX_DIM, height: THUMB_MAX_DIM, fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: THUMB_QUALITY, progressive: true, mozjpeg: true })
+        .toFile(tmpOut);
 
-      await bucket.file(filePath).download({ destination: tmpSrc });
-
-      // Lazy import sharp to avoid cold start overhead in unrelated functions
-      const sharp = (await import('sharp')).default;
-      await sharp(tmpSrc)
-        .rotate()
-        .resize({ width: 1280, withoutEnlargement: true })
-        .jpeg({ quality: 80 })
-        .toFile(tmpDst);
-
-      await bucket.upload(tmpDst, {
-        destination: destPath,
+      // Upload thumbnail with cache headers and marker metadata
+      await bucket.upload(tmpOut, {
+        destination: outName,
         metadata: {
           contentType: 'image/jpeg',
-          cacheControl: 'public, max-age=31536000, s-maxage=31536000',
+          cacheControl: 'public, max-age=31536000, s-maxage=31536000, immutable',
+          metadata: { generated: 'true', source: filePath },
         },
       });
 
-      try { fs.unlinkSync(tmpSrc); } catch (_) {}
-      try { fs.unlinkSync(tmpDst); } catch (_) {}
+      // Cleanup temp files
+      try { fs.unlinkSync(tmpIn); } catch (_) {}
+      try { fs.unlinkSync(tmpOut); } catch (_) {}
       return null;
     } catch (e) {
       console.error('onImageFinalize error', e);
@@ -3643,15 +3645,16 @@ export const onImageFinalize = onObjectFinalized({ region: REGION, bucket: DEFAU
 );
 
 /**
- * Scheduled: Prune thumbnails older than 30 days (limits to ~400 deletions/run)
+ * Scheduled: Prune old files by prefix with per-prefix TTLs (cap ~400 deletions/run)
  */
-export const pruneOldImages = onSchedule({ region: REGION, schedule: 'every 24 hours', timeZone: 'Etc/UTC' }, async (event) => {
+exports.pruneOldImages = onSchedule({ region: process.env.FUNCTIONS_REGION || 'us-central1', schedule: 'every 24 hours', timeZone: 'Etc/UTC' }, async () => {
   const bucket = admin.storage().bucket();
   let totalDeleted = 0;
   try {
     for (const cfg of PREFIX_TTLS) {
       const prefix = cfg.prefix;
-      const cutoff = Date.now() - (cfg.days * 24 * 60 * 60 * 1000);
+      const days = Math.max(1, Math.min(365, Number(cfg.days)));
+      const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
       const [files] = await bucket.getFiles({ prefix });
       let deleted = 0;
       for (const f of files) {
@@ -3671,8 +3674,7 @@ export const pruneOldImages = onSchedule({ region: REGION, schedule: 'every 24 h
     console.log(`pruneOldImages: totalDeleted=${totalDeleted}`);
     return null;
   } catch (e) {
-    console.warn('pruneOldImages error', e);
+    console.error('pruneOldImages error', e);
     return null;
   }
 });
-
