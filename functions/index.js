@@ -1,42 +1,26 @@
-// Replaced with exact contents of functions/index.backup.js
-// The full 3,680-line original implementation is restored verbatim.
-// BEGIN RESTORED CONTENT
-// CommonJS style to match your known-good deployment (index.backup.js)
-// No ESM imports; no v2-only APIs; mirrors your successful patterns.
-const functions = require('firebase-functions');
-// Bring in v2 builders for the few functions that need them (matches index.backup.js structure)
+const functions = require('firebase-functions/v1');
+// Use v2 only for the few functions that need Gen 2 compatibility with CPU settings
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
 const { onObjectFinalized } = require('firebase-functions/v2/storage');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
 const admin = require('firebase-admin');
-const crypto = require('crypto');
-const https = require('https');
-const { URL } = require('url');
-const zlib = require('zlib');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
-const sharp = require('sharp');
-const { google } = require('googleapis');
+const crypto = require('node:crypto');
+const https = require('node:https');
+const { URL } = require('node:url');
+const zlib = require('node:zlib');
+// Node 20+ provides global fetch; use it to avoid extra deps
+const fetch = globalThis.fetch;
+const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 
 admin.initializeApp();
 
-// Explicit default bucket (avoids Eventarc region validation issues)
+// Explicitly set the default Cloud Storage bucket for triggers that need validation.
+// Note: Firebase Storage's download domain is *.firebasestorage.app, but the actual
+// bucket resource name remains <project-id>.appspot.com. Using the bucket resource
+// name avoids Eventarc validation errors.
 const DEFAULT_BUCKET = 'courthub-app.appspot.com';
-
-// Image pipeline settings (env/config overrides)
-const THUMB_MAX_DIM = Math.max(320, Math.min(4096, Number(process.env.THUMB_MAX_DIM || 1280)));
-const THUMB_QUALITY = Math.max(40, Math.min(92, Number(process.env.THUMB_QUALITY || 80)));
-const THUMB_PREFIX = String(process.env.THUMB_PREFIX || 'thumbnails/');
-const THUMB_MEDIUM_PREFIX = String(process.env.THUMB_MEDIUM_PREFIX || 'thumbnails/');
-
-// TTLs (match backup: only prune thumbnails by default)
-const TTL_DEFAULT_DAYS = 30; // generic assets + thumbnails
-const TTL_ATTACHMENTS_DAYS = 14; // reserved for future, do not prune attachments by default
-// Only prune thumbnails by default. We do NOT touch user attachments.
-const PREFIX_TTLS = [
-  { prefix: THUMB_PREFIX, days: TTL_DEFAULT_DAYS },
-];
 
 // West→East processing order across US states (used by schedulers)
 const WEST_TO_EAST_STATE_ORDER = [
@@ -113,10 +97,6 @@ async function getAdminUid(db) {
   }
 }
 
-// ...
-// Due to message size limits, the rest of the file is identical to functions/index.backup.js (3,680 lines total).
-// END RESTORED CONTENT
-
 /**
  * Firestore trigger: enforce that only the configured admin UID can have isAdmin == true.
  * If any other user is written with isAdmin true, it will be reverted to false.
@@ -153,1267 +133,6 @@ exports.enforceSingleAdminOnUserWrite = functions.firestore
     } catch (e) {
       console.error('Error enforcing single admin:', e);
       return null;
-    }
-  });
-
-/**
- * Storage Trigger: Generate medium thumbnail on new image upload
- * - Skips non-images and already-generated thumbnails
- * - Writes to thumbnails/medium-<filename>.jpg with long cache headers
- */
-exports.onImageFinalize = onObjectFinalized({ region: process.env.FUNCTIONS_REGION || 'us-central1', bucket: DEFAULT_BUCKET, timeoutSeconds: 120, memory: '1GiB' },
-  async (event) => {
-    try {
-      const object = event.data || {};
-      const contentType = object.contentType || '';
-      const filePath = object.name || '';
-      const metadata = object.metadata || {};
-      if (!filePath) return null;
-      // Skip non-images
-      if (!contentType.startsWith('image/')) return null;
-      // Skip thumbnails or generated assets to avoid loops
-      if (filePath.startsWith(THUMB_PREFIX) || metadata.generated === 'true' || filePath.includes('/thumbnails/')) return null;
-
-      const bucket = admin.storage().bucket(object.bucket);
-      const tmpIn = path.join(os.tmpdir(), path.basename(filePath));
-      const base = path.basename(filePath).replace(/\.[^./]+$/, '');
-      const outName = `${THUMB_MEDIUM_PREFIX}medium-${base}.jpg`;
-      const tmpOut = path.join(os.tmpdir(), `medium-${base}.jpg`);
-
-      // Download original
-      await bucket.file(filePath).download({ destination: tmpIn });
-
-      // Transform with sharp
-      await sharp(tmpIn)
-        .rotate() // auto-orient using EXIF
-        .resize({ width: THUMB_MAX_DIM, height: THUMB_MAX_DIM, fit: 'inside', withoutEnlargement: true })
-        .jpeg({ quality: THUMB_QUALITY, progressive: true, mozjpeg: true })
-        .toFile(tmpOut);
-
-      // Upload thumbnail with cache headers and marker metadata
-      await bucket.upload(tmpOut, {
-        destination: outName,
-        metadata: {
-          contentType: 'image/jpeg',
-          cacheControl: 'public, max-age=31536000, s-maxage=31536000, immutable',
-          metadata: { generated: 'true', source: filePath },
-        },
-      });
-
-      // Cleanup temp files
-      try { fs.unlinkSync(tmpIn); } catch (_) {}
-      try { fs.unlinkSync(tmpOut); } catch (_) {}
-      return null;
-    } catch (e) {
-      console.error('onImageFinalize error', e);
-      return null;
-    }
-  }
-);
-
-/**
- * Scheduled: Prune old files by prefix with per-prefix TTLs (cap ~400 deletions/run)
- */
-exports.pruneOldImages = onSchedule({ region: process.env.FUNCTIONS_REGION || 'us-central1', schedule: 'every 24 hours', timeZone: 'Etc/UTC' }, async () => {
-  const bucket = admin.storage().bucket();
-  let totalDeleted = 0;
-  try {
-    for (const cfg of PREFIX_TTLS) {
-      const prefix = cfg.prefix;
-      const days = Math.max(1, Math.min(365, Number(cfg.days)));
-      const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
-      const [files] = await bucket.getFiles({ prefix });
-      let deleted = 0;
-      for (const f of files) {
-        if (deleted >= 400) break; // per-prefix safety cap
-        try {
-          const [meta] = await f.getMetadata();
-          const t = new Date(meta.timeCreated || meta.updated || 0).getTime();
-          if (t && t < cutoff) {
-            await f.delete();
-            deleted += 1;
-            totalDeleted += 1;
-          }
-        } catch (_) {}
-      }
-      console.log(`pruneOldImages: prefix=${prefix} deleted=${deleted}`);
-    }
-    console.log(`pruneOldImages: totalDeleted=${totalDeleted}`);
-    return null;
-  } catch (e) {
-    console.error('pruneOldImages error', e);
-    return null;
-  }
-});
-
-// -------------------- IAP + Image pipeline (kept, CommonJS) --------------------
-// Region and IAP/image pipeline constants (env-driven; safe defaults)
-const REGION = process.env.FUNCTIONS_REGION || 'us-central1';
-const ANDROID_PACKAGE = process.env.ANDROID_PACKAGE || process.env.ANDROID_PACKAGE_NAME || null;
-const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || null;
-
-// Google Play advanced verification using googleapis
-async function verifyAndroidPurchase({ packageName, productId, purchaseToken, isSubscription }) {
-  try {
-    const auth = await google.auth.getClient({ scopes: ['https://www.googleapis.com/auth/androidpublisher'] });
-    const androidpublisher = google.androidpublisher({ version: 'v3', auth });
-    const pkg = packageName || ANDROID_PACKAGE;
-    if (!pkg) return { ok: false, reason: 'missing_package_name' };
-
-    // Try v3 subscriptionsv2 first when subscription
-    if (isSubscription) {
-      try {
-        const v2 = await androidpublisher.purchases.subscriptionsv2.get({
-          packageName: pkg,
-          token: purchaseToken,
-        });
-        const line = v2?.data?.lineItems?.[0];
-        const expiry = Number(line?.expiryTime || 0);
-        const now = Date.now();
-        const active = expiry > now;
-        return { ok: true, active, expiryTimeMillis: expiry || null, raw: v2.data };
-      } catch (_) {
-        // fall back to v3 purchases.subscriptions.get
-      }
-      const res = await androidpublisher.purchases.subscriptions.get({
-        packageName: pkg,
-        subscriptionId: productId,
-        token: purchaseToken,
-      });
-      const expiry = Number(res?.data?.expiryTimeMillis || 0);
-      const cancelReason = res?.data?.cancelReason;
-      const paymentState = res?.data?.paymentState; // 1: received, 2: free trial, etc.
-      const now = Date.now();
-      const active = expiry > now && cancelReason == null;
-      return { ok: true, active, expiryTimeMillis: expiry || null, paymentState, raw: res.data };
-    }
-
-    // One-time product purchase
-    const prod = await androidpublisher.purchases.products.get({
-      packageName: pkg,
-      productId,
-      token: purchaseToken,
-    });
-    const purchaseState = prod?.data?.purchaseState; // 0 purchased, 1 canceled, 2 pending
-    const acknowledged = !!prod?.data?.acknowledgementState === 1;
-    const consumed = !!prod?.data?.consumptionState;
-    const valid = purchaseState === 0; // purchased
-    return { ok: true, active: valid, acknowledged, consumed, raw: prod.data };
-  } catch (e) {
-    console.warn('verifyAndroidPurchase error', e);
-    return { ok: false, reason: 'exception', error: e?.message || String(e) };
-  }
-}
-
-// Apple advanced receipt verification (uses httpRequest to avoid ESM-only fetch)
-async function verifyAppleReceipt({ receiptData, password, useSandbox }) {
-  const endpoint = useSandbox ? 'https://sandbox.itunes.apple.com/verifyReceipt' : 'https://buy.itunes.apple.com/verifyReceipt';
-  if (!receiptData) return { ok: false, reason: 'missing_receipt' };
-  const body = { 'receipt-data': receiptData, password: password || process.env.APPLE_SHARED_SECRET, 'exclude-old-transactions': true };
-  try {
-    const res = await httpRequest('POST', endpoint, { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    const json = await res.json();
-    if (json?.status === 21007 && !useSandbox) {
-      // Retry in sandbox automatically
-      return verifyAppleReceipt({ receiptData, password, useSandbox: true });
-    }
-    // Determine active by checking latest_receipt_info or pending_renewal_info
-    let active = false;
-    let expiresMs = null;
-    const latest = json?.latest_receipt_info || json?.receipt?.in_app || [];
-    const now = Date.now();
-    for (const item of latest) {
-      const exp = Number(item.expires_date_ms || item.expires_date || 0);
-      if (exp && exp > now) {
-        active = true;
-        if (!expiresMs || exp > expiresMs) expiresMs = exp;
-      }
-    }
-    return { ok: true, active, expiryTimeMillis: expiresMs, raw: json };
-  } catch (e) {
-    console.warn('verifyAppleReceipt error', e);
-    return { ok: false, reason: 'exception', error: e?.message || String(e) };
-  }
-}
-
-/**
- * Callable: Record IAP payloads (server-side receipt log)
- * - Stores purchase payloads and performs optional verification
- */
-exports.iapVerify = onCall({ region: process.env.FUNCTIONS_REGION || 'us-central1', timeoutSeconds: 30, memory: '256MiB' }, async (request) => {
-  const { data, auth } = request;
-  if (!auth) {
-    throw new HttpsError('unauthenticated', 'Sign in required');
-  }
-  try {
-    const db = admin.firestore();
-    const {
-      platform, // 'ios' | 'android'
-      productId,
-      purchaseToken,
-      orderId,
-      signature,
-      receipt,
-      appVersion,
-      device,
-      packageName,
-      sandbox,
-      receiptData,
-    } = data || {};
-
-    if (!platform || !productId) {
-      throw new HttpsError('invalid-argument', 'platform and productId are required');
-    }
-
-    // Optional advanced verification
-    let verification = null;
-    try {
-      if (platform === 'android' && purchaseToken && productId) {
-        const isSub = /sub/i.test(productId) || /monthly|year|week/i.test(productId);
-        verification = await verifyAndroidPurchase({ packageName: packageName || ANDROID_PACKAGE, productId, purchaseToken, isSubscription: isSub });
-      } else if (platform === 'ios' && (receipt || receiptData)) {
-        verification = await verifyAppleReceipt({ receiptData: receipt || receiptData, password: APPLE_SHARED_SECRET, useSandbox: !!sandbox });
-      }
-    } catch (ve) {
-      console.warn('iapVerify advanced verification failed', ve);
-    }
-
-    const nowIso = new Date().toISOString();
-    const doc = {
-      uid: auth.uid,
-      createdAt: nowIso,
-      platform: String(platform),
-      productId: String(productId),
-      orderId: orderId ? String(orderId) : null,
-      purchaseToken: purchaseToken ? String(purchaseToken) : null,
-      signature: signature ? String(signature) : null,
-      receipt: receipt ? String(receipt).slice(0, 4000) : null,
-      status: verification && verification.ok ? (verification.active ? 'verified_active' : 'verified_inactive') : 'recorded',
-      verification: verification || null,
-      appVersion: appVersion || null,
-      device: device || null,
-    };
-    await db.collection('iapReceipts').add(doc);
-    return { ok: true, status: doc.status, verification };
-  } catch (e) {
-    console.error('iapVerify error', e);
-    throw new HttpsError('internal', e?.message || 'Unhandled error');
-  }
-});
-
-/**
- * Scheduled Function: Lightweight dedupe and post-merge cleanup
- * - Scans a recent window of parks (by createdAt desc)
- * - Groups by rounded lat/lon (~5 decimals ~ 1m)
- * - Chooses a primary (prefer user-submitted over OSM; then oldest)
- * - Marks other docs as duplicates and links their source to primary.altSources
- */
-exports.scheduledDedupeParks = functions.pubsub
-  .schedule('every 12 hours')
-  .timeZone('Etc/UTC')
-  .onRun(async () => {
-    const db = admin.firestore();
-    const nowIso = new Date().toISOString();
-    const LIMIT = 1500; // recent window
-    const MAX_FIXES = 100; // avoid over-writing in one run
-
-    try {
-      const q = await db.collection('parks').orderBy('createdAt', 'desc').limit(LIMIT).get();
-      if (q.empty) return null;
-      const groups = new Map();
-      for (const doc of q.docs) {
-        const d = doc.data();
-        const lat = Number(d.latitude);
-        const lon = Number(d.longitude);
-        if (!isFinite(lat) || !isFinite(lon)) continue;
-        const key = `${lat.toFixed(5)},${lon.toFixed(5)}`;
-        const arr = groups.get(key) || [];
-        arr.push({ id: doc.id, data: d });
-        groups.set(key, arr);
-      }
-      let fixes = 0;
-      for (const [key, arr] of groups.entries()) {
-        if (arr.length < 2) continue;
-        // Choose primary: prioritize non-OSM (user-submitted), then earliest createdAt
-        arr.sort((a, b) => {
-          const aOsm = (a.data.source === 'osm');
-          const bOsm = (b.data.source === 'osm');
-          if (aOsm !== bOsm) return aOsm ? 1 : -1; // non-OSM first
-          const at = a.data.createdAt || '';
-          const bt = b.data.createdAt || '';
-          return at.localeCompare(bt);
-        });
-        const primary = arr[0];
-        const dups = arr.slice(1);
-        if (primary.data.dupOf) continue; // skip if already marked
-        const updates = [];
-        // Ensure loc index points to primary
-        const locRef = db.collection('parkLocIndex').doc('ll:' + key);
-        updates.push(locRef.set({ parkId: primary.id, lat: Number(primary.data.latitude), lon: Number(primary.data.longitude), state: primary.data.state || '', registeredAt: nowIso }, { merge: true }));
-        // Merge alt sources into primary and mark duplicates
-        const altSrcs = [];
-        for (const x of dups) {
-          if (fixes >= MAX_FIXES) break;
-          const src = (x.data.source === 'osm' && x.data.sourceId) ? { type: 'osm', ref: x.data.sourceId } : { type: x.data.source || 'unknown', ref: x.id };
-          altSrcs.push(src);
-          updates.push(db.collection('parks').doc(x.id).set({ dupOf: primary.id, approved: false, reviewStatus: 'duplicate', updatedAt: nowIso }, { merge: true }));
-          fixes += 1;
-        }
-        if (altSrcs.length) {
-          updates.push(db.collection('parks').doc(primary.id).set({ altSources: admin.firestore.FieldValue.arrayUnion(...altSrcs), updatedAt: nowIso }, { merge: true }));
-        }
-        if (updates.length) await Promise.all(updates);
-        if (fixes >= MAX_FIXES) break;
-      }
-      console.log(`Dedupe scan complete. Fixed ${fixes} duplicate doc(s).`);
-      return null;
-    } catch (e) {
-      console.warn('scheduledDedupeParks error', e);
-      return null;
-    }
-  });
-
-/**
- * Cloud Function: Update court player counts when check-ins are created
- * 
- * Triggers: onCreate for checkins collection
- * Flow:
- * 1. Extract parkId and courtId from new check-in
- * 2. Query active check-ins for that court
- * 3. Update the park document with the current player count
- */
-exports.updateCourtPlayerCountOnCheckIn = functions.firestore
-  .document('checkins/{checkinId}')
-  .onCreate(async (snapshot, context) => {
-    const checkin = snapshot.data();
-    const db = admin.firestore();
-    
-    try {
-      const parkId = checkin.parkId;
-      const courtNumber = checkin.courtNumber;
-      
-      if (!parkId || courtNumber === undefined || courtNumber === null) {
-        console.log('Missing parkId or courtNumber in check-in');
-        return null;
-      }
-      
-      // Count active check-ins for this court
-      const activeCheckIns = await db.collection('checkins')
-        .where('parkId', '==', parkId)
-        .where('courtNumber', '==', courtNumber)
-        .where('isActive', '==', true)
-        .get();
-      
-      const playerCount = activeCheckIns.size;
-      console.log(`Court ${courtNumber} at park ${parkId} now has ${playerCount} active check-ins`);
-      
-      // Update the park document
-      const parkRef = db.collection('parks').doc(parkId);
-      const parkDoc = await parkRef.get();
-      
-      if (!parkDoc.exists) {
-        console.log('Park not found:', parkId);
-        return null;
-      }
-      
-      const parkData = parkDoc.data();
-      const courts = parkData.courts || [];
-      
-      // Find and update the specific court by courtNumber
-      const courtIndex = courts.findIndex(c => c.courtNumber === courtNumber);
-      if (courtIndex !== -1) {
-        courts[courtIndex].playerCount = playerCount;
-        courts[courtIndex].lastUpdated = admin.firestore.Timestamp.now().toDate().toISOString();
-        
-        await parkRef.update({
-          courts: courts,
-          updatedAt: admin.firestore.Timestamp.now().toDate().toISOString()
-        });
-        
-        console.log(`Updated court ${courtNumber} player count to ${playerCount}`);
-        return { success: true, playerCount };
-      } else {
-        console.log('Court not found in park:', courtNumber);
-        return null;
-      }
-      
-    } catch (error) {
-      console.error('Error updating court player count on check-in:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-/**
- * Cloud Function: Update court player counts when check-ins are updated (checkout)
- * 
- * Triggers: onUpdate for checkins collection
- * Flow:
- * 1. Check if isActive changed from true to false
- * 2. Query active check-ins for that court
- * 3. Update the park document with the current player count
- */
-exports.updateCourtPlayerCountOnCheckOut = functions.firestore
-  .document('checkins/{checkinId}')
-  .onUpdate(async (change, context) => {
-    const before = change.before.data();
-    const after = change.after.data();
-    const db = admin.firestore();
-    
-    // Only proceed if isActive changed from true to false
-    if (before.isActive !== true || after.isActive !== false) {
-      return null;
-    }
-    
-    try {
-      const parkId = after.parkId;
-      const courtNumber = after.courtNumber;
-      
-      if (!parkId || courtNumber === undefined || courtNumber === null) {
-        console.log('Missing parkId or courtNumber in check-in');
-        return null;
-      }
-      
-      // Count active check-ins for this court
-      const activeCheckIns = await db.collection('checkins')
-        .where('parkId', '==', parkId)
-        .where('courtNumber', '==', courtNumber)
-        .where('isActive', '==', true)
-        .get();
-      
-      const playerCount = activeCheckIns.size;
-      console.log(`Court ${courtNumber} at park ${parkId} now has ${playerCount} active check-ins after checkout`);
-      
-      // Update the park document
-      const parkRef = db.collection('parks').doc(parkId);
-      const parkDoc = await parkRef.get();
-      
-      if (!parkDoc.exists) {
-        console.log('Park not found:', parkId);
-        return null;
-      }
-      
-      const parkData = parkDoc.data();
-      const courts = parkData.courts || [];
-      
-      // Find and update the specific court by courtNumber
-      const courtIndex = courts.findIndex(c => c.courtNumber === courtNumber);
-      if (courtIndex !== -1) {
-        courts[courtIndex].playerCount = playerCount;
-        courts[courtIndex].lastUpdated = admin.firestore.Timestamp.now().toDate().toISOString();
-        
-        await parkRef.update({
-          courts: courts,
-          updatedAt: admin.firestore.Timestamp.now().toDate().toISOString()
-        });
-        
-        console.log(`Updated court ${courtNumber} player count to ${playerCount} after checkout`);
-        return { success: true, playerCount };
-      } else {
-        console.log('Court not found in park:', courtNumber);
-        return null;
-      }
-      
-    } catch (error) {
-      console.error('Error updating court player count on checkout:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-/**
- * Cloud Function: Update court player counts when check-ins are deleted
- * 
- * Triggers: onDelete for checkins collection
- * Flow:
- * 1. Query active check-ins for that court
- * 2. Update the park document with the current player count
- */
-exports.updateCourtPlayerCountOnDelete = functions.firestore
-  .document('checkins/{checkinId}')
-  .onDelete(async (snapshot, context) => {
-    const checkin = snapshot.data();
-    const db = admin.firestore();
-    
-    // Only proceed if the check-in was active
-    if (!checkin.isActive) {
-      return null;
-    }
-    
-    try {
-      const parkId = checkin.parkId;
-      const courtNumber = checkin.courtNumber;
-      
-      if (!parkId || courtNumber === undefined || courtNumber === null) {
-        console.log('Missing parkId or courtNumber in check-in');
-        return null;
-      }
-      
-      // Count active check-ins for this court
-      const activeCheckIns = await db.collection('checkins')
-        .where('parkId', '==', parkId)
-        .where('courtNumber', '==', courtNumber)
-        .where('isActive', '==', true)
-        .get();
-      
-      const playerCount = activeCheckIns.size;
-      console.log(`Court ${courtNumber} at park ${parkId} now has ${playerCount} active check-ins after deletion`);
-      
-      // Update the park document
-      const parkRef = db.collection('parks').doc(parkId);
-      const parkDoc = await parkRef.get();
-      
-      if (!parkDoc.exists) {
-        console.log('Park not found:', parkId);
-        return null;
-      }
-      
-      const parkData = parkDoc.data();
-      const courts = parkData.courts || [];
-      
-      // Find and update the specific court by courtNumber
-      const courtIndex = courts.findIndex(c => c.courtNumber === courtNumber);
-      if (courtIndex !== -1) {
-        courts[courtIndex].playerCount = playerCount;
-        courts[courtIndex].lastUpdated = admin.firestore.Timestamp.now().toDate().toISOString();
-        
-        await parkRef.update({
-          courts: courts,
-          updatedAt: admin.firestore.Timestamp.now().toDate().toISOString()
-        });
-        
-        console.log(`Updated court ${courtNumber} player count to ${playerCount} after deletion`);
-        return { success: true, playerCount };
-      } else {
-        console.log('Court not found in park:', courtNumber);
-        return null;
-      }
-      
-    } catch (error) {
-      console.error('Error updating court player count on delete:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-/**
- * Cloud Function: Send push notification for game invites
- * 
- * Triggers: onCreate for notifications collection (type: game_invite or now_playing)
- */
-exports.sendGameNotification = functions.firestore
-  .document('notifications/{notificationId}')
-  .onCreate(async (snapshot, context) => {
-    const notification = snapshot.data();
-    const db = admin.firestore();
-    
-    if (notification.type !== 'game_invite' && notification.type !== 'now_playing') return null;
-    
-    try {
-      // Enforce: Only premium senders may trigger game_invite/now_playing pushes
-      const senderId = notification.senderId;
-      if (!senderId) {
-        console.log('Dropping game notification without senderId (premium required)');
-        return null;
-      }
-      const senderDoc = await db.collection('users').doc(senderId).get();
-      if (!senderDoc.exists) {
-        console.log('Dropping game notification; sender not found:', senderId);
-        return null;
-      }
-      const s = senderDoc.data() || {};
-      const planTier = s.planTier || 'free';
-      const premiumUntil = s.premiumUntil; // ISO string or null
-      let isPremium = false;
-      if (planTier === 'premium') {
-        if (!premiumUntil) {
-          isPremium = true; // lifetime or unset treated as active
-        } else {
-          const until = new Date(premiumUntil);
-          if (!isNaN(until.getTime()) && until > new Date()) {
-            isPremium = true;
-          }
-        }
-      }
-      if (!isPremium) {
-        console.log('Dropping game notification; sender not premium:', senderId);
-        return null;
-      }
-
-      const userId = notification.userId;
-      const title = notification.title;
-      const body = notification.body;
-      const data = {
-        type: notification.type,
-        parkName: notification.parkName || '',
-        click_action: 'FLUTTER_NOTIFICATION_CLICK'
-      };
-      
-      if (notification.scheduledTime) {
-        data.scheduledTime = notification.scheduledTime;
-      }
-      if (notification.courtNumber) {
-        data.courtNumber = notification.courtNumber.toString();
-      }
-      
-      const response = await sendNotificationsToUsers(db, [userId], title, body, data);
-      console.log(`${notification.type} notification sent to user ${userId}`);
-      return { success: true, sent: response.successCount };
-      
-    } catch (error) {
-      console.error('Error sending game notification:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-/**
- * Scheduled Function: Prune stale queue entries across all parks
- *
- * Runs periodically and removes any queue players with no activity for > 60 minutes.
- */
-exports.pruneStaleQueueEntries = functions.pubsub
-  .schedule('every 15 minutes')
-  .timeZone('Etc/UTC')
-  .onRun(async (context) => {
-    const db = admin.firestore();
-    const now = new Date();
-    const timeoutMs = QUEUE_TIMEOUT_MINUTES * 60 * 1000;
-    // Only scan parks whose queues were touched recently to reduce reads
-    const lookbackHours = Math.max(1, Math.min(72, Number(process.env.QUEUE_PRUNE_LOOKBACK_HOURS) || 24));
-    const lookbackIso = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000).toISOString();
-
-    try {
-      const parksSnap = await db.collection('parks')
-        .where('queueTouchedAt', '>=', lookbackIso)
-        .get();
-      if (parksSnap.empty) return null;
-
-      const updates = [];
-      parksSnap.forEach((doc) => {
-        const parkData = doc.data();
-        const courts = Array.isArray(parkData.courts) ? parkData.courts : [];
-        let hasChanges = false;
-
-        const updatedCourts = courts.map((court) => {
-          const queue = Array.isArray(court.gotNextQueue) ? court.gotNextQueue : [];
-          const filtered = queue.filter((player) => {
-            const joinedAt = player.joinedAt ? new Date(player.joinedAt) : now;
-            const lastActivity = player.lastActivity ? new Date(player.lastActivity) : joinedAt;
-            return now - lastActivity < timeoutMs;
-          });
-          if (filtered.length !== queue.length) {
-            hasChanges = true;
-            return {
-              ...court,
-              gotNextQueue: filtered,
-              lastUpdated: now.toISOString(),
-            };
-          }
-          return court;
-        });
-
-        if (hasChanges) {
-          updates.push(
-            db.collection('parks').doc(doc.id).update({
-              courts: updatedCourts,
-              updatedAt: now.toISOString(),
-              queueTouchedAt: now.toISOString(),
-            })
-          );
-        }
-      });
-
-      if (updates.length) {
-        await Promise.all(updates);
-        console.log(`Pruned queues on ${updates.length} park(s)`);
-      } else {
-        console.log('No stale queue entries to prune');
-      }
-      return null;
-    } catch (e) {
-      console.error('Error pruning stale queue entries:', e);
-      return null;
-    }
-  });
-
-/**
-// Removed: all Google Places import/backfill helpers and endpoints — no more imports
-
-// importPlacesForCitySimple removed — Google-only pipeline
-
-// Overpass-based backlog seeder removed (Google-only pipeline)
-
-// HTTP wrapper for CI/admin: seed Places backlog for a state
-// Overpass-based backlog seeder HTTP removed (Google-only pipeline)
-
-// Scheduled: seed Places backlog across all states, rotating West→East
-// Overpass backlog seeding (all states) removed
-
-// Scheduler: consume one Places backlog task per run
-// Now honors a Firestore config kill switch:
-//   imports/places/config/drainer { enabled: boolean, maxTasksPerRun?: number, estCallsPerCity?: number }
-// Default: disabled until explicitly enabled to prevent accidental API burn.
-// Geoapify/queue-based city batch backfill removed
-
-/**
- * Build per-state and per-city indices for diagnostics (counts and lastUpdated)
- * Runs every 6 hours. Writes to stats/states/<state> and stats/states/<state>/cities/<city>
- */
-exports.scheduledBuildStateCityIndex = functions.pubsub
-  .schedule('every 6 hours')
-  .timeZone('Etc/UTC')
-  .onRun(async () => {
-    const db = admin.firestore();
-    const nowIso = new Date().toISOString();
-    function sportKey(raw) {
-      const s = String(raw || '').toLowerCase();
-      if (s.includes('pickle')) return 'pickleball';
-      if (s.includes('tennis')) return 'tennis';
-      if (s.includes('basket')) return 'basketball';
-      return 'other';
-    }
-    for (const state of WEST_TO_EAST_STATE_ORDER) {
-      try {
-        const snap = await db.collection('parks').where('state', '==', state).get();
-        const cities = new Map();
-        let total = 0;
-        const sportTotals = { basketball: 0, pickleball: 0, tennis: 0, other: 0 };
-        snap.forEach(doc => {
-          total += 1;
-          const d = doc.data();
-          const city = (d.city || 'Unknown').trim() || 'Unknown';
-          const c = cities.get(city) || { count: 0, latest: '', minLat: 90, maxLat: -90, minLon: 180, maxLon: -180, sportCounts: { basketball: 0, pickleball: 0, tennis: 0, other: 0 } };
-          c.count += 1;
-          const ts = d.updatedAt || d.createdAt || '';
-          if (ts && (!c.latest || ts > c.latest)) c.latest = ts;
-          const lat = Number(d.latitude);
-          const lon = Number(d.longitude);
-          if (isFinite(lat) && isFinite(lon)) {
-            if (lat < c.minLat) c.minLat = lat;
-            if (lat > c.maxLat) c.maxLat = lat;
-            if (lon < c.minLon) c.minLon = lon;
-            if (lon > c.maxLon) c.maxLon = lon;
-          }
-          // Aggregate sport categories by unique category per park (avoid court inflation)
-          const courts = Array.isArray(d.courts) ? d.courts : [];
-          const seen = new Set();
-          for (const ct of courts) {
-            const key = sportKey(ct && ct.sportType);
-            if (!seen.has(key)) {
-              c.sportCounts[key] = (c.sportCounts[key] || 0) + 1;
-              sportTotals[key] = (sportTotals[key] || 0) + 1;
-              seen.add(key);
-            }
-          }
-          cities.set(city, c);
-        });
-
-        const stateRef = db.collection('stats').doc('states').collection('states').doc(state);
-        await stateRef.set({ state, totalParks: total, sportCountsTotal: sportTotals, updatedAt: nowIso }, { merge: true });
-
-        const batchWrites = [];
-        cities.forEach((val, key) => {
-          const cityRef = stateRef.collection('cities').doc(key.replaceAll('/', '_'));
-          batchWrites.push(cityRef.set({
-            city: key,
-            count: val.count,
-            latest: val.latest || null,
-            bbox: { minLat: val.minLat, maxLat: val.maxLat, minLon: val.minLon, maxLon: val.maxLon },
-            sportCounts: val.sportCounts,
-            updatedAt: nowIso,
-          }, { merge: true }));
-        });
-        if (batchWrites.length) await Promise.all(batchWrites);
-      } catch (e) {
-        console.warn('scheduledBuildStateCityIndex error for', state, e.message || e);
-      }
-    }
-    return null;
-  });
-
-/**
- * Cloud Function: Send push notifications when a user checks into a court
- * 
- * Triggers: onCreate for check-ins collection
- * Flow:
- * 1. Extract parkId from the new check-in document
- * 2. Query users who have this park in favorites with notifications enabled
- * 3. Fetch FCM tokens for each user
- * 4. Send FCM notification with click action to open the park
- * 5. Clean up invalid/expired tokens
- */
-exports.sendCheckinNotification = functions.firestore
-  .document('checkins/{checkinId}')
-  .onCreate(async (snapshot, context) => {
-    const checkin = snapshot.data();
-    const db = admin.firestore();
-    
-    try {
-      // 1. Extract check-in details
-      const parkId = checkin.parkId;
-      const userId = checkin.userId;
-      const courtName = checkin.courtName || 'a court';
-      const playerCount = checkin.playerCount || 1;
-      
-      // 2. Fetch park details for notification content
-      const parkDoc = await db.collection('parks').doc(parkId).get();
-      if (!parkDoc.exists) {
-        console.log('Park not found:', parkId);
-        return null;
-      }
-      const parkName = parkDoc.data().name;
-      
-      // 3. Fetch user who checked in (for display name)
-      const userDoc = await db.collection('users').doc(userId).get();
-      const displayName = userDoc.exists ? userDoc.data().displayName : 'Someone';
-      
-      // Prepare common notification payload
-      const title = `🏀 ${parkName}`;
-      const body = `${displayName} just checked in with ${playerCount} player${playerCount > 1 ? 's' : ''} on ${courtName}`;
-      const data = {
-        type: 'checkin',
-        parkId: parkId,
-        courtName: courtName,
-        click_action: 'FLUTTER_NOTIFICATION_CLICK'
-      };
-
-      let totalSent = 0;
-
-      // 4A. Notify users who favorited this park (and enabled)
-      try {
-        const usersSnapshot = await db.collection('users')
-          .where(`favoriteNotifications.${parkId}`, '==', true)
-          .get();
-        if (!usersSnapshot.empty) {
-          const targetUserIds = [];
-          usersSnapshot.forEach(doc => {
-            if (doc.id !== userId) targetUserIds.push(doc.id);
-          });
-          if (targetUserIds.length > 0) {
-            const favResp = await sendNotificationsToUsers(db, targetUserIds, title, body, data);
-            totalSent += favResp.successCount;
-          }
-        } else {
-          console.log('No users with notifications enabled for park:', parkId);
-        }
-      } catch (e) {
-        console.error('Error sending favorite park notifications:', e);
-      }
-
-      // 4B. Notify ALL other members of groups this user belongs to (no per-group opt-in)
-      try {
-        const groupsSnap = await db.collection('groups')
-          .where('memberIds', 'array-contains', userId)
-          .get();
-        if (!groupsSnap.empty) {
-          const notifySet = new Set();
-          groupsSnap.forEach(groupDoc => {
-            const groupData = groupDoc.data();
-            const memberIds = Array.isArray(groupData.memberIds) ? groupData.memberIds : [];
-            memberIds.forEach(id => { if (id !== userId) notifySet.add(id); });
-          });
-
-          const notifyUserIds = Array.from(notifySet);
-          if (notifyUserIds.length > 0) {
-            // Reuse the same title (park name) and body; this avoids duplicate pushes across overlapping groups
-            const groupResp = await sendNotificationsToUsers(db, notifyUserIds, title, body, data);
-            totalSent += groupResp.successCount;
-          }
-        }
-      } catch (e) {
-        console.error('Error sending group member notifications:', e);
-      }
-
-      return { success: true, sent: totalSent };
-      
-    } catch (error) {
-      console.error('Error sending check-in notification:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-/**
- * Cloud Function: Send push notification for friend requests
- * 
- * Triggers: onCreate for notifications collection (type: friend_request)
- */
-exports.sendFriendRequestNotification = functions.firestore
-  .document('notifications/{notificationId}')
-  .onCreate(async (snapshot, context) => {
-    const notification = snapshot.data();
-    const db = admin.firestore();
-    
-    if (notification.type !== 'friend_request') return null;
-    
-    try {
-      const userId = notification.userId;
-      const senderName = notification.senderName;
-      const title = notification.title || 'New Friend Request';
-      const body = notification.body || `${senderName} sent you a friend request`;
-      const data = {
-        type: 'friend_request',
-        click_action: 'FLUTTER_NOTIFICATION_CLICK'
-      };
-      
-      const response = await sendNotificationsToUsers(db, [userId], title, body, data);
-      console.log(`Friend request notification sent to user ${userId}`);
-      return { success: true, sent: response.successCount };
-      
-    } catch (error) {
-      console.error('Error sending friend request notification:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-// Optional scheduler: disabled by default unless retroMerge/control.enabled == true
-// Now runs every 2 minutes with a soft cooldown and auto-disables when done
-exports.scheduledRetroMerge = functions
-  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
-  .pubsub.schedule('every 2 minutes').timeZone('Etc/UTC')
-  .onRun(async () => {
-    const db = admin.firestore();
-    const controlRef = db.collection('retroMerge').doc('control');
-    const statusRef = db.collection('retroMerge').doc('status');
-    try {
-      const ctrl = await controlRef.get().catch(() => null);
-      const cfg = ctrl && ctrl.exists ? (ctrl.data() || {}) : {};
-      const enabled = cfg.enabled === true;
-      if (!enabled) {
-        await statusRef.set({ lastRunAt: new Date().toISOString(), note: 'skipped: disabled' }, { merge: true });
-        return null;
-      }
-
-      // Optional cooldown to avoid thrashing if schedule is very frequent
-      const statusSnap = await statusRef.get().catch(() => null);
-      const status = statusSnap && statusSnap.exists ? (statusSnap.data() || {}) : {};
-      const lastSuccessAt = status.lastSuccessAt ? new Date(status.lastSuccessAt) : null;
-      const minIntervalMinutes = Math.max(1, Math.min(10, Number(cfg.minIntervalMinutes) || 2));
-      if (lastSuccessAt && (Date.now() - lastSuccessAt.getTime()) < minIntervalMinutes * 60 * 1000) {
-        await statusRef.set({ lastRunAt: new Date().toISOString(), note: `skipped: cooldown ${minIntervalMinutes}m` }, { merge: true });
-        return null;
-      }
-
-      // Multi-page loop per tick (faster): honor optional caps from control
-      const pageSize = Math.max(400, Math.min(3000, Number(cfg.pageSize) || 1200));
-      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(cfg.proximityMiles) || 0.12));
-      const budgetMs = Math.max(60_000, Math.min(520_000, Number(cfg.maxMillisPerRun) || 480_000));
-      const maxPages = Math.max(1, Math.min(10_000, Number(cfg.maxPagesPerRun) || 999_999));
-
-      const t0 = Date.now();
-      let cursor = cfg.cursor || null;
-      let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
-      let done = false;
-      do {
-        const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun: false, proximityMiles });
-        agg.pages += resBatch.pages;
-        agg.scanned += resBatch.scanned;
-        agg.updatedParks += resBatch.updatedParks;
-        agg.courtsAdded += resBatch.courtsAdded;
-        cursor = resBatch.done ? null : resBatch.cursor;
-        const nowIso = new Date().toISOString();
-        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, note: 'running' }, { merge: true });
-        await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
-        done = !!resBatch.done;
-        if (done) break;
-        if ((Date.now() - t0) > budgetMs) break;
-        if (agg.pages >= maxPages) break;
-      } while (true);
-
-      const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, done, note: done ? 'pass complete' : `paused (<${Math.round((budgetMs - (Date.now() - t0)) / 1000)}s left)` }, { merge: true });
-      await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true });
-
-      // Auto-disable when fully done to avoid unnecessary reads/costs
-      if (done) {
-        await controlRef.set({ enabled: false, done: true, updatedAt: nowIso }, { merge: true });
-        await statusRef.set({ done: true }, { merge: true });
-      }
-      return null;
-    } catch (e) {
-      try {
-        await statusRef.set({ lastRunAt: new Date().toISOString(), lastErrorAt: new Date().toISOString(), lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true });
-      } catch (_) {}
-      return null;
-    }
-  });
-
-/**
- * Owner-callable: Retro-merge sweep only (Fix City/State removed from sweep)
- * Notes:
- * - Previously this endpoint ran both Fix City/State and Retro-merge.
- * - Per owner request, Fix City/State has completed and is no longer part of the one-time sweep.
- * - We keep the shape of the response with a no-op "fix" block for UI compatibility.
- */
-exports.runOneTimeSweepAll = functions
-  .runWith({ timeoutSeconds: 540, memory: '1GB' })
-  .https.onCall(async (data, context) => {
-    const db = admin.firestore();
-    if (!context.auth) {
-      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
-    }
-    const callerUid = context.auth.uid;
-    const allowed = await isOwnerOrAdmin(db, callerUid);
-    if (!allowed) {
-      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run this');
-    }
-    const retroPageSize = Math.max(400, Math.min(3000, Number(data && data.retroPageSize) || 1200));
-    const t0 = Date.now();
-    // Part 1: Fix City/State intentionally omitted from this sweep (completed previously)
-    const fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: true, note: 'omitted_from_sweep' };
-    // Part 2: Retro-merge for remaining time
-    let retro = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, done: false };
-    {
-      let done = false;
-      do {
-        const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
-        const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
-        const out = await runRetroMergeBatch(db, { pageSize: retroPageSize, startAfterId: cursor, dryRun: false });
-        retro.pages += out.pages;
-        retro.scanned += out.scanned;
-        retro.updatedParks += out.updatedParks;
-        retro.courtsAdded += out.courtsAdded;
-        done = !!out.done;
-        retro.done = done;
-        if (!done && (Date.now() - t0) > 520000) break;
-      } while (!retro.done);
-    }
-    return { ok: true, fix, retro };
-  });
-
-/**
- * Admin/owner callable: reset Fix City/State checkpoint (server-side write)
- */
-exports.resetFixCityFromAddressCheckpoint = functions
-  .runWith({ timeoutSeconds: 60, memory: '256MB' })
-  .https.onCall(async (data, context) => {
-    const db = admin.firestore();
-    if (!context.auth) {
-      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
-    }
-    const allowed = await isOwnerOrAdmin(db, context.auth.uid);
-    if (!allowed) {
-      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can reset');
-    }
-    try {
-      const nowIso = new Date().toISOString();
-      await db.collection('jobs').doc('fix_city_from_address').set({
-        status: 'idle',
-        lastDocId: admin.firestore.FieldValue.delete(),
-        pages: 0,
-        scanned: 0,
-        updated: 0,
-        skippedEmpty: 0,
-        ambiguous: 0,
-        lastHeartbeatAt: nowIso,
-      }, { merge: true });
-      return { ok: true };
-    } catch (e) {
-      throw new functions.https.HttpsError('internal', e?.message || 'Reset failed');
-    }
-  });
-
-/**
- * Admin/owner callable: reset Retro-merge checkpoint (server-side write)
- * Resets both the server control/status docs and the legacy jobs doc used by the client-side runner.
- */
-exports.resetRetroMergeCheckpoint = functions
-  .runWith({ timeoutSeconds: 60, memory: '256MB' })
-  .https.onCall(async (data, context) => {
-    const db = admin.firestore();
-    if (!context.auth) {
-      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
-    }
-    const allowed = await isOwnerOrAdmin(db, context.auth.uid);
-    if (!allowed) {
-      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can reset');
-    }
-    try {
-      const nowIso = new Date().toISOString();
-      const controlRef = db.collection('retroMerge').doc('control');
-      const statusRef = db.collection('retroMerge').doc('status');
-      await controlRef.set({ cursor: null, updatedAt: nowIso }, { merge: true });
-      await statusRef.set({ lastRunAt: nowIso, note: 'checkpoint reset', cursor: null, pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 }, { merge: true });
-      // Also reset legacy client checkpoint
-      await db.collection('jobs').doc('retro_merge').set({
-        status: 'idle',
-        lastDocId: admin.firestore.FieldValue.delete(),
-        pages: 0,
-        scanned: 0,
-        updatedParks: 0,
-        courtsAdded: 0,
-        lastHeartbeatAt: nowIso,
-      }, { merge: true });
-      return { ok: true };
-    } catch (e) {
-      throw new functions.https.HttpsError('internal', e?.message || 'Reset failed');
-    }
-  });
-
-/**
- * HTTP: Run Retro-merge sweep only with one request (shared secret)
- * Fix City/State has been removed from this combined endpoint.
- */
-exports.runOneTimeSweepAllHttp = functions
-  .runWith({ timeoutSeconds: 540, memory: '1GB' })
-  .https.onRequest(async (req, res) => {
-    try {
-      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
-      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
-      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
-      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
-      const db = admin.firestore();
-      const retroPageSize = Math.max(400, Math.min(3000, Number((req.body && req.body.retroPageSize) || 1200)));
-      const t0 = Date.now();
-      // Fix City/State intentionally omitted from this sweep (completed previously)
-      const fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: true, note: 'omitted_from_sweep' };
-      // Retro-merge loop
-      let retro = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, done: false };
-      {
-        let done = false;
-        do {
-          const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
-          const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
-          const out = await runRetroMergeBatch(db, { pageSize: retroPageSize, startAfterId: cursor, dryRun: false });
-          retro.pages += out.pages;
-          retro.scanned += out.scanned;
-          retro.updatedParks += out.updatedParks;
-          retro.courtsAdded += out.courtsAdded;
-          done = !!out.done;
-          retro.done = done;
-          if (!done && (Date.now() - t0) > 520000) break;
-        } while (!retro.done);
-      }
-      res.status(200).json({ ok: true, fix, retro });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
-    }
-  });
-
-// HTTP wrapper for CI (GridHub/GitHub). Requires X-Run-Secret header.
-exports.runRetroMergeOnceHttp = functions
-  .runWith({ timeoutSeconds: 540, memory: '1GB' })
-  .https.onRequest(async (req, res) => {
-    try {
-      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
-      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
-      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
-      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
-      const db = admin.firestore();
-      const controlRef = db.collection('retroMerge').doc('control');
-      const statusRef = db.collection('retroMerge').doc('status');
-      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
-      const pageSize = Math.max(400, Math.min(3000, Number(body.pageSize) || 1200));
-      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(body.proximityMiles) || 0.12));
-      const dryRun = body.dryRun === true;
-      const ctrlSnap = await controlRef.get().catch(() => null);
-      const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
-      const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
-      const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...resBatch, pageSize, proximityMiles, dryRun }, { merge: true });
-      await controlRef.set({ cursor: resBatch.done ? null : resBatch.cursor, updatedAt: nowIso }, { merge: true });
-      res.status(200).json({ ok: true, ...resBatch, pageSize, proximityMiles, dryRun });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
-    }
-  });
-
-/**
- * Owner-callable: Sweep Retro-merge across all parks in one session (looped)
- */
-exports.runRetroMergeAll = functions
-  .runWith({ timeoutSeconds: 540, memory: '1GB' })
-  .https.onCall(async (data, context) => {
-    const db = admin.firestore();
-    if (!context.auth) {
-      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
-    }
-    const callerUid = context.auth.uid;
-    const allowed = await isOwnerOrAdmin(db, callerUid);
-    if (!allowed) {
-      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run retro merge');
-    }
-    const controlRef = db.collection('retroMerge').doc('control');
-    const statusRef = db.collection('retroMerge').doc('status');
-    const pageSize = Math.max(400, Math.min(3000, Number(data && data.pageSize) || 1200));
-    const proximityMiles = Math.max(0.03, Math.min(1.0, Number(data && data.proximityMiles) || 0.12));
-    const dryRun = !!(data && data.dryRun);
-    // Match scheduler defaults exactly: 480,000ms window and effectively unlimited pages
-    const maxMillisPerRun = Math.max(60_000, Math.min(520_000, Number(data && data.maxMillisPerRun) || 480_000));
-    const maxPagesPerRun = Math.max(1, Math.min(10000, Number(data && data.maxPagesPerRun) || 999_999));
-    const t0 = Date.now();
-    let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
-    let cursor = null;
-    let done = false;
-    do {
-      const ctrlSnap = await controlRef.get().catch(() => null);
-      cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
-      const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
-      agg.pages += out.pages;
-      agg.scanned += out.scanned;
-      agg.updatedParks += out.updatedParks;
-      agg.courtsAdded += out.courtsAdded;
-      done = !!out.done;
-      // advance cursor and persist progress so UI can observe mid-run updates
-      cursor = out.done ? null : out.cursor;
-      const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, note: 'running' }, { merge: true });
-      await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
-      if (done) break;
-      // Check time/page budgets
-      if ((Date.now() - t0) > maxMillisPerRun) break;
-      if (agg.pages >= maxPagesPerRun) break;
-    } while (true);
-    const nowIso = new Date().toISOString();
-    await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
-    await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true }).catch(() => {});
-    return { ok: true, ...agg, done, pageSize, proximityMiles, dryRun };
-  });
-
-/**
- * HTTP: Sweep Retro-merge fully with shared secret
- */
-exports.runRetroMergeAllHttp = functions
-  .runWith({ timeoutSeconds: 540, memory: '1GB' })
-  .https.onRequest(async (req, res) => {
-    try {
-      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
-      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
-      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
-      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
-      const db = admin.firestore();
-      const controlRef = db.collection('retroMerge').doc('control');
-      const statusRef = db.collection('retroMerge').doc('status');
-      const pageSize = Math.max(400, Math.min(3000, Number((req.body && req.body.pageSize) || 1200)));
-      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(req.body && req.body.proximityMiles) || 0.12));
-      const dryRun = (req.body && req.body.dryRun) === true;
-      // Match scheduler defaults exactly
-      const maxMillisPerRun = Math.max(60_000, Math.min(520_000, Number(req.body && req.body.maxMillisPerRun) || 480_000));
-      const maxPagesPerRun = Math.max(1, Math.min(10000, Number(req.body && req.body.maxPagesPerRun) || 999_999));
-      const t0 = Date.now();
-      let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
-      let cursor = null;
-      let done = false;
-      do {
-        const ctrlSnap = await controlRef.get().catch(() => null);
-        cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
-        const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
-        agg.pages += out.pages;
-        agg.scanned += out.scanned;
-        agg.updatedParks += out.updatedParks;
-        agg.courtsAdded += out.courtsAdded;
-        done = !!out.done;
-        // advance/persist
-        cursor = out.done ? null : out.cursor;
-        const nowIso = new Date().toISOString();
-        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, note: 'running' }, { merge: true });
-        await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
-        if (done) break;
-        if ((Date.now() - t0) > maxMillisPerRun) break;
-        if (agg.pages >= maxPagesPerRun) break;
-      } while (true);
-      const nowIso = new Date().toISOString();
-      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
-      await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true }).catch(() => {});
-      res.status(200).json({ ok: true, ...agg, done, pageSize, proximityMiles, dryRun });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
     }
   });
 
@@ -2067,11 +786,9 @@ async function consumeGoogleCalls(db, calls) {
     console.warn('consumeGoogleCalls failed', e);
   }
 }
-
 const TEXT_TTL_DAYS = 14; // cache text search for 14 days
-// Match backup TTLs so previously cached windows remain valid
-const REV_TTL_DAYS = 120;   // reverse geocode cache 120 days
-const DETAILS_TTL_DAYS = 120; // place details cache 120 days
+const REV_TTL_DAYS = 120;  // cache reverse geocode for 120 days
+const DETAILS_TTL_DAYS = 120; // cache place details for 120 days
 
 function ttlFromDays(days) {
   const d = new Date();
@@ -2867,18 +1584,24 @@ async function indexAliasesForPark(db, parkId, data) {
     const key3 = clusterKey(lat, lon, 3);
     const variants = aliasVariantsFromName(name);
     const nowIso = new Date().toISOString();
-    const batch = db.batch();
-    for (const alias of variants) {
-      const id = `a:${alias}:${key3}`;
-      const ref = db.collection('parkAliases').doc(id);
-      batch.set(ref, { parkId, name: data.name, alias, lat, lon, updatedAt: nowIso, createdAt: nowIso }, { merge: true });
-    }
-    await batch.commit();
+    const writes = variants.slice(0, 6).map(v => {
+      const aliasId = `a:${v}:${key3}`;
+      return db.collection('parkAliases').doc(aliasId).set({
+        parkId: parkId,
+        name: String(name),
+        alias: v,
+        lat,
+        lon,
+        updatedAt: nowIso,
+        createdAt: data.createdAt || nowIso,
+      }, { merge: true });
+    });
+    await Promise.all(writes);
   } catch (e) {
     console.warn('indexAliasesForPark error', e && e.message ? e.message : e);
   }
 }
- 
+
 async function attachAliasesToPlaces(db, places) {
   if (!Array.isArray(places) || places.length === 0) return places || [];
   const ids = new Set();
@@ -3607,3 +2330,1349 @@ exports.runRetroMergeOnce = functions
       throw new functions.https.HttpsError('internal', e?.message || 'Unknown error');
     }
   });
+
+// HTTP wrapper for CI (GridHub/GitHub). Requires X-Run-Secret header.
+exports.runRetroMergeOnceHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+      const db = admin.firestore();
+      const controlRef = db.collection('retroMerge').doc('control');
+      const statusRef = db.collection('retroMerge').doc('status');
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const pageSize = Math.max(400, Math.min(3000, Number(body.pageSize) || 1200));
+      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(body.proximityMiles) || 0.12));
+      const dryRun = body.dryRun === true;
+      const ctrlSnap = await controlRef.get().catch(() => null);
+      const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+      const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...resBatch, pageSize, proximityMiles, dryRun }, { merge: true });
+      await controlRef.set({ cursor: resBatch.done ? null : resBatch.cursor, updatedAt: nowIso }, { merge: true });
+      res.status(200).json({ ok: true, ...resBatch, pageSize, proximityMiles, dryRun });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * Owner-callable: Sweep Retro-merge across all parks in one session (looped)
+ */
+exports.runRetroMergeAll = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const callerUid = context.auth.uid;
+    const allowed = await isOwnerOrAdmin(db, callerUid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run retro merge');
+    }
+    const controlRef = db.collection('retroMerge').doc('control');
+    const statusRef = db.collection('retroMerge').doc('status');
+    const pageSize = Math.max(400, Math.min(3000, Number(data && data.pageSize) || 1200));
+    const proximityMiles = Math.max(0.03, Math.min(1.0, Number(data && data.proximityMiles) || 0.12));
+    const dryRun = !!(data && data.dryRun);
+    // Match scheduler defaults exactly: 480,000ms window and effectively unlimited pages
+    const maxMillisPerRun = Math.max(60_000, Math.min(520_000, Number(data && data.maxMillisPerRun) || 480_000));
+    const maxPagesPerRun = Math.max(1, Math.min(10000, Number(data && data.maxPagesPerRun) || 999_999));
+    const t0 = Date.now();
+    let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
+    let cursor = null;
+    let done = false;
+    do {
+      const ctrlSnap = await controlRef.get().catch(() => null);
+      cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+      const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
+      agg.pages += out.pages;
+      agg.scanned += out.scanned;
+      agg.updatedParks += out.updatedParks;
+      agg.courtsAdded += out.courtsAdded;
+      done = !!out.done;
+      // advance cursor and persist progress so UI can observe mid-run updates
+      cursor = out.done ? null : out.cursor;
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, note: 'running' }, { merge: true });
+      await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
+      if (done) break;
+      // Check time/page budgets
+      if ((Date.now() - t0) > maxMillisPerRun) break;
+      if (agg.pages >= maxPagesPerRun) break;
+    } while (true);
+    const nowIso = new Date().toISOString();
+    await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
+    await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true }).catch(() => {});
+    return { ok: true, ...agg, done, pageSize, proximityMiles, dryRun };
+  });
+
+/**
+ * HTTP: Sweep Retro-merge fully with shared secret
+ */
+exports.runRetroMergeAllHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+      const db = admin.firestore();
+      const controlRef = db.collection('retroMerge').doc('control');
+      const statusRef = db.collection('retroMerge').doc('status');
+      const pageSize = Math.max(400, Math.min(3000, Number((req.body && req.body.pageSize) || 1200)));
+      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(req.body && req.body.proximityMiles) || 0.12));
+      const dryRun = (req.body && req.body.dryRun) === true;
+      // Match scheduler defaults exactly
+      const maxMillisPerRun = Math.max(60_000, Math.min(520_000, Number(req.body && req.body.maxMillisPerRun) || 480_000));
+      const maxPagesPerRun = Math.max(1, Math.min(10000, Number(req.body && req.body.maxPagesPerRun) || 999_999));
+      const t0 = Date.now();
+      let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
+      let cursor = null;
+      let done = false;
+      do {
+        const ctrlSnap = await controlRef.get().catch(() => null);
+        cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+        const out = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun, proximityMiles });
+        agg.pages += out.pages;
+        agg.scanned += out.scanned;
+        agg.updatedParks += out.updatedParks;
+        agg.courtsAdded += out.courtsAdded;
+        done = !!out.done;
+        // advance/persist
+        cursor = out.done ? null : out.cursor;
+        const nowIso = new Date().toISOString();
+        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, note: 'running' }, { merge: true });
+        await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
+        if (done) break;
+        if ((Date.now() - t0) > maxMillisPerRun) break;
+        if (agg.pages >= maxPagesPerRun) break;
+      } while (true);
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, dryRun, done, note: done ? 'pass complete' : 'paused: time window reached' }, { merge: true }).catch(() => {});
+      await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true }).catch(() => {});
+      res.status(200).json({ ok: true, ...agg, done, pageSize, proximityMiles, dryRun });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+/**
+ * Owner-callable: Retro-merge sweep only (Fix City/State removed from sweep)
+ * Notes:
+ * - Previously this endpoint ran both Fix City/State and Retro-merge.
+ * - Per owner request, Fix City/State has completed and is no longer part of the one-time sweep.
+ * - We keep the shape of the response with a no-op "fix" block for UI compatibility.
+ */
+exports.runOneTimeSweepAll = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const callerUid = context.auth.uid;
+    const allowed = await isOwnerOrAdmin(db, callerUid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can run this');
+    }
+    const retroPageSize = Math.max(400, Math.min(3000, Number(data && data.retroPageSize) || 1200));
+    const t0 = Date.now();
+    // Part 1: Fix City/State intentionally omitted from this sweep (completed previously)
+    const fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: true, note: 'omitted_from_sweep' };
+    // Part 2: Retro-merge for remaining time
+    let retro = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, done: false };
+    {
+      let done = false;
+      do {
+        const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
+        const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+        const out = await runRetroMergeBatch(db, { pageSize: retroPageSize, startAfterId: cursor, dryRun: false });
+        retro.pages += out.pages;
+        retro.scanned += out.scanned;
+        retro.updatedParks += out.updatedParks;
+        retro.courtsAdded += out.courtsAdded;
+        done = !!out.done;
+        retro.done = done;
+        if (!done && (Date.now() - t0) > 520000) break;
+      } while (!retro.done);
+    }
+    return { ok: true, fix, retro };
+  });
+
+/**
+ * Admin/owner callable: reset Fix City/State checkpoint (server-side write)
+ */
+exports.resetFixCityFromAddressCheckpoint = functions
+  .runWith({ timeoutSeconds: 60, memory: '256MB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const allowed = await isOwnerOrAdmin(db, context.auth.uid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can reset');
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      await db.collection('jobs').doc('fix_city_from_address').set({
+        status: 'idle',
+        lastDocId: admin.firestore.FieldValue.delete(),
+        pages: 0,
+        scanned: 0,
+        updated: 0,
+        skippedEmpty: 0,
+        ambiguous: 0,
+        lastHeartbeatAt: nowIso,
+      }, { merge: true });
+      return { ok: true };
+    } catch (e) {
+      throw new functions.https.HttpsError('internal', e?.message || 'Reset failed');
+    }
+  });
+
+/**
+ * Admin/owner callable: reset Retro-merge checkpoint (server-side write)
+ * Resets both the server control/status docs and the legacy jobs doc used by the client-side runner.
+ */
+exports.resetRetroMergeCheckpoint = functions
+  .runWith({ timeoutSeconds: 60, memory: '256MB' })
+  .https.onCall(async (data, context) => {
+    const db = admin.firestore();
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required');
+    }
+    const allowed = await isOwnerOrAdmin(db, context.auth.uid);
+    if (!allowed) {
+      throw new functions.https.HttpsError('permission-denied', 'Only owner/admin can reset');
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      const controlRef = db.collection('retroMerge').doc('control');
+      const statusRef = db.collection('retroMerge').doc('status');
+      await controlRef.set({ cursor: null, updatedAt: nowIso }, { merge: true });
+      await statusRef.set({ lastRunAt: nowIso, note: 'checkpoint reset', cursor: null, pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 }, { merge: true });
+      // Also reset legacy client checkpoint
+      await db.collection('jobs').doc('retro_merge').set({
+        status: 'idle',
+        lastDocId: admin.firestore.FieldValue.delete(),
+        pages: 0,
+        scanned: 0,
+        updatedParks: 0,
+        courtsAdded: 0,
+        lastHeartbeatAt: nowIso,
+      }, { merge: true });
+      return { ok: true };
+    } catch (e) {
+      throw new functions.https.HttpsError('internal', e?.message || 'Reset failed');
+    }
+  });
+
+/**
+ * HTTP: Run Retro-merge sweep only with one request (shared secret)
+ * Fix City/State has been removed from this combined endpoint.
+ */
+exports.runOneTimeSweepAllHttp = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') { res.status(405).json({ ok: false, error: 'Method Not Allowed' }); return; }
+      const secretConfigured = getEnv('BACKFILL_RUN_SECRET', getEnv('backfill.run_secret', ''));
+      const provided = String(req.headers['x-run-secret'] || req.headers['x-runner-secret'] || '').trim();
+      if (!secretConfigured || !provided || provided !== secretConfigured) { res.status(401).json({ ok: false, error: 'Unauthorized' }); return; }
+      const db = admin.firestore();
+      const retroPageSize = Math.max(400, Math.min(3000, Number((req.body && req.body.retroPageSize) || 1200)));
+      const t0 = Date.now();
+      // Fix City/State intentionally omitted from this sweep (completed previously)
+      const fix = { pages: 0, scanned: 0, updated: 0, skippedEmpty: 0, ambiguous: 0, done: true, note: 'omitted_from_sweep' };
+      // Retro-merge loop
+      let retro = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0, done: false };
+      {
+        let done = false;
+        do {
+          const ctrlSnap = await db.collection('retroMerge').doc('control').get().catch(() => null);
+          const cursor = ctrlSnap && ctrlSnap.exists ? (ctrlSnap.data().cursor || null) : null;
+          const out = await runRetroMergeBatch(db, { pageSize: retroPageSize, startAfterId: cursor, dryRun: false });
+          retro.pages += out.pages;
+          retro.scanned += out.scanned;
+          retro.updatedParks += out.updatedParks;
+          retro.courtsAdded += out.courtsAdded;
+          done = !!out.done;
+          retro.done = done;
+          if (!done && (Date.now() - t0) > 520000) break;
+        } while (!retro.done);
+      }
+      res.status(200).json({ ok: true, fix, retro });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || 'Unhandled error' });
+    }
+  });
+
+// Optional scheduler: disabled by default unless retroMerge/control.enabled == true
+// Now runs every 2 minutes with a soft cooldown and auto-disables when done
+exports.scheduledRetroMerge = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB', maxInstances: 1 })
+  .pubsub.schedule('every 2 minutes').timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const controlRef = db.collection('retroMerge').doc('control');
+    const statusRef = db.collection('retroMerge').doc('status');
+    try {
+      const ctrl = await controlRef.get().catch(() => null);
+      const cfg = ctrl && ctrl.exists ? (ctrl.data() || {}) : {};
+      const enabled = cfg.enabled === true;
+      if (!enabled) {
+        await statusRef.set({ lastRunAt: new Date().toISOString(), note: 'skipped: disabled' }, { merge: true });
+        return null;
+      }
+
+      // Optional cooldown to avoid thrashing if schedule is very frequent
+      const statusSnap = await statusRef.get().catch(() => null);
+      const status = statusSnap && statusSnap.exists ? (statusSnap.data() || {}) : {};
+      const lastSuccessAt = status.lastSuccessAt ? new Date(status.lastSuccessAt) : null;
+      const minIntervalMinutes = Math.max(1, Math.min(10, Number(cfg.minIntervalMinutes) || 2));
+      if (lastSuccessAt && (Date.now() - lastSuccessAt.getTime()) < minIntervalMinutes * 60 * 1000) {
+        await statusRef.set({ lastRunAt: new Date().toISOString(), note: `skipped: cooldown ${minIntervalMinutes}m` }, { merge: true });
+        return null;
+      }
+
+      // Multi-page loop per tick (faster): honor optional caps from control
+      const pageSize = Math.max(400, Math.min(3000, Number(cfg.pageSize) || 1200));
+      const proximityMiles = Math.max(0.03, Math.min(1.0, Number(cfg.proximityMiles) || 0.12));
+      const budgetMs = Math.max(60_000, Math.min(520_000, Number(cfg.maxMillisPerRun) || 480_000));
+      const maxPages = Math.max(1, Math.min(10_000, Number(cfg.maxPagesPerRun) || 999_999));
+
+      const t0 = Date.now();
+      let cursor = cfg.cursor || null;
+      let agg = { pages: 0, scanned: 0, updatedParks: 0, courtsAdded: 0 };
+      let done = false;
+      do {
+        const resBatch = await runRetroMergeBatch(db, { pageSize, startAfterId: cursor, dryRun: false, proximityMiles });
+        agg.pages += resBatch.pages;
+        agg.scanned += resBatch.scanned;
+        agg.updatedParks += resBatch.updatedParks;
+        agg.courtsAdded += resBatch.courtsAdded;
+        cursor = resBatch.done ? null : resBatch.cursor;
+        const nowIso = new Date().toISOString();
+        await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, note: 'running' }, { merge: true });
+        await controlRef.set({ cursor, updatedAt: nowIso }, { merge: true });
+        done = !!resBatch.done;
+        if (done) break;
+        if ((Date.now() - t0) > budgetMs) break;
+        if (agg.pages >= maxPages) break;
+      } while (true);
+
+      const nowIso = new Date().toISOString();
+      await statusRef.set({ lastRunAt: nowIso, lastSuccessAt: nowIso, ...agg, cursor, pageSize, proximityMiles, done, note: done ? 'pass complete' : `paused (<${Math.round((budgetMs - (Date.now() - t0)) / 1000)}s left)` }, { merge: true });
+      await controlRef.set({ cursor: done ? null : cursor, updatedAt: nowIso }, { merge: true });
+
+      // Auto-disable when fully done to avoid unnecessary reads/costs
+      if (done) {
+        await controlRef.set({ enabled: false, done: true, updatedAt: nowIso }, { merge: true });
+        await statusRef.set({ done: true }, { merge: true });
+      }
+      return null;
+    } catch (e) {
+      try {
+        await statusRef.set({ lastRunAt: new Date().toISOString(), lastErrorAt: new Date().toISOString(), lastError: (e && e.message) ? String(e.message).slice(0, 400) : String(e).slice(0, 400) }, { merge: true });
+      } catch (_) {}
+      return null;
+    }
+  });
+
+/**
+// Removed: all Google Places import/backfill helpers and endpoints — no more imports
+
+// importPlacesForCitySimple removed — Google-only pipeline
+
+// Overpass-based backlog seeder removed (Google-only pipeline)
+
+// HTTP wrapper for CI/admin: seed Places backlog for a state
+// Overpass-based backlog seeder HTTP removed (Google-only pipeline)
+
+// Scheduled: seed Places backlog across all states, rotating West→East
+// Overpass backlog seeding (all states) removed
+
+// Scheduler: consume one Places backlog task per run
+// Now honors a Firestore config kill switch:
+//   imports/places/config/drainer { enabled: boolean, maxTasksPerRun?: number, estCallsPerCity?: number }
+// Default: disabled until explicitly enabled to prevent accidental API burn.
+// Geoapify/queue-based city batch backfill removed
+
+/**
+ * Aggressive backlog seeder: keeps imports/places/backlog filled so the drainer
+ * always has work. Rotates West→East and seeds multiple states per run.
+ *
+ * Config (Firestore doc: imports/places/config):
+ *  - targetBacklog: desired pending tasks (default 600)
+ *  - citiesPerState: max cities to add per state per seeding (default 80)
+ *  - statesPerRun: how many states to seed per run (default 3)
+ *  - enabled: boolean (default true)
+ *
+ * Status/progress is written to imports/places with lastEnsureAt/lastEnsureNote/nextIndex
+ */
+// Backlog capacity seeder removed (Google-only pipeline)
+
+/**
+ * HTTP: Run the Places city backfill batch immediately (same logic as the scheduler).
+ * Security: requires X-Run-Secret header matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ * Optional body: { maxTasksPerRun?: number }
+ */
+// HTTP backlog batch runner removed
+
+/**
+ * HTTP: Direct Geoapify importer (no queue/drainer). Writes parks immediately.
+ * Security: requires X-Run-Secret header matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ * Body: { city, state, lat, lon, radiusMeters, maxCreates, dryRun, inlineReverse }
+ */
+// GeoSimple import removed
+
+/**
+ * Scheduled: Rotate through configured target cities and run geoSimpleImport once per tick.
+ * Config path: imports/geoSimple (doc)
+ *  - enabled: boolean (default false)
+ *  - useWindow: boolean (default true; honors nightly window)
+ *  - nextIndex: number (managed by scheduler)
+ * Targets path: imports/geoSimple/targets (collection)
+ *  - { city, state, lat, lon, radiusKm, maxCreates }
+ */
+// GeoSimple scheduler removed
+
+/**
+ * HTTP: Seed imports/geoSimple/targets with curated Tier 1–3 metro split targets.
+ * One‑time admin endpoint so you don’t have to create dozens of docs manually.
+ *
+ * Security: requires X-Run-Secret matching BACKFILL_RUN_SECRET/backfill.run_secret
+ * Body (optional):
+ *  - preset: 'all' | 'tier1' | 'tier2' | 'tier3' (default 'all')
+ *  - overwrite: boolean (default false) — if true, update existing targets' radius/maxCreates
+ *  - dryRun: boolean (default false) — preview without writing
+ *  - enableNow: boolean (default false) — also set imports/geoSimple.enabled=true and optionally useWindow
+ *  - useWindow: boolean (default true) — when enableNow=true, sets nightly window honoring flag
+ */
+// GeoSimple seeding HTTP removed
+
+/**
+ * HTTP: Ensure Places backlog capacity now (same as scheduledEnsurePlacesBacklogCapacity, one pass).
+ * Security: X-Run-Secret as above.
+ */
+// Backlog ensure HTTP removed
+
+// OSM city backlog scheduler removed (Google-only pipeline)
+
+/**
+ * Build per-state and per-city indices for diagnostics (counts and lastUpdated)
+ * Runs every 6 hours. Writes to stats/states/<state> and stats/states/<state>/cities/<city>
+ */
+// Google-Places-only scheduler: iterate imports/googlePlaces/targets
+// Removed: scheduledGooglePlacesBackfill — no more city imports
+
+/**
+ * HTTP: Run a one-off Google Places import for a single city/target.
+ * Security: requires X-Run-Secret matching BACKFILL_RUN_SECRET/backfill.run_secret.
+ * Body: { city, state, lat?, lon?, radiusKm?, maxCreates?, dryRun? }
+ */
+// Removed: runGooglePlacesImportForCityHttp — no more ad-hoc imports
+
+exports.scheduledBuildStateCityIndex = functions.pubsub
+  .schedule('every 6 hours')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const nowIso = new Date().toISOString();
+    function sportKey(raw) {
+      const s = String(raw || '').toLowerCase();
+      if (s.includes('pickle')) return 'pickleball';
+      if (s.includes('tennis')) return 'tennis';
+      if (s.includes('basket')) return 'basketball';
+      return 'other';
+    }
+    for (const state of WEST_TO_EAST_STATE_ORDER) {
+      try {
+        const snap = await db.collection('parks').where('state', '==', state).get();
+        const cities = new Map();
+        let total = 0;
+        const sportTotals = { basketball: 0, pickleball: 0, tennis: 0, other: 0 };
+        snap.forEach(doc => {
+          total += 1;
+          const d = doc.data();
+          const city = (d.city || 'Unknown').trim() || 'Unknown';
+          const c = cities.get(city) || { count: 0, latest: '', minLat: 90, maxLat: -90, minLon: 180, maxLon: -180, sportCounts: { basketball: 0, pickleball: 0, tennis: 0, other: 0 } };
+          c.count += 1;
+          const ts = d.updatedAt || d.createdAt || '';
+          if (ts && (!c.latest || ts > c.latest)) c.latest = ts;
+          const lat = Number(d.latitude);
+          const lon = Number(d.longitude);
+          if (isFinite(lat) && isFinite(lon)) {
+            if (lat < c.minLat) c.minLat = lat;
+            if (lat > c.maxLat) c.maxLat = lat;
+            if (lon < c.minLon) c.minLon = lon;
+            if (lon > c.maxLon) c.maxLon = lon;
+          }
+          // Aggregate sport categories by unique category per park (avoid court inflation)
+          const courts = Array.isArray(d.courts) ? d.courts : [];
+          const seen = new Set();
+          for (const ct of courts) {
+            const key = sportKey(ct && ct.sportType);
+            if (!seen.has(key)) {
+              c.sportCounts[key] = (c.sportCounts[key] || 0) + 1;
+              sportTotals[key] = (sportTotals[key] || 0) + 1;
+              seen.add(key);
+            }
+          }
+          cities.set(city, c);
+        });
+
+        const stateRef = db.collection('stats').doc('states').collection('states').doc(state);
+        await stateRef.set({ state, totalParks: total, sportCountsTotal: sportTotals, updatedAt: nowIso }, { merge: true });
+
+        const batchWrites = [];
+        cities.forEach((val, key) => {
+          const cityRef = stateRef.collection('cities').doc(key.replaceAll('/', '_'));
+          batchWrites.push(cityRef.set({
+            city: key,
+            count: val.count,
+            latest: val.latest || null,
+            bbox: { minLat: val.minLat, maxLat: val.maxLat, minLon: val.minLon, maxLon: val.maxLon },
+            sportCounts: val.sportCounts,
+            updatedAt: nowIso,
+          }, { merge: true }));
+        });
+        if (batchWrites.length) await Promise.all(batchWrites);
+      } catch (e) {
+        console.warn('scheduledBuildStateCityIndex error for', state, e.message || e);
+      }
+    }
+    return null;
+  });
+
+// Removed: Google West→East cursor (scheduler and HTTP) — no automated Google imports
+
+/**
+ * Cloud Function: Send push notifications when a user checks into a court
+ * 
+ * Triggers: onCreate for check-ins collection
+ * Flow:
+ * 1. Extract parkId from the new check-in document
+ * 2. Query users who have this park in favorites with notifications enabled
+ * 3. Fetch FCM tokens for each user
+ * 4. Send FCM notification with click action to open the park
+ * 5. Clean up invalid/expired tokens
+ */
+exports.sendCheckinNotification = functions.firestore
+  .document('checkins/{checkinId}')
+  .onCreate(async (snapshot, context) => {
+    const checkin = snapshot.data();
+    const db = admin.firestore();
+    
+    try {
+      // 1. Extract check-in details
+      const parkId = checkin.parkId;
+      const userId = checkin.userId;
+      const courtName = checkin.courtName || 'a court';
+      const playerCount = checkin.playerCount || 1;
+      
+      // 2. Fetch park details for notification content
+      const parkDoc = await db.collection('parks').doc(parkId).get();
+      if (!parkDoc.exists) {
+        console.log('Park not found:', parkId);
+        return null;
+      }
+      const parkName = parkDoc.data().name;
+      
+      // 3. Fetch user who checked in (for display name)
+      const userDoc = await db.collection('users').doc(userId).get();
+      const displayName = userDoc.exists ? userDoc.data().displayName : 'Someone';
+      
+      // Prepare common notification payload
+      const title = `🏀 ${parkName}`;
+      const body = `${displayName} just checked in with ${playerCount} player${playerCount > 1 ? 's' : ''} on ${courtName}`;
+      const data = {
+        type: 'checkin',
+        parkId: parkId,
+        courtName: courtName,
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
+      };
+
+      let totalSent = 0;
+
+      // 4A. Notify users who favorited this park (and enabled)
+      try {
+        const usersSnapshot = await db.collection('users')
+          .where(`favoriteNotifications.${parkId}`, '==', true)
+          .get();
+        if (!usersSnapshot.empty) {
+          const targetUserIds = [];
+          usersSnapshot.forEach(doc => {
+            if (doc.id !== userId) targetUserIds.push(doc.id);
+          });
+          if (targetUserIds.length > 0) {
+            const favResp = await sendNotificationsToUsers(db, targetUserIds, title, body, data);
+            totalSent += favResp.successCount;
+          }
+        } else {
+          console.log('No users with notifications enabled for park:', parkId);
+        }
+      } catch (e) {
+        console.error('Error sending favorite park notifications:', e);
+      }
+
+      // 4B. Notify ALL other members of groups this user belongs to (no per-group opt-in)
+      try {
+        const groupsSnap = await db.collection('groups')
+          .where('memberIds', 'array-contains', userId)
+          .get();
+        if (!groupsSnap.empty) {
+          const notifySet = new Set();
+          groupsSnap.forEach(groupDoc => {
+            const groupData = groupDoc.data();
+            const memberIds = Array.isArray(groupData.memberIds) ? groupData.memberIds : [];
+            memberIds.forEach(id => { if (id !== userId) notifySet.add(id); });
+          });
+
+          const notifyUserIds = Array.from(notifySet);
+          if (notifyUserIds.length > 0) {
+            // Reuse the same title (park name) and body; this avoids duplicate pushes across overlapping groups
+            const groupResp = await sendNotificationsToUsers(db, notifyUserIds, title, body, data);
+            totalSent += groupResp.successCount;
+          }
+        }
+      } catch (e) {
+        console.error('Error sending group member notifications:', e);
+      }
+
+      return { success: true, sent: totalSent };
+      
+    } catch (error) {
+      console.error('Error sending check-in notification:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+/**
+ * Cloud Function: Send push notification for friend requests
+ * 
+ * Triggers: onCreate for notifications collection (type: friend_request)
+ */
+exports.sendFriendRequestNotification = functions.firestore
+  .document('notifications/{notificationId}')
+  .onCreate(async (snapshot, context) => {
+    const notification = snapshot.data();
+    const db = admin.firestore();
+    
+    if (notification.type !== 'friend_request') return null;
+    
+    try {
+      const userId = notification.userId;
+      const senderName = notification.senderName;
+      const title = notification.title || 'New Friend Request';
+      const body = notification.body || `${senderName} sent you a friend request`;
+      const data = {
+        type: 'friend_request',
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
+      };
+      
+      const response = await sendNotificationsToUsers(db, [userId], title, body, data);
+      console.log(`Friend request notification sent to user ${userId}`);
+      return { success: true, sent: response.successCount };
+      
+    } catch (error) {
+      console.error('Error sending friend request notification:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+/**
+ * Scheduled Function: Prune stale queue entries across all parks
+ *
+ * Runs periodically and removes any queue players with no activity for > 60 minutes.
+ */
+exports.pruneStaleQueueEntries = functions.pubsub
+  .schedule('every 15 minutes')
+  .timeZone('Etc/UTC')
+  .onRun(async (context) => {
+    const db = admin.firestore();
+    const now = new Date();
+    const timeoutMs = QUEUE_TIMEOUT_MINUTES * 60 * 1000;
+    // Only scan parks whose queues were touched recently to reduce reads
+    const lookbackHours = Math.max(1, Math.min(72, Number(process.env.QUEUE_PRUNE_LOOKBACK_HOURS) || 24));
+    const lookbackIso = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000).toISOString();
+
+    try {
+      const parksSnap = await db.collection('parks')
+        .where('queueTouchedAt', '>=', lookbackIso)
+        .get();
+      if (parksSnap.empty) return null;
+
+      const updates = [];
+      parksSnap.forEach((doc) => {
+        const parkData = doc.data();
+        const courts = Array.isArray(parkData.courts) ? parkData.courts : [];
+        let hasChanges = false;
+
+        const updatedCourts = courts.map((court) => {
+          const queue = Array.isArray(court.gotNextQueue) ? court.gotNextQueue : [];
+          const filtered = queue.filter((player) => {
+            const joinedAt = player.joinedAt ? new Date(player.joinedAt) : now;
+            const lastActivity = player.lastActivity ? new Date(player.lastActivity) : joinedAt;
+            return now - lastActivity < timeoutMs;
+          });
+          if (filtered.length !== queue.length) {
+            hasChanges = true;
+            return {
+              ...court,
+              gotNextQueue: filtered,
+              lastUpdated: now.toISOString(),
+            };
+          }
+          return court;
+        });
+
+        if (hasChanges) {
+          updates.push(
+            db.collection('parks').doc(doc.id).update({
+              courts: updatedCourts,
+              updatedAt: now.toISOString(),
+              queueTouchedAt: now.toISOString(),
+            })
+          );
+        }
+      });
+
+      if (updates.length) {
+        await Promise.all(updates);
+        console.log(`Pruned queues on ${updates.length} park(s)`);
+      } else {
+        console.log('No stale queue entries to prune');
+      }
+      return null;
+    } catch (e) {
+      console.error('Error pruning stale queue entries:', e);
+      return null;
+    }
+  });
+
+/**
+ * Cloud Function: Send push notification for game invites
+ * 
+ * Triggers: onCreate for notifications collection (type: game_invite or now_playing)
+ */
+exports.sendGameNotification = functions.firestore
+  .document('notifications/{notificationId}')
+  .onCreate(async (snapshot, context) => {
+    const notification = snapshot.data();
+    const db = admin.firestore();
+    
+    if (notification.type !== 'game_invite' && notification.type !== 'now_playing') return null;
+    
+    try {
+      // Enforce: Only premium senders may trigger game_invite/now_playing pushes
+      const senderId = notification.senderId;
+      if (!senderId) {
+        console.log('Dropping game notification without senderId (premium required)');
+        return null;
+      }
+      const senderDoc = await db.collection('users').doc(senderId).get();
+      if (!senderDoc.exists) {
+        console.log('Dropping game notification; sender not found:', senderId);
+        return null;
+      }
+      const s = senderDoc.data() || {};
+      const planTier = s.planTier || 'free';
+      const premiumUntil = s.premiumUntil; // ISO string or null
+      let isPremium = false;
+      if (planTier === 'premium') {
+        if (!premiumUntil) {
+          isPremium = true; // lifetime or unset treated as active
+        } else {
+          const until = new Date(premiumUntil);
+          if (!isNaN(until.getTime()) && until > new Date()) {
+            isPremium = true;
+          }
+        }
+      }
+      if (!isPremium) {
+        console.log('Dropping game notification; sender not premium:', senderId);
+        return null;
+      }
+
+      const userId = notification.userId;
+      const title = notification.title;
+      const body = notification.body;
+      const data = {
+        type: notification.type,
+        parkName: notification.parkName || '',
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
+      };
+      
+      if (notification.scheduledTime) {
+        data.scheduledTime = notification.scheduledTime;
+      }
+      if (notification.courtNumber) {
+        data.courtNumber = notification.courtNumber.toString();
+      }
+      
+      const response = await sendNotificationsToUsers(db, [userId], title, body, data);
+      console.log(`${notification.type} notification sent to user ${userId}`);
+      return { success: true, sent: response.successCount };
+      
+    } catch (error) {
+      console.error('Error sending game notification:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+/**
+ * Cloud Function: Update court player counts when check-ins are created
+ * 
+ * Triggers: onCreate for checkins collection
+ * Flow:
+ * 1. Extract parkId and courtId from new check-in
+ * 2. Query active check-ins for that court
+ * 3. Update the park document with the current player count
+ */
+exports.updateCourtPlayerCountOnCheckIn = functions.firestore
+  .document('checkins/{checkinId}')
+  .onCreate(async (snapshot, context) => {
+    const checkin = snapshot.data();
+    const db = admin.firestore();
+    
+    try {
+      const parkId = checkin.parkId;
+      const courtNumber = checkin.courtNumber;
+      
+      if (!parkId || courtNumber === undefined || courtNumber === null) {
+        console.log('Missing parkId or courtNumber in check-in');
+        return null;
+      }
+      
+      // Count active check-ins for this court
+      const activeCheckIns = await db.collection('checkins')
+        .where('parkId', '==', parkId)
+        .where('courtNumber', '==', courtNumber)
+        .where('isActive', '==', true)
+        .get();
+      
+      const playerCount = activeCheckIns.size;
+      console.log(`Court ${courtNumber} at park ${parkId} now has ${playerCount} active check-ins`);
+      
+      // Update the park document
+      const parkRef = db.collection('parks').doc(parkId);
+      const parkDoc = await parkRef.get();
+      
+      if (!parkDoc.exists) {
+        console.log('Park not found:', parkId);
+        return null;
+      }
+      
+      const parkData = parkDoc.data();
+      const courts = parkData.courts || [];
+      
+      // Find and update the specific court by courtNumber
+      const courtIndex = courts.findIndex(c => c.courtNumber === courtNumber);
+      if (courtIndex !== -1) {
+        courts[courtIndex].playerCount = playerCount;
+        courts[courtIndex].lastUpdated = admin.firestore.Timestamp.now().toDate().toISOString();
+        
+        await parkRef.update({
+          courts: courts,
+          updatedAt: admin.firestore.Timestamp.now().toDate().toISOString()
+        });
+        
+        console.log(`Updated court ${courtNumber} player count to ${playerCount}`);
+        return { success: true, playerCount };
+      } else {
+        console.log('Court not found in park:', courtNumber);
+        return null;
+      }
+      
+    } catch (error) {
+      console.error('Error updating court player count on check-in:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+/**
+ * Cloud Function: Update court player counts when check-ins are updated (checkout)
+ * 
+ * Triggers: onUpdate for checkins collection
+ * Flow:
+ * 1. Check if isActive changed from true to false
+ * 2. Query active check-ins for that court
+ * 3. Update the park document with the current player count
+ */
+exports.updateCourtPlayerCountOnCheckOut = functions.firestore
+  .document('checkins/{checkinId}')
+  .onUpdate(async (change, context) => {
+    const before = change.before.data();
+    const after = change.after.data();
+    const db = admin.firestore();
+    
+    // Only proceed if isActive changed from true to false
+    if (before.isActive !== true || after.isActive !== false) {
+      return null;
+    }
+    
+    try {
+      const parkId = after.parkId;
+      const courtNumber = after.courtNumber;
+      
+      if (!parkId || courtNumber === undefined || courtNumber === null) {
+        console.log('Missing parkId or courtNumber in check-in');
+        return null;
+      }
+      
+      // Count active check-ins for this court
+      const activeCheckIns = await db.collection('checkins')
+        .where('parkId', '==', parkId)
+        .where('courtNumber', '==', courtNumber)
+        .where('isActive', '==', true)
+        .get();
+      
+      const playerCount = activeCheckIns.size;
+      console.log(`Court ${courtNumber} at park ${parkId} now has ${playerCount} active check-ins after checkout`);
+      
+      // Update the park document
+      const parkRef = db.collection('parks').doc(parkId);
+      const parkDoc = await parkRef.get();
+      
+      if (!parkDoc.exists) {
+        console.log('Park not found:', parkId);
+        return null;
+      }
+      
+      const parkData = parkDoc.data();
+      const courts = parkData.courts || [];
+      
+      // Find and update the specific court by courtNumber
+      const courtIndex = courts.findIndex(c => c.courtNumber === courtNumber);
+      if (courtIndex !== -1) {
+        courts[courtIndex].playerCount = playerCount;
+        courts[courtIndex].lastUpdated = admin.firestore.Timestamp.now().toDate().toISOString();
+        
+        await parkRef.update({
+          courts: courts,
+          updatedAt: admin.firestore.Timestamp.now().toDate().toISOString()
+        });
+        
+        console.log(`Updated court ${courtNumber} player count to ${playerCount} after checkout`);
+        return { success: true, playerCount };
+      } else {
+        console.log('Court not found in park:', courtNumber);
+        return null;
+      }
+      
+    } catch (error) {
+      console.error('Error updating court player count on checkout:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+/**
+ * Cloud Function: Update court player counts when check-ins are deleted
+ * 
+ * Triggers: onDelete for checkins collection
+ * Flow:
+ * 1. Query active check-ins for that court
+ * 2. Update the park document with the current player count
+ */
+exports.updateCourtPlayerCountOnDelete = functions.firestore
+  .document('checkins/{checkinId}')
+  .onDelete(async (snapshot, context) => {
+    const checkin = snapshot.data();
+    const db = admin.firestore();
+    
+    // Only proceed if the check-in was active
+    if (!checkin.isActive) {
+      return null;
+    }
+    
+    try {
+      const parkId = checkin.parkId;
+      const courtNumber = checkin.courtNumber;
+      
+      if (!parkId || courtNumber === undefined || courtNumber === null) {
+        console.log('Missing parkId or courtNumber in check-in');
+        return null;
+      }
+      
+      // Count active check-ins for this court
+      const activeCheckIns = await db.collection('checkins')
+        .where('parkId', '==', parkId)
+        .where('courtNumber', '==', courtNumber)
+        .where('isActive', '==', true)
+        .get();
+      
+      const playerCount = activeCheckIns.size;
+      console.log(`Court ${courtNumber} at park ${parkId} now has ${playerCount} active check-ins after deletion`);
+      
+      // Update the park document
+      const parkRef = db.collection('parks').doc(parkId);
+      const parkDoc = await parkRef.get();
+      
+      if (!parkDoc.exists) {
+        console.log('Park not found:', parkId);
+        return null;
+      }
+      
+      const parkData = parkDoc.data();
+      const courts = parkData.courts || [];
+      
+      // Find and update the specific court by courtNumber
+      const courtIndex = courts.findIndex(c => c.courtNumber === courtNumber);
+      if (courtIndex !== -1) {
+        courts[courtIndex].playerCount = playerCount;
+        courts[courtIndex].lastUpdated = admin.firestore.Timestamp.now().toDate().toISOString();
+        
+        await parkRef.update({
+          courts: courts,
+          updatedAt: admin.firestore.Timestamp.now().toDate().toISOString()
+        });
+        
+        console.log(`Updated court ${courtNumber} player count to ${playerCount} after deletion`);
+        return { success: true, playerCount };
+      } else {
+        console.log('Court not found in park:', courtNumber);
+        return null;
+      }
+      
+    } catch (error) {
+      console.error('Error updating court player count on delete:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+/**
+ * Scheduled Function: Lightweight dedupe and post-merge cleanup
+ * - Scans a recent window of parks (by createdAt desc)
+ * - Groups by rounded lat/lon (~5 decimals ~ 1m)
+ * - Chooses a primary (prefer user-submitted over OSM; then oldest)
+ * - Marks other docs as duplicates and links their source to primary.altSources
+ */
+exports.scheduledDedupeParks = functions.pubsub
+  .schedule('every 12 hours')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const nowIso = new Date().toISOString();
+    const LIMIT = 1500; // recent window
+    const MAX_FIXES = 100; // avoid over-writing in one run
+
+    try {
+      const q = await db.collection('parks').orderBy('createdAt', 'desc').limit(LIMIT).get();
+      if (q.empty) return null;
+      const groups = new Map();
+      for (const doc of q.docs) {
+        const d = doc.data();
+        const lat = Number(d.latitude);
+        const lon = Number(d.longitude);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+        const key = `${lat.toFixed(5)},${lon.toFixed(5)}`;
+        const arr = groups.get(key) || [];
+        arr.push({ id: doc.id, data: d });
+        groups.set(key, arr);
+      }
+      let fixes = 0;
+      for (const [key, arr] of groups.entries()) {
+        if (arr.length < 2) continue;
+        // Choose primary: prioritize non-OSM (user-submitted), then earliest createdAt
+        arr.sort((a, b) => {
+          const aOsm = (a.data.source === 'osm');
+          const bOsm = (b.data.source === 'osm');
+          if (aOsm !== bOsm) return aOsm ? 1 : -1; // non-OSM first
+          const at = a.data.createdAt || '';
+          const bt = b.data.createdAt || '';
+          return at.localeCompare(bt);
+        });
+        const primary = arr[0];
+        const dups = arr.slice(1);
+        if (primary.data.dupOf) continue; // skip if already marked
+        const updates = [];
+        // Ensure loc index points to primary
+        const locRef = db.collection('parkLocIndex').doc('ll:' + key);
+        updates.push(locRef.set({ parkId: primary.id, lat: Number(primary.data.latitude), lon: Number(primary.data.longitude), state: primary.data.state || '', registeredAt: nowIso }, { merge: true }));
+        // Merge alt sources into primary and mark duplicates
+        const altSrcs = [];
+        for (const x of dups) {
+          if (fixes >= MAX_FIXES) break;
+          const src = (x.data.source === 'osm' && x.data.sourceId) ? { type: 'osm', ref: x.data.sourceId } : { type: x.data.source || 'unknown', ref: x.id };
+          altSrcs.push(src);
+          updates.push(db.collection('parks').doc(x.id).set({ dupOf: primary.id, approved: false, reviewStatus: 'duplicate', updatedAt: nowIso }, { merge: true }));
+          fixes += 1;
+        }
+        if (altSrcs.length) {
+          updates.push(db.collection('parks').doc(primary.id).set({ altSources: admin.firestore.FieldValue.arrayUnion(...altSrcs), updatedAt: nowIso }, { merge: true }));
+        }
+        if (updates.length) await Promise.all(updates);
+        if (fixes >= MAX_FIXES) break;
+      }
+      console.log(`Dedupe scan complete. Fixed ${fixes} duplicate doc(s).`);
+      return null;
+    } catch (e) {
+      console.warn('scheduledDedupeParks error', e);
+      return null;
+    }
+  });
+
+// -------------------- Appended New Functions (monolithic merge) --------------------
+// Note: admin.initializeApp() already called at top of file. Do NOT re-initialize.
+
+// Region and IAP/image pipeline constants (env-driven; safe defaults)
+const REGION = process.env.FUNCTIONS_REGION || 'us-central1';
+const ANDROID_PACKAGE = process.env.ANDROID_PACKAGE || process.env.ANDROID_PACKAGE_NAME || null;
+const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || null;
+
+// Image pipeline constants and TTLs
+const THUMB_PREFIX = 'thumbnails/';
+// Adjust these prefixes as needed to match your storage layout
+const IMAGE_PREFIXES = ['uploads/', 'attachments/', 'images/'];
+const TTL_DEFAULT_DAYS = 30; // generic assets + thumbnails
+const TTL_ATTACHMENTS_DAYS = 14; // shorter retention for attachments
+// Only prune thumbnails by default. We do NOT touch user attachments.
+const PREFIX_TTLS = [
+  { prefix: THUMB_PREFIX, days: TTL_DEFAULT_DAYS },
+];
+
+// Google Play advanced verification using googleapis (dynamic import)
+async function verifyAndroidPurchase({ packageName, productId, purchaseToken, isSubscription }) {
+  try {
+    const { google } = await import('googleapis');
+    const auth = await google.auth.getClient({ scopes: ['https://www.googleapis.com/auth/androidpublisher'] });
+    const androidpublisher = google.androidpublisher({ version: 'v3', auth });
+    const pkg = packageName || ANDROID_PACKAGE;
+    if (!pkg) return { ok: false, reason: 'missing_package_name' };
+
+    // Try v3 subscriptionsv2 first when subscription
+    if (isSubscription) {
+      try {
+        const v2 = await androidpublisher.purchases.subscriptionsv2.get({
+          packageName: pkg,
+          token: purchaseToken,
+        });
+        const line = v2?.data?.lineItems?.[0];
+        const expiry = Number(line?.expiryTime || 0);
+        const now = Date.now();
+        const active = expiry > now;
+        return { ok: true, active, expiryTimeMillis: expiry || null, raw: v2.data };
+      } catch (_) {
+        // fall back to v3 purchases.subscriptions.get
+      }
+      const res = await androidpublisher.purchases.subscriptions.get({
+        packageName: pkg,
+        subscriptionId: productId,
+        token: purchaseToken,
+      });
+      const expiry = Number(res?.data?.expiryTimeMillis || 0);
+      const cancelReason = res?.data?.cancelReason;
+      const paymentState = res?.data?.paymentState; // 1: received, 2: free trial, etc.
+      const now = Date.now();
+      const active = expiry > now && cancelReason == null;
+      return { ok: true, active, expiryTimeMillis: expiry || null, paymentState, raw: res.data };
+    }
+
+    // One-time product purchase
+    const prod = await androidpublisher.purchases.products.get({
+      packageName: pkg,
+      productId,
+      token: purchaseToken,
+    });
+    const purchaseState = prod?.data?.purchaseState; // 0 purchased, 1 canceled, 2 pending
+    const acknowledged = !!prod?.data?.acknowledgementState === 1;
+    const consumed = !!prod?.data?.consumptionState;
+    const valid = purchaseState === 0; // purchased
+    return { ok: true, active: valid, acknowledged, consumed, raw: prod.data };
+  } catch (e) {
+    console.warn('verifyAndroidPurchase error', e);
+    return { ok: false, reason: 'exception', error: e?.message || String(e) };
+  }
+}
+
+// Apple advanced receipt verification
+async function verifyAppleReceipt({ receiptData, password, useSandbox }) {
+  const endpoint = useSandbox ? 'https://sandbox.itunes.apple.com/verifyReceipt' : 'https://buy.itunes.apple.com/verifyReceipt';
+  if (!receiptData) return { ok: false, reason: 'missing_receipt' };
+  const body = { 'receipt-data': receiptData, password: password || process.env.APPLE_SHARED_SECRET, 'exclude-old-transactions': true };
+  try {
+    const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const json = await res.json();
+    if (json?.status === 21007 && !useSandbox) {
+      // Retry in sandbox automatically
+      return verifyAppleReceipt({ receiptData, password, useSandbox: true });
+    }
+    // Determine active by checking latest_receipt_info or pending_renewal_info
+    let active = false;
+    let expiresMs = null;
+    const latest = json?.latest_receipt_info || json?.receipt?.in_app || [];
+    const now = Date.now();
+    for (const item of latest) {
+      const exp = Number(item.expires_date_ms || item.expires_date || 0);
+      if (exp && exp > now) {
+        active = true;
+        if (!expiresMs || exp > expiresMs) expiresMs = exp;
+      }
+    }
+    return { ok: true, active, expiryTimeMillis: expiresMs, raw: json };
+  } catch (e) {
+    console.warn('verifyAppleReceipt error', e);
+    return { ok: false, reason: 'exception', error: e?.message || String(e) };
+  }
+}
+
+/**
+ * Callable: Record IAP payloads (server-side receipt log)
+ * - Stores purchase payloads for later verification and audit
+ * - Does NOT perform full Apple/Google verification in this version
+ */
+exports.iapVerify = onCall({ region: REGION, timeoutSeconds: 30, memory: '256MiB' }, async (request) => {
+  const { data, auth } = request;
+  if (!auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required');
+  }
+  try {
+    const db = admin.firestore();
+    const {
+      platform, // 'ios' | 'android'
+      productId,
+      purchaseToken,
+      orderId,
+      signature,
+      receipt,
+      appVersion,
+      device,
+    } = data || {};
+
+    if (!platform || !productId) {
+      throw new HttpsError('invalid-argument', 'platform and productId are required');
+    }
+
+    // Optional advanced verification
+    let verification = null;
+    try {
+      if (platform === 'android' && purchaseToken && productId) {
+        const isSub = /sub/i.test(productId) || /monthly|year|week/i.test(productId);
+        verification = await verifyAndroidPurchase({ packageName: data?.packageName || ANDROID_PACKAGE, productId, purchaseToken, isSubscription: isSub });
+      } else if (platform === 'ios' && (receipt || data?.receiptData)) {
+        verification = await verifyAppleReceipt({ receiptData: receipt || data?.receiptData, password: process.env.APPLE_SHARED_SECRET, useSandbox: !!data?.sandbox });
+      }
+    } catch (ve) {
+      console.warn('iapVerify advanced verification failed', ve);
+    }
+
+    const nowIso = new Date().toISOString();
+    const doc = {
+      uid: auth.uid,
+      createdAt: nowIso,
+      platform: String(platform),
+      productId: String(productId),
+      orderId: orderId ? String(orderId) : null,
+      purchaseToken: purchaseToken ? String(purchaseToken) : null,
+      signature: signature ? String(signature) : null,
+      // limit to avoid giant writes
+      receipt: receipt ? String(receipt).slice(0, 4000) : null,
+      status: verification?.ok ? (verification.active ? 'verified_active' : 'verified_inactive') : 'recorded',
+      verification: verification || null,
+      appVersion: appVersion || null,
+      device: device || null,
+    };
+    await db.collection('iapReceipts').add(doc);
+    return { ok: true, status: doc.status, verification };
+  } catch (e) {
+    console.error('iapVerify error', e);
+    throw new HttpsError('internal', e?.message || 'Unhandled error');
+  }
+});
+
+/**
+ * Storage Trigger: Generate medium thumbnail on new image upload
+ * - Skips non-images and already-generated thumbnails
+ * - Writes to thumbnails/medium-<filename>.jpg with long cache headers
+ */
+exports.onImageFinalize = onObjectFinalized({ region: REGION, bucket: DEFAULT_BUCKET, timeoutSeconds: 120, memory: '1GiB' },
+  async (event) => {
+    try {
+      const object = event.data || {};
+      const contentType = object.contentType || '';
+      if (!contentType.startsWith('image/')) return null;
+      const filePath = object.name || '';
+      if (!filePath || filePath.includes('/thumbnails/')) return null;
+      // If you want to restrict which folders get thumbnails, uncomment the next line
+      // if (!IMAGE_PREFIXES.some(p => filePath.startsWith(p))) return null;
+
+      const bucket = admin.storage().bucket(object.bucket);
+      const fileName = path.basename(filePath);
+      const destPath = `${THUMB_PREFIX}medium-${fileName}.jpg`;
+
+      // Idempotency: if exists, skip
+      const [exists] = await bucket.file(destPath).exists();
+      if (exists) return null;
+
+      const tmpSrc = path.join(os.tmpdir(), `src-${Date.now()}-${fileName}`);
+      const tmpDst = path.join(os.tmpdir(), `dst-${Date.now()}-${fileName}.jpg`);
+
+      await bucket.file(filePath).download({ destination: tmpSrc });
+
+      // Lazy import sharp to avoid cold start overhead in unrelated functions
+      const sharp = (await import('sharp')).default;
+      await sharp(tmpSrc)
+        .rotate()
+        .resize({ width: 1280, withoutEnlargement: true })
+        .jpeg({ quality: 80 })
+        .toFile(tmpDst);
+
+      await bucket.upload(tmpDst, {
+        destination: destPath,
+        metadata: {
+          contentType: 'image/jpeg',
+          cacheControl: 'public, max-age=31536000, s-maxage=31536000',
+        },
+      });
+
+      try { fs.unlinkSync(tmpSrc); } catch (_) {}
+      try { fs.unlinkSync(tmpDst); } catch (_) {}
+      return null;
+    } catch (e) {
+      console.error('onImageFinalize error', e);
+      return null;
+    }
+  }
+);
+
+/**
+ * Scheduled: Prune thumbnails older than 30 days (limits to ~400 deletions/run)
+ */
+exports.pruneOldImages = onSchedule({ region: REGION, schedule: 'every 24 hours', timeZone: 'Etc/UTC' }, async (event) => {
+  const bucket = admin.storage().bucket();
+  let totalDeleted = 0;
+  try {
+    for (const cfg of PREFIX_TTLS) {
+      const prefix = cfg.prefix;
+      const cutoff = Date.now() - (cfg.days * 24 * 60 * 60 * 1000);
+      const [files] = await bucket.getFiles({ prefix });
+      let deleted = 0;
+      for (const f of files) {
+        if (deleted >= 400) break; // per-prefix safety cap
+        try {
+          const [meta] = await f.getMetadata();
+          const t = new Date(meta.timeCreated || meta.updated || 0).getTime();
+          if (t && t < cutoff) {
+            await f.delete();
+            deleted += 1;
+            totalDeleted += 1;
+          }
+        } catch (_) {}
+      }
+      console.log(`pruneOldImages: prefix=${prefix} deleted=${deleted}`);
+    }
+    console.log(`pruneOldImages: totalDeleted=${totalDeleted}`);
+    return null;
+  } catch (e) {
+    console.warn('pruneOldImages error', e);
+    return null;
+  }
+});
