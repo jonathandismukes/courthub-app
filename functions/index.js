@@ -3592,7 +3592,7 @@ exports.iapVerify = onCall({ region: REGION, timeoutSeconds: 30, memory: '256MiB
  * - Skips non-images and already-generated thumbnails
  * - Writes to thumbnails/medium-<filename>.jpg with long cache headers
  */
-exports.onImageFinalize = onObjectFinalized({ region: REGION, bucket: DEFAULT_BUCKET, timeoutSeconds: 120, memory: '1GiB' },
+exports.onImageFinalize = onObjectFinalized({ region: REGION, timeoutSeconds: 120, memory: '1GiB' },
   async (event) => {
     try {
       const object = event.data || {};
