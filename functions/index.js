@@ -18,9 +18,9 @@ const { google } = require('googleapis');
 
 // Explicit default bucket (avoids Eventarc region validation issues)
 // Prefer env override if provided by CI/production config
-// Note: You shared your bucket as courthub-app.firebasestorage.app — we will
-// use that value directly here so the trigger binds to the exact bucket.
-const DEFAULT_BUCKET = process.env.STORAGE_BUCKET || 'courthub-app.firebasestorage.app';
+// IMPORTANT: Use the bucket resource ID (<project-id>.appspot.com), not the
+// download domain. This avoids Eventarc validation issues during deploy.
+const DEFAULT_BUCKET = process.env.STORAGE_BUCKET || 'courthub-app.appspot.com';
 
 // Initialize Admin SDK and set default Storage bucket for admin.storage().bucket()
 // (This does not create the bucket; the bucket must exist in your Firebase project.)
@@ -709,6 +709,33 @@ function getEnv(keyPath, fallback = '') {
   } catch (_) { return fallback; }
 }
 
+/**
+ * Scheduled: prune expired geo cache docs (compliance — 14/30 day TTLs)
+ * Deletes any docs in geoCache where expiresAt < now.
+ */
+exports.pruneExpiredGeoCache = functions.pubsub
+  .schedule('every 24 hours')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    try {
+      const nowIso = new Date().toISOString();
+      const snap = await db.collection(GEO_CACHE_COLL).where('expiresAt', '<', nowIso).get();
+      if (snap.empty) {
+        console.log('pruneExpiredGeoCache: nothing to prune');
+        return null;
+      }
+      const batch = db.batch();
+      snap.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+      console.log(`pruneExpiredGeoCache: pruned ${snap.size} doc(s)`);
+      return null;
+    } catch (e) {
+      console.error('pruneExpiredGeoCache error', e);
+      return null;
+    }
+  });
+
 const GOOGLE_KEY = getEnv('GOOGLE_MAPS_SERVER_KEY', getEnv('maps.google_server_key'));
 const GEO_CACHE_COLL = 'geoCache';
 const GOOGLE_MONTHLY_CAP_DEFAULT = 90000;
@@ -827,3 +854,36 @@ exports.pruneOldImages = onSchedule({ region: process.env.FUNCTIONS_REGION || 'u
     return null;
   } catch (e) { console.error('pruneOldImages error', e); return null; }
 });
+
+/**
+ * Scheduled: Unapprove expired Google-sourced parks (30-day cache compliance)
+ * Any park with source=='places' and autoExpireAt < now will be hidden (approved=false)
+ * unless it has been claimed/created by a user (createdByUserId not 'system').
+ */
+exports.pruneExpiredGoogleParks = functions.pubsub
+  .schedule('every 24 hours')
+  .timeZone('Etc/UTC')
+  .onRun(async () => {
+    const db = admin.firestore();
+    const nowIso = new Date().toISOString();
+    try {
+      const snap = await db.collection('parks')
+        .where('source', '==', 'places')
+        .where('autoExpireAt', '<', nowIso)
+        .get();
+      if (snap.empty) { console.log('pruneExpiredGoogleParks: none expired'); return null; }
+      const updates = [];
+      snap.forEach(doc => {
+        const d = doc.data() || {};
+        const creator = String(d.createdByUserId || '');
+        if (creator && creator !== 'system') return; // keep user-claimed items
+        updates.push(doc.ref.set({ approved: false, reviewStatus: 'expired_cache', expiredAt: nowIso, updatedAt: nowIso }, { merge: true }));
+      });
+      if (updates.length) await Promise.all(updates);
+      console.log(`pruneExpiredGoogleParks: expired ${updates.length} doc(s)`);
+      return null;
+    } catch (e) {
+      console.warn('pruneExpiredGoogleParks error', e && e.message ? e.message : e);
+      return null;
+    }
+  });
