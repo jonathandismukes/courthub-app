@@ -19,7 +19,7 @@ admin.initializeApp();
 // Explicitly set the default Cloud Storage bucket for triggers.
 // Use the exact bucket string shown in your Firebase Console.
 // This project uses the new firebasestorage.app bucket identifier.
-const DEFAULT_BUCKET = 'courthub-app.appspot.com';
+const DEFAULT_BUCKET = 'courthub-app.firebasestorage.app';
 
 // West→East processing order across US states (used by schedulers)
 const WEST_TO_EAST_STATE_ORDER = [
