@@ -20,7 +20,24 @@ const { google } = require('googleapis');
 // Prefer env override if provided by CI/production config
 // IMPORTANT: Use the bucket resource ID (<project-id>.appspot.com), not the
 // download domain. This avoids Eventarc validation issues during deploy.
-const DEFAULT_BUCKET = process.env.STORAGE_BUCKET || 'courthub-app.appspot.com';
+const PROJECT_ID = process.env.GCLOUD_PROJECT || process.env.GCP_PROJECT || process.env.PROJECT_ID || 'courthub-app';
+const RAW_BUCKET = process.env.STORAGE_BUCKET || process.env.FIREBASE_STORAGE_BUCKET || '';
+// Normalize common wrong values (e.g., courthub-app.firebasestorage.app or gs:// prefix)
+function normalizeBucketName(name) {
+  if (!name) return '';
+  let b = String(name).trim();
+  // Strip gs:// prefix
+  b = b.replace(/^gs:\/\//i, '');
+  // Strip common download host patterns accidentally pasted
+  b = b.replace(/^https?:\/\/(?:firebasestorage\.googleapis\.com|storage\.googleapis\.com)\/?/i, '');
+  // If someone pasted the web download domain, replace with appspot.com bucket
+  if (/\.firebasestorage\.app$/i.test(b)) {
+    const proj = PROJECT_ID || 'courthub-app';
+    return `${proj}.appspot.com`;
+  }
+  return b;
+}
+const DEFAULT_BUCKET = normalizeBucketName(RAW_BUCKET) || `${PROJECT_ID}.appspot.com`;
 
 // Initialize Admin SDK and set default Storage bucket for admin.storage().bucket()
 // (This does not create the bucket; the bucket must exist in your Firebase project.)
@@ -807,28 +824,34 @@ exports.iapVerify = onCall({ region: process.env.FUNCTIONS_REGION || 'us-central
 });
 
 // Storage thumbnail + prune (v2) — unchanged behavior
-exports.onImageFinalize = onObjectFinalized({ region: process.env.FUNCTIONS_REGION || 'us-central1', bucket: DEFAULT_BUCKET, timeoutSeconds: 120, memory: '1GiB' }, async (event) => {
-  try {
-    const object = event.data || {};
-    const contentType = object.contentType || '';
-    const filePath = object.name || '';
-    const metadata = object.metadata || {};
-    if (!filePath) return null;
-    if (!contentType.startsWith('image/')) return null;
-    if (filePath.startsWith(THUMB_PREFIX) || metadata.generated === 'true' || filePath.includes('/thumbnails/')) return null;
-    const bucket = admin.storage().bucket(object.bucket);
-    const tmpIn = path.join(os.tmpdir(), path.basename(filePath));
-    const base = path.basename(filePath).replace(/\.[^./]+$/, '');
-    const outName = `${THUMB_MEDIUM_PREFIX}medium-${base}.jpg`;
-    const tmpOut = path.join(os.tmpdir(), `medium-${base}.jpg`);
-    await bucket.file(filePath).download({ destination: tmpIn });
-    await sharp(tmpIn).rotate().resize({ width: THUMB_MAX_DIM, height: THUMB_MAX_DIM, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: THUMB_QUALITY, progressive: true, mozjpeg: true }).toFile(tmpOut);
-    await bucket.upload(tmpOut, { destination: outName, metadata: { contentType: 'image/jpeg', cacheControl: 'public, max-age=31536000, s-maxage=31536000, immutable', metadata: { generated: 'true', source: filePath }, }, });
-    try { fs.unlinkSync(tmpIn); } catch (_) {}
-    try { fs.unlinkSync(tmpOut); } catch (_) {}
-    return null;
-  } catch (e) { console.error('onImageFinalize error', e); return null; }
-});
+// If you need to unblock deploys before Storage is initialized, set DISABLE_IMAGE_TRIGGER=true in CI
+const DISABLE_IMAGE_TRIGGER = String(process.env.DISABLE_IMAGE_TRIGGER || '').toLowerCase() === 'true';
+if (!DISABLE_IMAGE_TRIGGER) {
+  exports.onImageFinalize = onObjectFinalized({ region: process.env.FUNCTIONS_REGION || 'us-central1', bucket: DEFAULT_BUCKET, timeoutSeconds: 120, memory: '1GiB' }, async (event) => {
+    try {
+      const object = event.data || {};
+      const contentType = object.contentType || '';
+      const filePath = object.name || '';
+      const metadata = object.metadata || {};
+      if (!filePath) return null;
+      if (!contentType.startsWith('image/')) return null;
+      if (filePath.startsWith(THUMB_PREFIX) || metadata.generated === 'true' || filePath.includes('/thumbnails/')) return null;
+      const bucket = admin.storage().bucket(object.bucket);
+      const tmpIn = path.join(os.tmpdir(), path.basename(filePath));
+      const base = path.basename(filePath).replace(/\.[^./]+$/, '');
+      const outName = `${THUMB_MEDIUM_PREFIX}medium-${base}.jpg`;
+      const tmpOut = path.join(os.tmpdir(), `medium-${base}.jpg`);
+      await bucket.file(filePath).download({ destination: tmpIn });
+      await sharp(tmpIn).rotate().resize({ width: THUMB_MAX_DIM, height: THUMB_MAX_DIM, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: THUMB_QUALITY, progressive: true, mozjpeg: true }).toFile(tmpOut);
+      await bucket.upload(tmpOut, { destination: outName, metadata: { contentType: 'image/jpeg', cacheControl: 'public, max-age=31536000, s-maxage=31536000, immutable', metadata: { generated: 'true', source: filePath }, }, });
+      try { fs.unlinkSync(tmpIn); } catch (_) {}
+      try { fs.unlinkSync(tmpOut); } catch (_) {}
+      return null;
+    } catch (e) { console.error('onImageFinalize error', e); return null; }
+  });
+} else {
+  console.log('onImageFinalize is disabled via DISABLE_IMAGE_TRIGGER=true');
+}
 
 exports.pruneOldImages = onSchedule({ region: process.env.FUNCTIONS_REGION || 'us-central1', schedule: 'every 24 hours', timeZone: 'Etc/UTC' }, async () => {
   const bucket = admin.storage().bucket();
