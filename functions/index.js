@@ -16,11 +16,10 @@ const os = require('node:os');
 
 admin.initializeApp();
 
-// Explicitly set the default Cloud Storage bucket for triggers that need validation.
-// Note: Firebase Storage's download domain is *.firebasestorage.app, but the actual
-// bucket resource name remains <project-id>.appspot.com. Using the bucket resource
-// name avoids Eventarc validation errors.
-const DEFAULT_BUCKET = 'courthub-app.appspot.com';
+// Explicitly set the default Cloud Storage bucket for triggers.
+// Use the exact bucket string shown in your Firebase Console.
+// This project uses the new firebasestorage.app bucket identifier.
+const DEFAULT_BUCKET = 'courthub-app.firebasestorage.app';
 
 // West→East processing order across US states (used by schedulers)
 const WEST_TO_EAST_STATE_ORDER = [
